@@ -98,6 +98,11 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTP_PORT", "8765")
     monkeypatch.setenv("HTTP_PATH", "/mcp/")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
+    # Host-level Agent Mail settings must not leak identities, notifications,
+    # or tool filtering into isolated server tests.
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", "")
+    monkeypatch.setenv("NOTIFICATIONS_ENABLED", "false")
+    monkeypatch.setenv("TOOLS_FILTER_ENABLED", "false")
     storage_root = tmp_path / "storage"
     monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
     monkeypatch.setenv("GIT_AUTHOR_NAME", "test-agent")

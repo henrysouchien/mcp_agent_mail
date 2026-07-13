@@ -134,6 +134,7 @@ class ToolFilterSettings:
     Profiles:
         - "full": All tools exposed (default behavior)
         - "core": Essential tools only (identity, messaging, file_reservations)
+        - "agent": Token-efficient communication, inbox sync, and reservations
         - "minimal": Bare minimum (identity, messaging basics)
         - "messaging": Messaging-focused subset
         - "custom": Use explicit include/exclude lists
@@ -151,7 +152,7 @@ class ToolFilterSettings:
     """
 
     enabled: bool
-    profile: str  # "full" | "core" | "minimal" | "messaging" | "custom"
+    profile: str  # "full" | "core" | "agent" | "minimal" | "messaging" | "custom"
     mode: str  # "include" | "exclude"
     clusters: list[str]  # Cluster names to include/exclude
     tools: list[str]  # Specific tool names to include/exclude
@@ -353,7 +354,7 @@ def _build_settings() -> Settings:
         rbac_default_role=decouple_config("HTTP_RBAC_DEFAULT_ROLE", default="reader"),
         rbac_readonly_tools=_csv(
             "HTTP_RBAC_READONLY_TOOLS",
-            default="health_check,fetch_inbox,whois,search_messages,summarize_thread",
+            default="health_check,fetch_inbox,sync_inbox,read_messages,whois,search_messages,summarize_thread",
         ),
         allow_localhost_unauthenticated=_bool(decouple_config("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default="true"), default=True),
     )
@@ -409,7 +410,7 @@ def _build_settings() -> Settings:
 
     def _tool_filter_profile(value: str) -> str:
         v = (value or "").strip().lower()
-        if v in {"full", "core", "minimal", "messaging", "custom"}:
+        if v in {"full", "core", "agent", "minimal", "messaging", "custom"}:
             return v
         return "full"
 

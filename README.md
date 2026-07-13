@@ -166,7 +166,7 @@ How to use effectively
 1) Same repository
    - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
-   - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
+   - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; use `sync_inbox(cursor=...)` for metadata-only deltas, `read_messages(...)` for selected bodies, and `update_messages(...)` for batched read/ack state.
    - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20&agent_token=<registration_token>` or `resource://thread/{id}?project=<abs-path>&agent=<Agent>&agent_token=<registration_token>&include_bodies=true` unless the current MCP session already authenticated as that agent.
    - Tip: set `AGENT_NAME` in your environment so the pre-commit guard can block commits that conflict with others' active exclusive file reservations.
 
@@ -176,7 +176,9 @@ How to use effectively
 
 Macros vs granular tools
 - Prefer macros when you want speed or are on a smaller model: `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`.
-- Use granular tools when you need control: `register_agent`, `file_reservation_paths`, `send_message`, `fetch_inbox`, `acknowledge_message`.
+- Use granular tools when you need control: `register_agent`, `file_reservation_paths`, `send_message`, `sync_inbox`, `read_messages`, `update_messages`.
+- For normal agent sessions, enable `TOOLS_FILTER_ENABLED=true` and `TOOLS_FILTER_PROFILE=agent`; administrative clients can keep the `full` profile.
+- For a one-process override without editing `.env`, launch with `mcp-agent-mail serve-http --tool-profile agent`.
 
 Common pitfalls
 - "from_agent not registered": always `register_agent` in the correct `project_key` first.
@@ -1660,10 +1662,12 @@ sequenceDiagram
   Server-->>Agent: result
 ```
 
-3) Check inbox
+3) Synchronize inbox
 
-- `fetch_inbox(project_key, agent_name, since_ts?, urgent_only?, unread_only?, include_bodies?, limit?)` returns recent messages, preserving thread_id where available. Pass `unread_only=true` to skip messages this recipient has already explicitly marked read (cuts token-burn for polling agents).
-- `acknowledge_message(project_key, agent_name, message_id)` marks acknowledgements.
+- `sync_inbox(project_key, agent_name, cursor?, limit?)` returns only newer metadata, oldest first, plus `next_cursor` and `has_more`.
+- `read_messages(project_key, agent_name, message_ids[])` retrieves selected full bodies in one call.
+- `update_messages(project_key, agent_name, read_ids?, acknowledge_ids?)` batches read and acknowledgement state.
+- `fetch_inbox(...)` and the single-message read/ack tools remain available to full-profile clients for specialized workflows.
 
 4) Avoid conflicts with file reservations (leases)
 
@@ -2040,7 +2044,9 @@ Common variables you may set:
 | `HTTP_RBAC_READER_ROLES` | `reader,read,ro` | CSV of reader roles |
 | `HTTP_RBAC_WRITER_ROLES` | `writer,write,tools,rw` | CSV of writer roles |
 | `HTTP_RBAC_DEFAULT_ROLE` | `reader` | Role used when none present |
-| `HTTP_RBAC_READONLY_TOOLS` | `health_check,fetch_inbox,whois,search_messages,summarize_thread` | CSV of read-only tool names |
+| `HTTP_RBAC_READONLY_TOOLS` | `health_check,fetch_inbox,sync_inbox,read_messages,whois,search_messages,summarize_thread` | CSV of read-only tool names |
+| `TOOLS_FILTER_ENABLED` | `false` | Enable server-side tool exposure filtering. |
+| `TOOLS_FILTER_PROFILE` | `full` | `agent` keeps durable messaging, cursor/batch inbox tools, and reservations; `full` keeps administrative tools. |
 | `HTTP_RATE_LIMIT_ENABLED` | `false` | Enable token-bucket limiter |
 | `HTTP_RATE_LIMIT_BACKEND` | `memory` | `memory` or `redis` |
 | `HTTP_RATE_LIMIT_PER_MINUTE` | `60` | Legacy per-IP limit (fallback) |
@@ -2283,13 +2289,16 @@ Output format (all tools/resources):
 | `register_agent` | `register_agent(project_key: str, program: str, model: str, name?: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Creates/updates agent; writes profile to Git |
 | `whois` | `whois(project_key: str, agent_name: str, include_recent_commits?: bool, commit_limit?: int)` | Agent profile dict | Enriched profile for one agent (optionally includes recent commits) |
 | `create_agent_identity` | `create_agent_identity(project_key: str, program: str, model: str, name_hint?: str, task_description?: str, attachments_policy?: str)` | Agent profile dict | Always creates a new unique agent |
-| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, cc?: list[str], bcc?: list[str], attachment_paths?: list[str], convert_images?: bool, importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, sender_token?: str)` | `{deliveries: list, count: int, attachments?}` | Writes canonical + inbox/outbox, converts images. Non-absolute `attachment_paths` resolve relative to the project archive root. |
-| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, sender_token?: str)` | `{thread_id, reply_to, deliveries: list, count: int, attachments?}` | Preserves/creates thread, inherits flags |
+| `send_message` | `send_message(project_key: str, sender_name: str, to: list[str], subject: str, body_md: str, cc?: list[str], bcc?: list[str], attachment_paths?: list[str], convert_images?: bool, importance?: str, ack_required?: bool, thread_id?: str, auto_contact_if_blocked?: bool, sender_token?: str)` | `{deliveries: list, count: int, attachments?}` | Writes canonical + inbox/outbox and returns compact receipts without echoing the body. Non-absolute `attachment_paths` resolve relative to the project archive root. |
+| `reply_message` | `reply_message(project_key: str, message_id: int, sender_name: str, body_md: str, to?: list[str], cc?: list[str], bcc?: list[str], subject_prefix?: str, sender_token?: str)` | `{thread_id, reply_to, deliveries: list, count: int, attachments?}` | Preserves/creates thread, inherits flags, and returns compact receipts without echoing the body. |
 | `request_contact` | `request_contact(project_key: str, from_agent: str, to_agent: str, to_project?: str, reason?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Request permission to message another agent |
 | `respond_contact` | `respond_contact(project_key: str, to_agent: str, from_agent: str, accept: bool, from_project?: str, ttl_seconds?: int, registration_token?: str)` | Contact link dict | Approve or deny a contact request |
 | `list_contacts` | `list_contacts(project_key: str, agent_name: str, registration_token?: str)` | `list[dict]` | List outbound contact links with target-project and expiry audit metadata |
 | `set_contact_policy` | `set_contact_policy(project_key: str, agent_name: str, policy: str, registration_token?: str)` | Agent dict | Set policy: `open`, `auto`, `contacts_only`, `block_all` |
 | `fetch_inbox` | `fetch_inbox(project_key: str, agent_name: str, limit?: int, urgent_only?: bool, include_bodies?: bool, since_ts?: str, topic?: str, unread_only?: bool, registration_token?: str)` | `list[dict]` | Non-mutating inbox read. `unread_only=true` filters to messages where this recipient's `read_ts` is NULL. |
+| `sync_inbox` | `sync_inbox(project_key: str, agent_name: str, cursor?: int, limit?: int, registration_token?: str)` | `{messages, next_cursor, has_more}` | Cursor-based metadata delta; bodies are always omitted. |
+| `read_messages` | `read_messages(project_key: str, agent_name: str, message_ids: list[int], registration_token?: str)` | `{messages}` | Reads full bodies for up to 100 selected visible messages. |
+| `update_messages` | `update_messages(project_key: str, agent_name: str, read_ids?: list[int], acknowledge_ids?: list[int], registration_token?: str)` | `{read_ids, acknowledged_ids, not_in_inbox_ids}` | Batches idempotent read and acknowledgement updates. |
 | `mark_message_read` | `mark_message_read(project_key: str, agent_name: str, message_id: int, registration_token?: str)` | `{message_id, read, read_at}` | Per-recipient read receipt |
 | `acknowledge_message` | `acknowledge_message(project_key: str, agent_name: str, message_id: int, registration_token?: str)` | `{message_id, acknowledged, acknowledged_at, read_at}` | Sets ack and read |
 | `macro_start_session` | `macro_start_session(human_key: str, program: str, model: str, task_description?: str, agent_name?: str, registration_token?: str, file_reservation_paths?: list[str], file_reservation_reason?: str, file_reservation_ttl_seconds?: int, inbox_limit?: int)` | `{project, agent, file_reservations, inbox}` | Orchestrates ensure→register→optional file reservation→inbox fetch |

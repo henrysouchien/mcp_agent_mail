@@ -209,6 +209,7 @@ CLUSTER_PRODUCT = "product_bus"
 # Profile definitions:
 #   - full: All tools (default, no filtering)
 #   - core: Essential tools for typical agent workflows
+#   - agent: Token-efficient durable communication and file coordination
 #   - minimal: Bare minimum for simple message passing
 #   - messaging: Focus on messaging without file reservations
 #   - custom: User-defined via TOOLS_FILTER_CLUSTERS/TOOLS_FILTER_TOOLS
@@ -221,6 +222,22 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
     "core": {
         "clusters": [CLUSTER_IDENTITY, CLUSTER_MESSAGING, CLUSTER_FILE_RESERVATIONS, CLUSTER_MACROS],
         "tools": ["health_check", "ensure_project"],
+    },
+    "agent": {
+        "clusters": [],
+        "tools": [
+            "macro_start_session",
+            "sync_inbox",
+            "read_messages",
+            "update_messages",
+            "send_message",
+            "reply_message",
+            "request_contact",
+            "respond_contact",
+            "list_contacts",
+            "file_reservation_paths",
+            "release_file_reservations",
+        ],
     },
     "minimal": {
         "clusters": [],
@@ -1785,6 +1802,20 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
     if include_body:
         data["body_md"] = message.body_md
     return data
+
+
+def _message_receipt(message: Message) -> dict[str, Any]:
+    """Return the compact durable-delivery facts needed after a write."""
+    return {
+        "id": message.id,
+        "project_id": message.project_id,
+        "thread_id": message.thread_id,
+        "topic": message.topic,
+        "subject": message.subject,
+        "importance": message.importance,
+        "ack_required": message.ack_required,
+        "created_ts": _iso(message.created_ts),
+    }
 
 
 def _format_cross_project_agent_address(project_slug: str, agent_name: str) -> str:
@@ -4345,6 +4376,8 @@ async def _list_inbox(
     since_ts: Optional[str],
     topic: Optional[str] = None,
     unread_only: bool = False,
+    after_message_id: Optional[int] = None,
+    oldest_first: bool = False,
 ) -> list[dict[str, Any]]:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing inbox.")
@@ -4371,9 +4404,9 @@ async def _list_inbox(
                 cast(Any, Message.project_id) == project.id,
                 MessageRecipient.agent_id == agent.id,
             )
-            .order_by(desc(Message.created_ts))
             .limit(limit)
         )
+        stmt = stmt.order_by(Message.id if oldest_first else desc(Message.id))
         if urgent_only:
             stmt = stmt.where(cast(Any, Message.importance).in_(["high", "urgent"]))
         if since_ts:
@@ -4390,6 +4423,8 @@ async def _list_inbox(
             # acknowledge_message do. The supporting index
             # idx_message_recipients_agent_message keeps the JOIN cheap.
             stmt = stmt.where(cast(Any, MessageRecipient.read_ts).is_(None))
+        if after_message_id is not None:
+            stmt = stmt.where(cast(Any, Message.id) > after_message_id)
         result = await session.execute(stmt)
         rows = result.all()
     messages: list[dict[str, Any]] = []
@@ -4913,9 +4948,9 @@ async def _update_recipient_timestamp(
         return existing[0]
 
 
-def build_mcp_server() -> FastMCP:
+def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
     """Create and configure the FastMCP server instance."""
-    settings: Settings = get_settings()
+    settings: Settings = settings_override or get_settings()
     lifespan = _lifespan_factory(settings)
 
     instructions = (
@@ -5462,7 +5497,10 @@ def build_mcp_server() -> FastMCP:
                 attachments_meta,
             )
             recipients_for_archive = [agent.name for agent in to_agents + cc_agents + bcc_agents]
-            payload = _message_to_dict(message)
+            # Write tools return a receipt, not a copy of the body the model just
+            # authored. The canonical body remains available through inbox/thread
+            # reads and the batch read_messages tool.
+            payload = _message_receipt(message)
             payload.update(
                 {
                     "to": [agent.name for agent in to_agents],
@@ -6860,7 +6898,13 @@ def build_mcp_server() -> FastMCP:
             "expired_at": _iso(now),
         }
 
-    @mcp.tool(name="send_message")
+    @mcp.tool(
+        name="send_message",
+        description=(
+            "Durably send one Markdown message to named agents. Supports threads, importance, acknowledgements, "
+            "CC/BCC, and attachments; returns a compact delivery receipt without echoing the body."
+        ),
+    )
     @_instrument_tool(
         "send_message",
         cluster=CLUSTER_MESSAGING,
@@ -8144,7 +8188,13 @@ def build_mcp_server() -> FastMCP:
             "max_age_days": age_limit,
         }
 
-    @mcp.tool(name="reply_message")
+    @mcp.tool(
+        name="reply_message",
+        description=(
+            "Durably reply to a visible message while preserving its thread, importance, and acknowledgement policy. "
+            "Returns a compact delivery receipt without echoing the reply body."
+        ),
+    )
     @_instrument_tool(
         "reply_message",
         cluster=CLUSTER_MESSAGING,
@@ -8714,7 +8764,10 @@ def build_mcp_server() -> FastMCP:
                 primary_payload.setdefault("attachments", attachments)
         return primary_payload
 
-    @mcp.tool(name="request_contact")
+    @mcp.tool(
+        name="request_contact",
+        description="Request permission for one agent to contact another agent, including across projects.",
+    )
     @_instrument_tool(
         "request_contact",
         cluster=CLUSTER_CONTACT,
@@ -8975,7 +9028,10 @@ def build_mcp_server() -> FastMCP:
             result["notification_error"] = notification_error
         return result
 
-    @mcp.tool(name="respond_contact")
+    @mcp.tool(
+        name="respond_contact",
+        description="Accept or deny a pending agent contact request.",
+    )
     @_instrument_tool(
         "respond_contact",
         cluster=CLUSTER_CONTACT,
@@ -9084,7 +9140,10 @@ def build_mcp_server() -> FastMCP:
             "updated": updated,
         }
 
-    @mcp.tool(name="list_contacts")
+    @mcp.tool(
+        name="list_contacts",
+        description="List an agent's contact links and their current approval state.",
+    )
     @_instrument_tool(
         "list_contacts",
         cluster=CLUSTER_CONTACT,
@@ -9185,7 +9244,13 @@ def build_mcp_server() -> FastMCP:
                 await s.commit()
         return {"agent": agent.name, "policy": pol}
 
-    @mcp.tool(name="fetch_inbox")
+    @mcp.tool(
+        name="fetch_inbox",
+        description=(
+            "Fetch recent inbox messages without changing read state. Prefer sync_inbox for cursor-based polling; "
+            "leave include_bodies false unless the full bodies are immediately needed."
+        ),
+    )
     @_instrument_tool(
         "fetch_inbox",
         cluster=CLUSTER_MESSAGING,
@@ -9296,6 +9361,219 @@ def build_mcp_server() -> FastMCP:
         except Exception as exc:
             _rich_error_panel("fetch_inbox", {"error": str(exc)})
             raise
+
+    def _validated_message_ids(message_ids: Sequence[int], argument: str) -> list[int]:
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for message_id in message_ids:
+            if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+                raise ToolExecutionError(
+                    "INVALID_ARGUMENT",
+                    f"{argument} must contain only positive integer message ids.",
+                    recoverable=True,
+                    data={"argument": argument},
+                )
+            if message_id not in seen:
+                normalized.append(message_id)
+                seen.add(message_id)
+        if len(normalized) > 100:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                f"{argument} accepts at most 100 unique message ids per call.",
+                recoverable=True,
+                data={"argument": argument, "maximum": 100},
+            )
+        return normalized
+
+    @mcp.tool(
+        name="sync_inbox",
+        description=(
+            "Return metadata for messages newer than an integer cursor, oldest first, plus next_cursor and has_more. "
+            "Bodies are omitted; use read_messages for selected ids."
+        ),
+    )
+    @_instrument_tool(
+        "sync_inbox",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def sync_inbox(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        cursor: int = 0,
+        limit: int = 20,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Synchronize new inbox metadata without replaying previously seen messages."""
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "cursor must be a non-negative integer message id.",
+                recoverable=True,
+                data={"argument": "cursor", "provided": cursor},
+            )
+        limit = _validate_limit(limit)
+        if limit > 100:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "sync_inbox limit cannot exceed 100 messages.",
+                recoverable=True,
+                data={"argument": "limit", "provided": limit, "maximum": 100},
+            )
+
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="sync_inbox",
+        )
+        items = await _list_inbox(
+            project,
+            agent,
+            limit + 1,
+            urgent_only=False,
+            include_bodies=False,
+            since_ts=None,
+            topic=None,
+            after_message_id=cursor,
+            oldest_first=True,
+        )
+        has_more = len(items) > limit
+        messages = items[:limit]
+        next_cursor = messages[-1]["id"] if messages else cursor
+        settings = get_settings()
+        if settings.notifications.enabled and not has_more:
+            with suppress(Exception):
+                await clear_notification_signal(settings, project.slug, agent.name)
+        return {
+            "messages": messages,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
+
+    @mcp.tool(
+        name="read_messages",
+        description="Read full bodies for up to 100 selected visible message ids in one call.",
+    )
+    @_instrument_tool(
+        "read_messages",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def read_messages(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        message_ids: list[int],
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Read chosen message bodies after a metadata-only inbox sync."""
+        ids = _validated_message_ids(message_ids, "message_ids")
+        if not ids:
+            return {"messages": []}
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="read_messages",
+        )
+        messages: list[dict[str, Any]] = []
+        for message_id in ids:
+            message = await _get_visible_message(project, agent, message_id)
+            sender = await _get_agent_any_project_by_id(message.sender_id)
+            sender_project = await _get_project_by_id(sender.project_id)
+            payload = _message_to_dict(message, include_body=True)
+            _apply_sender_identity(
+                payload,
+                message_project_id=message.project_id,
+                sender_name=sender.name,
+                sender_project_id=sender_project.id,
+                sender_project_human_key=sender_project.human_key,
+                sender_project_slug=sender_project.slug,
+            )
+            messages.append(payload)
+        return {"messages": messages}
+
+    @mcp.tool(
+        name="update_messages",
+        description="Mark up to 100 inbox messages read and/or acknowledged in one compact, idempotent call.",
+    )
+    @_instrument_tool(
+        "update_messages",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def update_messages(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        read_ids: Optional[list[int]] = None,
+        acknowledge_ids: Optional[list[int]] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Batch read and acknowledgement mutations to avoid per-message model turns."""
+        reads = _validated_message_ids(read_ids or [], "read_ids")
+        acknowledgements = _validated_message_ids(acknowledge_ids or [], "acknowledge_ids")
+        combined = list(dict.fromkeys([*reads, *acknowledgements]))
+        if len(combined) > 100:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "update_messages accepts at most 100 unique message ids per call.",
+                recoverable=True,
+                data={"maximum": 100},
+            )
+        if not combined:
+            return {"read_ids": [], "acknowledged_ids": [], "not_in_inbox_ids": []}
+
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="update_messages",
+        )
+        for message_id in combined:
+            await _get_visible_message(project, agent, message_id)
+
+        updated_reads: list[int] = []
+        updated_acknowledgements: list[int] = []
+        not_in_inbox: list[int] = []
+        read_targets = set(reads) | set(acknowledgements)
+        for message_id in combined:
+            if message_id in read_targets:
+                read_ts = await _update_recipient_timestamp(agent, message_id, "read_ts")
+                if read_ts is None:
+                    not_in_inbox.append(message_id)
+                    continue
+                updated_reads.append(message_id)
+            if message_id in acknowledgements:
+                ack_ts = await _update_recipient_timestamp(agent, message_id, "ack_ts")
+                if ack_ts is not None:
+                    updated_acknowledgements.append(message_id)
+
+        return {
+            "read_ids": sorted(updated_reads),
+            "acknowledged_ids": sorted(updated_acknowledgements),
+            "not_in_inbox_ids": sorted(not_in_inbox),
+        }
 
     @mcp.tool(name="fetch_topic")
     @_instrument_tool(
@@ -9512,7 +9790,10 @@ def build_mcp_server() -> FastMCP:
                     pass
             raise
 
-    @mcp.tool(name="acknowledge_message")
+    @mcp.tool(
+        name="acknowledge_message",
+        description="Acknowledge one inbox message and mark it read. Prefer update_messages when handling multiple messages.",
+    )
     @_instrument_tool(
         "acknowledge_message",
         cluster=CLUSTER_MESSAGING,
@@ -9601,7 +9882,13 @@ def build_mcp_server() -> FastMCP:
                     pass
             raise
 
-    @mcp.tool(name="macro_start_session")
+    @mcp.tool(
+        name="macro_start_session",
+        description=(
+            "Start an Agent Mail session: ensure the project, register or authenticate an agent, optionally reserve files, "
+            "and return a metadata-only inbox snapshot."
+        ),
+    )
     @_instrument_tool(
         "macro_start_session",
         cluster=CLUSTER_MACROS,
@@ -10997,7 +11284,10 @@ def build_mcp_server() -> FastMCP:
             await _ctx_info_safe(ctx, f"No pre-commit guard to remove at {repo_path / '.git/hooks/pre-commit'}.")
         return {"removed": removed}
 
-    @mcp.tool(name="file_reservation_paths")
+    @mcp.tool(
+        name="file_reservation_paths",
+        description="Reserve file paths or globs for an agent and return granted reservations plus conflicts.",
+    )
     @_instrument_tool("file_reservation_paths", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations", "repository"}, project_arg="project_key", agent_arg="agent_name")
     async def file_reservation_paths(
         ctx: Context,
@@ -11281,7 +11571,10 @@ def build_mcp_server() -> FastMCP:
             )
         return {"granted": granted, "conflicts": conflicts, "warnings": warnings_list}
 
-    @mcp.tool(name="release_file_reservations")
+    @mcp.tool(
+        name="release_file_reservations",
+        description="Release an agent's active file reservations, optionally limited to specified paths.",
+    )
     @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
     async def release_file_reservations_tool(
         ctx: Context,
