@@ -172,11 +172,21 @@ Note the hash algorithm change: NTM used MD5, the canonical convention uses SHA-
 
 ## Interaction with Window Identity (DB-Based)
 
-The MCP Agent Mail server also has a database-backed window identity system (`MCP_AGENT_MAIL_WINDOW_ID`, stored in the `window_identities` table). That system uses a UUID and is managed by the server process.
+The MCP Agent Mail server also has a database-backed window identity system (`MCP_AGENT_MAIL_WINDOW_ID`, stored in the `window_identities` table). That system uses a UUID and is managed by the server process. Shared HTTP servers can receive the UUID per request through either `X-MCP-Agent-Mail-Window-ID: <uuid>` or `Authorization: Bearer mcp-window:<uuid>`; this avoids assigning one server-process identity to every connected pane.
 
 The file-based identity contract documented here serves a different purpose: it allows **shell scripts, hooks, and external tools** to discover which agent is running in which pane without needing to query the MCP server. The two systems are complementary:
 
 - File-based: for shell-level identity discovery (hooks, integration scripts, cron jobs).
 - DB-based: for server-level identity persistence (MCP tool calls, session continuity).
 
-A future enhancement could have `register_agent` in the server also call `identity-write.sh` to keep both systems in sync.
+A local pane or fleet binding remains routing metadata, not Agent Mail sender authority. The request carrier becomes usable only when its UUID is already associated with the requested agent and project. Agent Mail may create or refresh that association after a registration-token-backed call or another call from a session already authenticated as the agent. It refuses to overwrite a UUID associated with a different agent.
+
+Fleet tooling should therefore use this sequence:
+
+1. Create a distinct, persistent UUID for the pane or independently routed client without printing it.
+2. Pass it on every HTTP MCP request using one of the request carrier forms above.
+3. Authenticate once as the intended Agent Mail identity using its registration token or an already authenticated MCP session.
+4. Prove the persisted association with a no-token `whois` call for the same project and agent.
+5. Keep shell-level pane routing metadata separate and fail closed if either the live route or Agent Mail proof is missing.
+
+An invalid request carrier deliberately blocks fallback to the process-wide environment value. Treat the UUID like a bearer credential: store it with restrictive permissions, exclude it from logs and prompts, and use TLS outside localhost.

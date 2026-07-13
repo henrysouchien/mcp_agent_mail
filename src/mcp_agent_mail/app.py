@@ -23,6 +23,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -100,6 +101,30 @@ except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None
 
 logger = logging.getLogger(__name__)
+
+_request_window_identity_uuid: ContextVar[str] = ContextVar(
+    "mcp_agent_mail_request_window_identity_uuid",
+    default="",
+)
+
+
+def set_request_window_identity_uuid(window_uuid: str) -> Token[str]:
+    """Attach a request-scoped window identity for HTTP transports."""
+    return _request_window_identity_uuid.set((window_uuid or "").strip())
+
+
+def reset_request_window_identity_uuid(token: Token[str]) -> None:
+    """Reset a request-scoped window identity context token."""
+    _request_window_identity_uuid.reset(token)
+
+
+def effective_window_identity_uuid(settings: Settings | None = None) -> str:
+    """Return request-scoped window identity, falling back to process env settings."""
+    request_uuid = (_request_window_identity_uuid.get("") or "").strip()
+    if request_uuid:
+        return request_uuid
+    resolved_settings = settings or get_settings()
+    return (getattr(resolved_settings, "window_identity_uuid", "") or "").strip()
 
 
 class _FastMCPToolGetter(Protocol):
@@ -3299,7 +3324,7 @@ async def _get_or_create_agent(
         raise ValueError("Project must have an id before creating agents.")
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     explicit_name_used = False
-    window_uuid = getattr(settings, "window_identity_uuid", "") or ""
+    window_uuid = effective_window_identity_uuid(settings)
     ttl_days = getattr(settings, "window_identity_ttl_days", 30)
     window_identity: Optional[WindowIdentity] = None
 
@@ -5064,6 +5089,40 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         bindings.add((project_id, agent_id))
         current_agents[project_id] = agent_id
 
+    async def _bind_current_window_identity_to_agent(
+        ctx: Context,
+        project: Project,
+        agent: Agent,
+    ) -> bool:
+        """Persist the request/process window carrier after sender auth succeeds."""
+        if project.id is None:
+            return False
+        window_uuid = effective_window_identity_uuid(settings)
+        if not window_uuid or not _validate_window_uuid(window_uuid):
+            return False
+
+        ttl_days = getattr(settings, "window_identity_ttl_days", 30)
+        window_identity = await _get_window_identity(project, window_uuid)
+        if window_identity is None:
+            window_identity = await _create_window_identity(project, window_uuid, agent.name, ttl_days)
+
+        if window_identity.display_name != agent.name:
+            await _ctx_info_safe(
+                ctx,
+                (
+                    "Current window identity is already bound to another agent in "
+                    f"project '{project.human_key}'; leaving it unchanged."
+                ),
+            )
+            return False
+
+        await _touch_window_identity(window_identity, ttl_days)
+        await _ctx_info_safe(
+            ctx,
+            f"Bound current window identity to agent '{agent.name}' in project '{project.human_key}'.",
+        )
+        return True
+
     def _session_is_bound_to_agent(ctx: Context, project: Project, agent: Agent) -> bool:
         if project.id is None or agent.id is None:
             return False
@@ -5101,6 +5160,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         agent = await _get_agent(project, agent_name)
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
+            await _bind_current_window_identity_to_agent(ctx, project, agent)
             return agent
 
         stored_token = (agent.registration_token or "").strip()
@@ -5134,12 +5194,12 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             # Fallback: auto-rebind via window identity when session reconnects.
             # If MCP_AGENT_MAIL_WINDOW_ID is set and maps to this agent in this
             # project, treat it as proof of identity and bind the session.
-            _wi_settings = get_settings()
-            _wi_uuid = getattr(_wi_settings, "window_identity_uuid", "") or ""
+            _wi_uuid = effective_window_identity_uuid()
             if _wi_uuid and _validate_window_uuid(_wi_uuid):
                 _wi = await _get_window_identity(project, _wi_uuid)
                 if _wi and _wi.display_name == agent.name:
                     _bind_session_agent(ctx, project, agent)
+                    await _bind_current_window_identity_to_agent(ctx, project, agent)
                     return agent
             raise ToolExecutionError(
                 "AUTHENTICATION_REQUIRED",
@@ -5159,6 +5219,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
 
         _bind_session_agent(ctx, project, agent)
+        await _bind_current_window_identity_to_agent(ctx, project, agent)
         return agent
 
     async def _resolve_authenticated_agent(
@@ -5372,7 +5433,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         notification_message_meta: dict[str, Any] | None = None
         message: Message | None = None
         window_identity: WindowIdentity | None = None
-        _wi_uuid = getattr(settings, "window_identity_uuid", "") or ""
+        _wi_uuid = effective_window_identity_uuid(settings)
         if _wi_uuid and _validate_window_uuid(_wi_uuid):
             window_identity = await _get_window_identity(project, _wi_uuid)
 
@@ -5951,7 +6012,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         # Enrich with window identity info if MCP_AGENT_MAIL_WINDOW_ID is set.
         # NOTE: _get_or_create_agent already resolved this for the archive profile,
         # but propagating it via return type would churn 8+ callers for a cold-path query.
-        window_uuid = getattr(settings, "window_identity_uuid", "") or ""
+        window_uuid = effective_window_identity_uuid(settings)
         if window_uuid and _validate_window_uuid(window_uuid):
             wi = await _get_window_identity(project, window_uuid)
             if wi:

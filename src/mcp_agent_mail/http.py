@@ -11,6 +11,7 @@ import importlib
 import json
 import logging
 import re
+import uuid
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -36,6 +37,8 @@ from .app import (
     build_mcp_server,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
+    reset_request_window_identity_uuid,
+    set_request_window_identity_uuid,
     sweep_stale_agents,
     update_project_sibling_status,
 )
@@ -731,6 +734,46 @@ def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> boo
     return BearerAuthMiddleware._is_localhost(client_host) and not BearerAuthMiddleware._has_forwarded_headers(
         request
     )
+
+
+_WINDOW_IDENTITY_HEADER_NAMES = (
+    b"x-mcp-agent-mail-window-id",
+    b"x-agent-mail-window-id",
+)
+_WINDOW_IDENTITY_BEARER_PREFIXES = (
+    "mcp-window:",
+    "agent-mail-window:",
+)
+
+
+def _normalize_window_identity_candidate(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    try:
+        return str(uuid.UUID(candidate))
+    except (TypeError, ValueError, AttributeError):
+        # Preserve invalid request-scoped input so it fails closed instead of
+        # falling back to a process-scoped MCP_AGENT_MAIL_WINDOW_ID.
+        return candidate
+
+
+def _extract_window_identity_from_headers(headers: list[tuple[bytes, bytes]]) -> str:
+    for raw_name, raw_value in headers:
+        if raw_name.lower() in _WINDOW_IDENTITY_HEADER_NAMES:
+            return _normalize_window_identity_candidate(raw_value.decode("latin1"))
+
+    for raw_name, raw_value in headers:
+        if raw_name.lower() != b"authorization":
+            continue
+        auth = raw_value.decode("latin1").strip()
+        if not auth.lower().startswith("bearer "):
+            continue
+        bearer = auth[7:].strip()
+        for prefix in _WINDOW_IDENTITY_BEARER_PREFIXES:
+            if bearer.startswith(prefix):
+                return _normalize_window_identity_candidate(bearer[len(prefix):])
+    return ""
 
 
 class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
@@ -1448,7 +1491,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 try:
                     response = await call_next(request)
                     return response
-                except BaseException as err:  # noqa: BLE001 - log then re-raise
+                except BaseException as err:
                     exc = err
                     raise
                 finally:
@@ -1663,7 +1706,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             new_scope = dict(scope)
             new_scope["headers"] = headers
 
-            await self._app(new_scope, receive, send)
+            window_uuid = _extract_window_identity_from_headers(headers)
+            token = set_request_window_identity_uuid(window_uuid) if window_uuid else None
+            try:
+                await self._app(new_scope, receive, send)
+            finally:
+                if token is not None:
+                    reset_request_window_identity_uuid(token)
 
     # Mount at both '/base' and '/base/' to tolerate either form from clients/tests.
     # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.
