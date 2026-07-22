@@ -941,6 +941,8 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE projects ADD COLUMN namespace_kind VARCHAR(32) DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE window_identities ADD COLUMN agent_id INTEGER DEFAULT NULL REFERENCES agents(id)",
+        "ALTER TABLE message_recipients ADD COLUMN provenance VARCHAR(32) DEFAULT NULL",
+        "ALTER TABLE message_recipients ADD COLUMN obligation_id VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
         # #188: persist the direct parent→child reply edge so replies survive a
         # round-trip through the DB (previously reply_to lived only in the
@@ -960,6 +962,10 @@ def _setup_fts(connection: Any) -> None:
         "ON runtime_bindings (authority_kind, authority_id) WHERE state != 'ended'",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_bindings_active_route "
         "ON runtime_bindings (host_id, tmux_server_id, pane_id) WHERE state != 'ended'",
+        "CREATE INDEX IF NOT EXISTS ix_message_recipients_provenance "
+        "ON message_recipients (provenance)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_recipients_obligation_id "
+        "ON message_recipients (obligation_id) WHERE obligation_id IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
     ]:

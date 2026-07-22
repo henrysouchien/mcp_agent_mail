@@ -350,9 +350,10 @@ async def test_list_window_identities(isolated_env, monkeypatch):
 
         assert result.data["count"] >= 1
         identities = result.data["identities"]
-        found = [i for i in identities if i["window_uuid"] == window_uuid]
-        assert len(found) == 1
-        assert found[0]["display_name"] is not None
+        assert len(identities) == 1
+        assert identities[0]["display_name"] is not None
+        assert identities[0]["agent_id"] is not None
+        assert "window_uuid" not in identities[0]
 
 
 @pytest.mark.asyncio
@@ -360,6 +361,8 @@ async def test_rename_window(isolated_env, monkeypatch):
     """rename_window should update the display name."""
     window_uuid = str(uuid.uuid4())
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
+    owner_token = "test-window-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
 
     from mcp_agent_mail.config import clear_settings_cache
     clear_settings_cache()
@@ -383,6 +386,7 @@ async def test_rename_window(isolated_env, monkeypatch):
                 "project_key": "/test/window",
                 "window_uuid": window_uuid,
                 "new_display_name": "SilverFox",
+                "owner_token": owner_token,
             },
         )
 
@@ -395,6 +399,8 @@ async def test_expire_window(isolated_env, monkeypatch):
     """expire_window should mark the identity as expired."""
     window_uuid = str(uuid.uuid4())
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
+    owner_token = "test-window-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
 
     from mcp_agent_mail.config import clear_settings_cache
     clear_settings_cache()
@@ -416,6 +422,7 @@ async def test_expire_window(isolated_env, monkeypatch):
             {
                 "project_key": "/test/window",
                 "window_uuid": window_uuid,
+                "owner_token": owner_token,
             },
         )
 
@@ -426,8 +433,7 @@ async def test_expire_window(isolated_env, monkeypatch):
             "list_window_identities",
             {"project_key": "/test/window"},
         )
-        found = [i for i in list_result.data["identities"] if i["window_uuid"] == window_uuid]
-        assert len(found) == 0
+        assert list_result.data["identities"] == []
 
 
 # ============================================================================

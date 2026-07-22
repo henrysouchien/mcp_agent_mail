@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
@@ -19,6 +20,7 @@ class RecipientIdentity:
     agent_id: int
     name: str
     kind: str
+    provenance: str = "legacy_unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +69,11 @@ def _request_payload(
         "importance": importance,
         "project_id": project_id,
         "recipients": [
-            {"agent_id": recipient.agent_id, "kind": recipient.kind}
+            {
+                "agent_id": recipient.agent_id,
+                "kind": recipient.kind,
+                "provenance": recipient.provenance,
+            }
             for recipient in recipients
         ],
         "reply_to": reply_to,
@@ -154,6 +160,8 @@ async def create_atomic_message(
                     message_id=message.id,
                     agent_id=recipient.agent_id,
                     kind=recipient.kind,
+                    provenance=recipient.provenance,
+                    obligation_id=uuid.uuid4().hex,
                 )
             )
         sender.last_active_ts = _utcnow_naive()
@@ -173,6 +181,13 @@ async def create_atomic_message(
                 "importance": importance,
                 "message_id": message.id,
                 "recipient_count": len(recipients),
+                "recipient_provenance": [
+                    {
+                        "agent_id": recipient.agent_id,
+                        "provenance": recipient.provenance,
+                    }
+                    for recipient in recipients
+                ],
                 "reply_to": reply_to,
                 "thread_id": thread_id,
                 "topic": topic,

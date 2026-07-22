@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 import uuid
@@ -25,6 +26,7 @@ from mcp_agent_mail.models import (
     IdempotencyRecord,
     Message,
     MessageRecipient,
+    Project,
     RuntimeBinding,
     WindowIdentity,
 )
@@ -351,13 +353,296 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
         with pytest.raises(ToolError, match="another active runtime incarnation"):
             await client.call_tool("reconcile_runtime_binding", conflict_args)
 
+        issued = await client.call_tool(
+            "issue_continuation_receipt",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "registration_token": agent["registration_token"],
+                "owner_token": owner_token,
+                "expected_generation": 2,
+            },
+        )
+        receipt = issued.data["continuation_receipt"]
+        continued = await client.call_tool(
+            "consume_continuation_receipt",
+            {
+                "project_key": project_key,
+                "continuation_receipt": receipt,
+                "host_id": "host-a",
+                "tmux_server_id": "server-a",
+                "pane_id": "%40",
+                "program": "codex",
+                "model": "gpt-5.6-new-account",
+                "process_started_ts": "2026-07-22T15:10:00Z",
+            },
+        )
+        assert continued.data["generation"] == 3
+        assert continued.data["runtime_session_id"] == runtime_session_id
+        assert continued.data["pane_incarnation_id"] == pane_incarnation_id
+        with pytest.raises(ToolError, match="consumed or expired"):
+            await client.call_tool(
+                "consume_continuation_receipt",
+                {
+                    "project_key": project_key,
+                    "continuation_receipt": receipt,
+                    "host_id": "host-a",
+                    "tmux_server_id": "server-a",
+                    "pane_id": "%40",
+                    "program": "codex",
+                    "model": "gpt-5.6-new-account",
+                    "process_started_ts": "2026-07-22T15:10:00Z",
+                },
+            )
+
+        new_window_uuid = str(uuid.uuid4())
+        rotated = await client.call_tool(
+            "rotate_runtime_binding",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "registration_token": agent["registration_token"],
+                "owner_token": owner_token,
+                "expected_generation": 3,
+                "new_window_uuid": new_window_uuid,
+                "runtime_session_id": str(uuid.uuid4()),
+                "pane_incarnation_id": str(uuid.uuid4()),
+                "host_id": "host-a",
+                "tmux_server_id": "server-a",
+                "pane_id": "%40",
+                "program": "codex",
+                "model": "gpt-5.6-new-task",
+                "process_started_ts": "2026-07-22T15:20:00Z",
+            },
+        )
+        assert rotated.data["generation"] == 4
+
     async with get_session() as session:
         rows = (
             await session.execute(
                 select(RuntimeBinding).order_by(cast(Any, RuntimeBinding.generation))
             )
         ).scalars().all()
-    assert [(row.generation, row.state) for row in rows] == [(1, "ended"), (2, "healthy")]
+    assert [(row.generation, row.state) for row in rows] == [
+        (1, "ended"),
+        (2, "ended"),
+        (3, "ended"),
+        (4, "healthy"),
+    ]
+
+    old_status, old_payload = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="whois",
+        arguments={
+            "project_key": project_key,
+            "agent_name": agent["name"],
+            "include_recent_commits": False,
+        },
+    )
+    assert old_status == 200
+    assert _jsonrpc_failed(old_payload)
+    new_status, new_payload = await _fresh_http_tool_call(
+        window_uuid=new_window_uuid,
+        tool_name="whois",
+        arguments={
+            "project_key": project_key,
+            "agent_name": agent["name"],
+            "include_recent_commits": False,
+        },
+    )
+    assert new_status == 200
+    assert not _jsonrpc_failed(new_payload)
+
+
+@pytest.mark.asyncio
+async def test_managed_watcher_v2_signal_and_prestop_are_durable_bounded_and_fail_open(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _configure_database_profile(monkeypatch)
+    owner_token = "test-managed-watcher-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
+    monkeypatch.setenv("NOTIFICATIONS_ENABLED", "true")
+    signals_dir = tmp_path / "signals"
+    monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", str(signals_dir))
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", "")
+    _config.clear_settings_cache()
+    project_key = "/regression/managed-watcher"
+
+    async with Client(build_mcp_server()) as setup_client:
+        await setup_client.call_tool("ensure_project", {"human_key": project_key})
+        sender = await _register_agent(
+            setup_client,
+            project_key=project_key,
+            name="GreenCastle",
+        )
+
+    window_uuid = str(uuid.uuid4())
+    runtime_session_id = str(uuid.uuid4())
+    pane_incarnation_id = str(uuid.uuid4())
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
+    _config.clear_settings_cache()
+    async with Client(build_mcp_server()) as client:
+        recipient = await _register_agent(client, project_key=project_key, name="BlueLake")
+        await client.call_tool(
+            "set_contact_policy",
+            {"project_key": project_key, "agent_name": recipient["name"], "policy": "open"},
+        )
+        await client.call_tool(
+            "reconcile_runtime_binding",
+            {
+                "project_key": project_key,
+                "agent_name": recipient["name"],
+                "registration_token": recipient["registration_token"],
+                "owner_token": owner_token,
+                "runtime_session_id": runtime_session_id,
+                "pane_incarnation_id": pane_incarnation_id,
+                "host_id": "host-watcher",
+                "tmux_server_id": "server-watcher",
+                "pane_id": "%41",
+                "program": "codex",
+                "model": "gpt-5.6",
+                "process_started_ts": "2026-07-22T15:00:00Z",
+                "expected_generation": 0,
+            },
+        )
+        sent = await client.call_tool(
+            "send_message",
+            {
+                "project_key": project_key,
+                "sender_name": sender["name"],
+                "sender_token": sender["registration_token"],
+                "to": [recipient["name"]],
+                "subject": "ACK me",
+                "body_md": "This body must never enter the control envelope.",
+                "importance": "urgent",
+                "ack_required": True,
+            },
+        )
+        message_id = int(sent.data["deliveries"][0]["payload"]["id"])
+
+        staged = await client.call_tool(
+            "watch_inbox",
+            {
+                "project_key": project_key,
+                "agent_name": recipient["name"],
+                "runtime_session_id": runtime_session_id,
+            },
+        )
+        assert [item["id"] for item in staged.data["messages"]] == [message_id]
+        obligation_id = staged.data["messages"][0]["recipient_obligation_id"]
+        assert staged.data["messages"][0]["recipient_provenance"] == "explicit_to"
+        replayed = await client.call_tool(
+            "watch_inbox",
+            {
+                "project_key": project_key,
+                "agent_name": recipient["name"],
+                "runtime_session_id": runtime_session_id,
+            },
+        )
+        assert replayed.data["replayed"] is True
+        assert replayed.data["discovery_generation"] == staged.data["discovery_generation"]
+        committed = await client.call_tool(
+            "commit_inbox_discovery",
+            {
+                "project_key": project_key,
+                "agent_name": recipient["name"],
+                "runtime_session_id": runtime_session_id,
+                "discovery_generation": staged.data["discovery_generation"],
+            },
+        )
+        assert committed.data["cursor"] == message_id
+        assert committed.data["marked_read"] is False
+
+    async with get_session() as session:
+        project = (await session.execute(select(Project))).scalar_one()
+        recipient_row = (
+            await session.execute(
+                select(Agent).where(cast(Any, Agent.name) == recipient["name"])
+            )
+        ).scalar_one()
+    signal_path = (
+        signals_dir
+        / "v2"
+        / "projects"
+        / str(project.id)
+        / "agents"
+        / f"{recipient_row.id}.signal"
+    )
+    signal = json.loads(signal_path.read_text(encoding="utf-8"))
+    assert signal["schema_version"] == 2
+    assert signal["recipient_agent_id"] == recipient_row.id
+    assert signal["obligations"][0]["recipient_obligation_id"] == obligation_id
+    assert "subject" not in json.dumps(signal)
+    assert "body" not in json.dumps(signal)
+
+    decision_args = {
+        "project_key": project_key,
+        "agent_name": recipient["name"],
+        "runtime_session_id": runtime_session_id,
+        "pane_incarnation_id": pane_incarnation_id,
+        "runtime_generation": 1,
+        "host_id": "host-watcher",
+        "tmux_server_id": "server-watcher",
+        "pane_id": "%41",
+        "signal_project_id": project.id,
+        "signal_recipient_agent_id": recipient_row.id,
+        "signal_generation": signal["generation"],
+        "recipient_obligation_id": obligation_id,
+    }
+    status, first = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="pre_stop_decision",
+        arguments=decision_args,
+    )
+    assert status == 200
+    assert first["result"]["structuredContent"]["decision"] == "block_stop"
+
+    _, second = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="pre_stop_decision",
+        arguments=decision_args,
+    )
+    assert second["result"]["structuredContent"]["attempt"] == 2
+    _, exhausted = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="pre_stop_decision",
+        arguments=decision_args,
+    )
+    assert exhausted["result"]["structuredContent"]["decision"] == "allow_stop"
+    assert exhausted["result"]["structuredContent"]["reason_code"] == "stop_budget_exhausted"
+
+    wrong_route = dict(decision_args)
+    wrong_route["pane_id"] = "%wrong"
+    _, deferred = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="pre_stop_decision",
+        arguments=wrong_route,
+    )
+    assert deferred["result"]["structuredContent"] == {
+        "decision": "allow_stop",
+        "reason_code": "notification_deferred",
+        "diagnostic": "notification_deferred",
+    }
+
+    _, marked = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="mark_message_read",
+        arguments={
+            "project_key": project_key,
+            "agent_name": recipient["name"],
+            "message_id": message_id,
+        },
+    )
+    assert not _jsonrpc_failed(marked)
+    _, after_read = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="pre_stop_decision",
+        arguments=decision_args,
+    )
+    assert after_read["result"]["structuredContent"]["decision"] == "allow_stop"
+    assert after_read["result"]["structuredContent"]["reason_code"] == "no_blocking_obligation"
 
 
 @pytest.mark.asyncio

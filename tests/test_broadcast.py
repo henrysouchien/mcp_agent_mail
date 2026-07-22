@@ -107,6 +107,24 @@ async def test_broadcast_expands_to_all_agents(isolated_env):
         assert sender not in recipients, "Sender should not be in broadcast recipients"
         for name in names[1:]:
             assert name in recipients, f"Expected {name} in recipients"
+        receipt = data["broadcast_receipt"]
+        assert receipt["scope"] == "active_registered"
+        assert {item["agent_name"] for item in receipt["included"]} == set(names[1:])
+        assert any(
+            item["agent_name"] == sender and item["reason"] == "sender"
+            for item in receipt["excluded"]
+        )
+
+        inbox = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/test/bcast",
+                "agent_name": names[1],
+                "limit": 10,
+            },
+        )
+        inbox_data = _get_list(inbox)
+        assert inbox_data[0]["recipient_provenance"] == "broadcast_expansion"
 
 
 @pytest.mark.asyncio

@@ -144,8 +144,13 @@ class TestToolFilter:
 
         names = {tool.name for tool in agent_tools}
         assert names == {
+            "identity_status",
+            "heartbeat_runtime_binding",
             "macro_start_session",
             "sync_inbox",
+            "watch_inbox",
+            "commit_inbox_discovery",
+            "pre_stop_decision",
             "read_messages",
             "update_messages",
             "send_message",
@@ -172,17 +177,18 @@ class TestNotifications:
 
         assert settings.notifications.enabled is False
 
-    def test_notification_settings_enabled(self, isolated_env, monkeypatch):
+    def test_notification_settings_enabled(self, isolated_env, monkeypatch, tmp_path):
         """Push notifications can be enabled via env."""
         from mcp_agent_mail.config import clear_settings_cache, get_settings
 
         monkeypatch.setenv("NOTIFICATIONS_ENABLED", "true")
-        monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", "/tmp/test_signals")
+        signals_dir = tmp_path / "test_signals"
+        monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", str(signals_dir))
         clear_settings_cache()
 
         settings = get_settings()
         assert settings.notifications.enabled is True
-        assert settings.notifications.signals_dir == "/tmp/test_signals"
+        assert settings.notifications.signals_dir == str(signals_dir)
         assert settings.notifications.include_metadata is True
         assert settings.notifications.debounce_ms == 100
 

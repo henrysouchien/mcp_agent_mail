@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,64 @@ async def emit_notification_signal(
         signal_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = signal_path.with_suffix(f"{signal_path.suffix}.tmp")
         temporary_path.write_text(json.dumps(signal_data, indent=2), encoding="utf-8")
+        temporary_path.replace(signal_path)
+
+    try:
+        await asyncio.to_thread(write_signal)
+        return True
+    except Exception:
+        return False
+
+
+async def emit_notification_signal_v2(
+    settings: Settings,
+    *,
+    project_id: int,
+    recipient_agent_id: int,
+    generation: int,
+    max_message_id: int,
+    obligations: list[dict[str, Any]],
+    runtime_generation: int | None = None,
+    route_generation: int | None = None,
+) -> bool:
+    """Write a token-free immutable-recipient wakeup envelope.
+
+    This file is advisory.  Consumers must authenticate through the affected
+    client's request carrier and re-query authoritative obligation state before
+    taking any control action.
+    """
+    if not settings.notifications.enabled:
+        return False
+    root = Path(settings.notifications.signals_dir).expanduser().resolve()
+    signal_path = (
+        root
+        / "v2"
+        / "projects"
+        / str(project_id)
+        / "agents"
+        / f"{recipient_agent_id}.signal"
+    )
+    signal_data = {
+        "schema_version": 2,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "project_id": project_id,
+        "recipient_agent_id": recipient_agent_id,
+        "generation": generation,
+        "max_message_id": max_message_id,
+        "runtime_generation": runtime_generation,
+        "route_generation": route_generation,
+        "obligations": obligations,
+    }
+
+    def write_signal() -> None:
+        signal_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = signal_path.with_suffix(
+            f"{signal_path.suffix}.tmp-{uuid.uuid4().hex}"
+        )
+        temporary_path.write_text(
+            json.dumps(signal_data, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         temporary_path.replace(signal_path)
 
     try:

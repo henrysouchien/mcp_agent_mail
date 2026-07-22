@@ -83,6 +83,8 @@ class MessageRecipient(SQLModel, table=True):
     message_id: int = Field(foreign_key="messages.id", primary_key=True)
     agent_id: int = Field(foreign_key="agents.id", primary_key=True)
     kind: str = Field(max_length=8, default="to")
+    provenance: Optional[str] = Field(default=None, max_length=32, index=True)
+    obligation_id: Optional[str] = Field(default=None, max_length=64, unique=True, index=True)
     read_ts: Optional[datetime] = Field(default=None)
     ack_ts: Optional[datetime] = Field(default=None)
 
@@ -225,6 +227,77 @@ class RuntimeBinding(SQLModel, table=True):
     last_heartbeat_ts: datetime = Field(default_factory=_utcnow_naive)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     ended_ts: Optional[datetime] = Field(default=None)
+
+
+class InboxCursor(SQLModel, table=True):
+    """Durable discovery cursor for one managed inbox consumer."""
+
+    __tablename__ = "inbox_cursors"
+    __table_args__ = (
+        UniqueConstraint("project_id", "agent_id", "consumer_id", name="uq_inbox_cursor_consumer"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    consumer_id: str = Field(max_length=128)
+    cursor: int = Field(default=0, ge=0)
+    pending_cursor: int = Field(default=0, ge=0)
+    pending_ids_json: str = Field(default="[]")
+    discovery_generation: int = Field(default=0, ge=0)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class NotificationSignalState(SQLModel, table=True):
+    """Monotonic v2 wakeup generation for one immutable recipient."""
+
+    __tablename__ = "notification_signal_states"
+    __table_args__ = (
+        UniqueConstraint("project_id", "agent_id", name="uq_notification_signal_recipient"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    generation: int = Field(default=0, ge=0)
+    max_message_id: int = Field(default=0, ge=0)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class StopAttempt(SQLModel, table=True):
+    """Atomic hard-stop budget keyed by immutable obligation and policy."""
+
+    __tablename__ = "stop_attempts"
+    __table_args__ = (
+        UniqueConstraint("obligation_id", "policy_version", name="uq_stop_attempt_policy"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    obligation_id: str = Field(max_length=64, index=True)
+    policy_version: str = Field(max_length=64)
+    attempts_allocated: int = Field(default=0, ge=0)
+    last_attempt_ts: Optional[datetime] = Field(default=None)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class ContinuationReceipt(SQLModel, table=True):
+    """Replay-tracked digest and scope for a signed continuation receipt."""
+
+    __tablename__ = "continuation_receipts"
+
+    nonce: str = Field(primary_key=True, max_length=64)
+    token_digest: str = Field(min_length=64, max_length=64, unique=True, index=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    authority_kind: str = Field(max_length=32)
+    authority_id: str = Field(max_length=64)
+    runtime_session_id: str = Field(max_length=128)
+    pane_incarnation_id: str = Field(max_length=128)
+    prior_generation: int = Field(ge=1)
+    carrier_digest: str = Field(min_length=64, max_length=64)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    expires_ts: datetime
+    consumed_ts: Optional[datetime] = Field(default=None)
 
 
 class MessageSummary(SQLModel, table=True):
