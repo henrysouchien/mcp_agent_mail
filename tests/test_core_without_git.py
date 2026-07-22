@@ -84,3 +84,93 @@ assert "mcp_agent_mail.storage" not in sys.modules
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_database_profile_mutates_without_gitpython_or_git_binary(tmp_path: Path) -> None:
+    script = r'''
+import importlib.abc
+import asyncio
+import os
+import sys
+
+class BlockGit(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "git" or fullname.startswith("git."):
+            raise ImportError("GitPython intentionally unavailable")
+        return None
+
+sys.meta_path.insert(0, BlockGit())
+for name in tuple(sys.modules):
+    if name == "git" or name.startswith("git."):
+        del sys.modules[name]
+os.environ["PATH"] = ""
+os.environ["RUNTIME_PROFILE"] = "database"
+
+from fastmcp import Client
+from sqlalchemy import func, select
+from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
+from mcp_agent_mail.legacy_adapter import LegacyStorageUnavailableError, clear_repo_cache
+from mcp_agent_mail.models import Message, ProjectStorageCutover
+
+async def exercise():
+    async with Client(build_mcp_server()) as client:
+        project = await client.call_tool("ensure_project", {"human_key": "/database-no-git"})
+        sender = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/database-no-git",
+                "program": "test",
+                "model": "test",
+                "name": "BlueLake",
+            },
+        )
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/database-no-git",
+                "program": "test",
+                "model": "test",
+                "name": "GreenCastle",
+            },
+        )
+        arguments = {
+            "project_key": "/database-no-git",
+            "sender_name": "BlueLake",
+            "sender_token": sender.data["registration_token"],
+            "to": ["GreenCastle"],
+            "subject": "No Git available",
+            "body_md": "Database-authoritative delivery.",
+        }
+        first = await client.call_tool("send_message", arguments)
+        replay = await client.call_tool("send_message", arguments)
+        assert first.data["deliveries"][0]["payload"]["replayed"] is False
+        assert replay.data["deliveries"][0]["payload"]["replayed"] is True
+        async with get_session() as session:
+            assert await session.scalar(select(func.count()).select_from(Message)) == 1
+            assert await session.get(ProjectStorageCutover, project.data["id"]) is None
+
+asyncio.run(exercise())
+try:
+    clear_repo_cache()
+except LegacyStorageUnavailableError:
+    pass
+else:
+    raise AssertionError("database runtime crossed the legacy storage boundary")
+assert not any(name == "git" or name.startswith("git.") for name in sys.modules)
+assert "mcp_agent_mail.storage" not in sys.modules
+'''
+    environment = dict(os.environ)
+    environment["DATABASE_URL"] = (
+        f"sqlite+aiosqlite:///{tmp_path / 'database.sqlite3'}"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr

@@ -533,8 +533,8 @@ class TestSQLiteConfiguration:
             assert result is not None
             timeout = result[0]
 
-        # Should be 60000ms (60 seconds) to handle sustained write contention
-        assert timeout == 60000
+        # Bound lock waits below common MCP client request deadlines.
+        assert timeout == 2000
 
     @pytest.mark.asyncio
     async def test_synchronous_mode_normal(self, isolated_env):

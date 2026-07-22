@@ -16,9 +16,9 @@ class LegacyStorageUnavailableError(RuntimeError):
 
 
 def _implementation(name: str) -> Any:
-    if get_settings().runtime_profile == "core":
+    if get_settings().runtime_profile in {"core", "database"}:
         raise LegacyStorageUnavailableError(
-            f"legacy Git/archive operation {name!r} is unavailable in core runtime"
+            f"legacy Git/archive operation {name!r} is unavailable in database-authoritative runtime"
         )
     module = importlib.import_module(".storage", __package__)
     return getattr(module, name)

@@ -66,7 +66,7 @@ def test_config_empty_value_falls_back_to_default(monkeypatch):
     s = get_settings()
     assert s.http.port == 8765
     assert s.http.rate_limit_enabled is False
-    assert s.database.pool_size == 50  # empty -> the configured default (50)
+    assert s.database.pool_size == 8  # empty -> the bounded SQLite default
     assert s.agent_name_enforcement_mode == "coerce"  # default
 
 
@@ -120,11 +120,11 @@ def test_config_malformed_optional_int_raises_with_key(monkeypatch):
     assert "DATABASE_POOL_SIZE" in str(exc.value)
 
 
-def test_database_pool_size_default_is_50(monkeypatch):
+def test_database_pool_size_default_is_8(monkeypatch):
     monkeypatch.delenv("DATABASE_POOL_SIZE", raising=False)
     clear_settings_cache()
     s = get_settings()
-    assert s.database.pool_size == 50
+    assert s.database.pool_size == 8
 
 
 def test_get_settings_cache_clear_reloads_decouple_snapshot(tmp_path, monkeypatch):

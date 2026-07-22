@@ -98,6 +98,9 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTP_PORT", "8765")
     monkeypatch.setenv("HTTP_PATH", "/mcp/")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
+    # Preserve the historical Git-archive contract for existing tests. Tests
+    # of the production default remove this override explicitly.
+    monkeypatch.setenv("RUNTIME_PROFILE", "legacy")
     # Host-level Agent Mail settings must not leak identities, notifications,
     # or tool filtering into isolated server tests.
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", "")

@@ -185,7 +185,6 @@ async def create_atomic_message(
             "thread_id": thread_id,
             "topic": topic,
             "subject": subject,
-            "body_md": body_md,
             "importance": importance,
             "ack_required": ack_required,
             "reply_to": reply_to,

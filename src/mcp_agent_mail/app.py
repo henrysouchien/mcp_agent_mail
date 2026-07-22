@@ -65,7 +65,6 @@ from .db import (
     get_query_tracker,
     get_session,
     init_engine,
-    retry_on_db_lock,
     start_query_tracking,
     stop_query_tracking,
 )
@@ -81,9 +80,11 @@ from .idempotency import (
 from .llm import complete_system_user
 from .blob_store import BlobStore
 from .message_service import AtomicAttachment, RecipientIdentity, create_atomic_message
+from .notification_signals import clear_notification_signal, emit_notification_signal
 from .models import (
     Agent,
     AgentLink,
+    AuditEvent,
     FileReservation,
     Message,
     MessageRecipient,
@@ -105,10 +106,8 @@ from .routing import (
 from .legacy_adapter import (
     ProjectArchive,
     archive_write_lock,
-    clear_notification_signal,
     clear_repo_cache,
     collect_lock_status,
-    emit_notification_signal,
     ensure_archive,
     heal_archive_locks,
     process_attachments,
@@ -134,9 +133,13 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 logger = logging.getLogger(__name__)
 
-_request_window_identity_uuid: ContextVar[str] = ContextVar(
+_request_window_identity_uuid: ContextVar[str | None] = ContextVar(
     "mcp_agent_mail_request_window_identity_uuid",
-    default="",
+    default=None,
+)
+_request_window_identity_authoritative: ContextVar[bool] = ContextVar(
+    "mcp_agent_mail_request_window_identity_authoritative",
+    default=False,
 )
 _request_pane_credential: ContextVar[str] = ContextVar(
     "mcp_agent_mail_request_pane_credential",
@@ -144,21 +147,39 @@ _request_pane_credential: ContextVar[str] = ContextVar(
 )
 
 
-def set_request_window_identity_uuid(window_uuid: str) -> Token[str]:
+def set_request_window_identity_uuid(window_uuid: str) -> Token[str | None]:
     """Attach a request-scoped window identity for HTTP transports."""
     return _request_window_identity_uuid.set((window_uuid or "").strip())
 
 
-def reset_request_window_identity_uuid(token: Token[str]) -> None:
+def reset_request_window_identity_uuid(token: Token[str | None]) -> None:
     """Reset a request-scoped window identity context token."""
     _request_window_identity_uuid.reset(token)
 
 
+def set_request_window_identity_authoritative(authoritative: bool) -> Token[bool]:
+    """Mark whether the request UUID arrived through the trusted loopback bearer."""
+    return _request_window_identity_authoritative.set(bool(authoritative))
+
+
+def reset_request_window_identity_authoritative(token: Token[bool]) -> None:
+    """Reset request-scoped window-bearer authority."""
+    _request_window_identity_authoritative.reset(token)
+
+
+def request_window_identity_is_authoritative() -> bool:
+    """Return whether the current request UUID is allowed to restore a binding."""
+    return bool(_request_window_identity_authoritative.get(False))
+
+
 def effective_window_identity_uuid(settings: Settings | None = None) -> str:
     """Return request-scoped window identity, falling back to process env settings."""
-    request_uuid = (_request_window_identity_uuid.get("") or "").strip()
-    if request_uuid:
-        return request_uuid
+    request_uuid = _request_window_identity_uuid.get(None)
+    if request_uuid is not None:
+        # HTTP requests always install a scoped value, including the empty
+        # string. This prevents a missing header from inheriting a daemon-wide
+        # MCP_AGENT_MAIL_WINDOW_ID intended for stdio compatibility.
+        return request_uuid.strip()
     resolved_settings = settings or get_settings()
     return (getattr(resolved_settings, "window_identity_uuid", "") or "").strip()
 
@@ -309,6 +330,35 @@ _EMFILE_RETRY_TOOLS: frozenset[str] = frozenset(
         "search_messages_product",
         "list_contacts",
         "whois",
+    }
+)
+
+# Database-authoritative mutations must return (success or failure) before the
+# shortest supported MCP client deadline.  This is a final guard above the
+# tighter SQLite busy/pool timeouts; it prevents a sequence of individually
+# bounded preflight writes from keeping an abandoned request alive.
+_DATABASE_MUTATION_DEADLINE_SECONDS = 6.0
+_DATABASE_MUTATION_DEADLINE_TOOLS: frozenset[str] = frozenset(
+    {
+        "ensure_project",
+        "register_agent",
+        "create_agent_identity",
+        "deregister_agent",
+        "retire_agent",
+        "unretire_agent",
+        "hard_delete_agent",
+        "send_message",
+        "reply_message",
+        "request_contact",
+        "respond_contact",
+        "set_contact_policy",
+        "file_reservation_paths",
+        "release_file_reservations",
+        "renew_file_reservations",
+        "force_release_file_reservation",
+        "macro_start_session",
+        "macro_file_reservation_cycle",
+        "macro_contact_handshake",
     }
 )
 
@@ -612,26 +662,49 @@ def _instrument_tool(
                     # Logging errors should not break tool execution
                     log_ctx = None
 
-            result = None
-            error = None
-            try:
+            async def invoke_tool() -> Any:
                 try:
-                    result = await func(*args, **kwargs)
+                    return await func(*args, **kwargs)
                 except OSError as exc:
                     # Best-effort recovery for EMFILE on safe/idempotent tools.
                     import errno
 
-                    if exc.errno == errno.EMFILE and tool_name in _EMFILE_RETRY_TOOLS:
-                        with suppress(Exception):
-                            clear_repo_cache()
-                        with suppress(Exception):
-                            import gc
-
-                            gc.collect()
-                        await asyncio.sleep(0.05)
-                        result = await func(*args, **kwargs)
-                    else:
+                    if exc.errno != errno.EMFILE or tool_name not in _EMFILE_RETRY_TOOLS:
                         raise
+                    with suppress(Exception):
+                        clear_repo_cache()
+                    with suppress(Exception):
+                        import gc
+
+                        gc.collect()
+                    await asyncio.sleep(0.05)
+                    return await func(*args, **kwargs)
+
+            result = None
+            error = None
+            try:
+                if (
+                    settings.runtime_profile == "database"
+                    and tool_name in _DATABASE_MUTATION_DEADLINE_TOOLS
+                ):
+                    try:
+                        async with asyncio.timeout(_DATABASE_MUTATION_DEADLINE_SECONDS):
+                            result = await invoke_tool()
+                    except TimeoutError as exc:
+                        raise ToolExecutionError(
+                            "DATABASE_OPERATION_TIMEOUT",
+                            (
+                                f"{tool_name} exceeded the database mutation deadline; "
+                                "no successful result was returned. Retry the request once."
+                            ),
+                            recoverable=True,
+                            data={
+                                "tool": tool_name,
+                                "deadline_seconds": _DATABASE_MUTATION_DEADLINE_SECONDS,
+                            },
+                        ) from exc
+                else:
+                    result = await invoke_tool()
                 if format_value is not None or settings.output_format_default or settings.toon_default_format:
                     result = await _apply_tool_output_format(
                         result,
@@ -784,7 +857,7 @@ def _instrument_tool(
                     # Clear repo cache to free file handles and allow recovery
                     cleared = (
                         0
-                        if get_settings().runtime_profile == "core"
+                        if get_settings().runtime_profile in {"core", "database"}
                         else clear_repo_cache()
                     )
                     wrapped_exc = ToolExecutionError(
@@ -949,7 +1022,7 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
     @asynccontextmanager
     async def lifespan(app: FastMCP) -> AsyncIterator[None]:
         init_engine(settings)
-        if settings.runtime_profile != "core":
+        if settings.runtime_profile in {"legacy", "migration"}:
             heal_summary = await heal_archive_locks(settings)
             if heal_summary.get("locks_removed") or heal_summary.get("metadata_removed"):
                 logger.info(
@@ -986,7 +1059,7 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 except Exception:
                     with suppress(BaseException):
                         dispose_engine_blocking(engine)
-            if settings.runtime_profile != "core":
+            if settings.runtime_profile in {"legacy", "migration"}:
                 with suppress(BaseException):
                     clear_repo_cache()
             if cancelled is not None:
@@ -1043,6 +1116,68 @@ def _naive_utc(dt: Optional[datetime] = None) -> datetime:
         # Convert to UTC first, then strip timezone
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
+
+
+_AUTOMATIC_IDEMPOTENCY_BUCKET_SECONDS = 30
+_AUTOMATIC_IDEMPOTENCY_HORIZON = timedelta(seconds=60)
+
+
+def _automatic_mutation_keys(
+    operation_kind: str,
+    request_payload: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[str, str, str]:
+    """Derive keys covering the current 60-second response-loss window."""
+    timestamp = now or datetime.now(timezone.utc)
+    bucket = int(timestamp.timestamp()) // _AUTOMATIC_IDEMPOTENCY_BUCKET_SECONDS
+    canonical = json.dumps(
+        request_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest = hashlib.sha256(
+        f"agent-mail-auto-idempotency-v1\0{operation_kind}\0{canonical}".encode()
+    ).hexdigest()
+
+    def key(value: int) -> str:
+        return f"auto-v1:{value}:{digest}"
+
+    return key(bucket), key(bucket - 1), key(bucket - 2)
+
+
+async def _resolve_mutation_idempotency_key(
+    session: Any,
+    *,
+    scope_kind: str,
+    scope_id: str,
+    operation_kind: str,
+    explicit_key: str | None,
+    request_payload: dict[str, Any],
+) -> tuple[str, str]:
+    """Return a stable explicit or short-window automatic mutation key."""
+    if explicit_key and explicit_key.strip():
+        return explicit_key.strip(), "explicit"
+    candidate_keys = _automatic_mutation_keys(
+        operation_kind,
+        request_payload,
+    )
+    for candidate in candidate_keys:
+        try:
+            replay = await lookup_idempotent_replay(
+                session,
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+                operation_kind=operation_kind,
+                idempotency_key=candidate,
+                request_payload=request_payload,
+            )
+        except IdempotencyReceiptExpiredError:
+            continue
+        if replay is not None:
+            return candidate, "automatic"
+    return candidate_keys[0], "automatic"
 
 
 def _max_datetime(*timestamps: Optional[datetime]) -> Optional[datetime]:
@@ -2141,6 +2276,26 @@ async def _prepare_git_independent_attachments(
         )
         return item["uri"]
 
+    def resolve_attachment_path(raw_path: str) -> Path:
+        source = Path(raw_path).expanduser()
+        if source.is_absolute():
+            if not settings.storage.allow_absolute_attachment_paths:
+                raise ValueError(
+                    "Absolute attachment paths are disabled. Set "
+                    "ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true to enable."
+                )
+            resolved = source.resolve(strict=True)
+        else:
+            project_root = Path(project.human_key).expanduser().resolve(strict=True)
+            resolved = (project_root / source).resolve(strict=True)
+            try:
+                resolved.relative_to(project_root)
+            except ValueError as exc:
+                raise ValueError("Attachment path escapes the project root") from exc
+        if not resolved.is_file():
+            raise ValueError(f"Attachment path is not a file: {raw_path}")
+        return resolved
+
     try:
         body_parts: list[str] = []
         cursor = 0
@@ -2162,23 +2317,7 @@ async def _prepare_git_independent_attachments(
         processed_body = "".join(body_parts)
 
         for raw_path in attachment_paths or ():
-            source = Path(raw_path).expanduser()
-            if source.is_absolute():
-                if not settings.storage.allow_absolute_attachment_paths:
-                    raise ValueError(
-                        "Absolute attachment paths are disabled. Set "
-                        "ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true to enable."
-                    )
-                resolved = source.resolve(strict=True)
-            else:
-                project_root = Path(project.human_key).expanduser().resolve(strict=True)
-                resolved = (project_root / source).resolve(strict=True)
-                try:
-                    resolved.relative_to(project_root)
-                except ValueError as exc:
-                    raise ValueError("Attachment path escapes the project root") from exc
-            if not resolved.is_file():
-                raise ValueError(f"Attachment path is not a file: {raw_path}")
+            resolved = await asyncio.to_thread(resolve_attachment_path, raw_path)
             media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
             installation = await store.install_file(resolved, max_bytes=max_bytes)
             digest = installation.blob.digest
@@ -2774,6 +2913,19 @@ async def _ensure_project(human_key: str) -> Project:
     # onto the same DB row (see GitHub issue #126).
     human_key = _normalize_project_human_key(human_key)
     slug = _compute_project_slug(human_key)
+    if get_settings().runtime_profile == "database":
+        # Serialize the read/create pair once.  The former retry loop could
+        # stack several SQLite busy waits and outlive the calling MCP client.
+        async with get_immediate_session() as session:
+            result = await session.execute(select(Project).where(Project.slug == slug))
+            project = result.scalars().first()
+            if project is not None:
+                return project
+            project = Project(slug=slug, human_key=human_key)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            return project
     for attempt in range(6):
         try:
             async with get_session() as session:
@@ -3572,20 +3724,27 @@ async def _agent_name_exists(project: Project, name: str) -> bool:
 async def _get_window_identity(
     project: Project,
     window_uuid: str,
+    *,
+    include_expired: bool = False,
 ) -> Optional[WindowIdentity]:
-    """Look up an existing, non-expired window identity."""
+    """Look up a window identity, normally requiring an active TTL."""
     if project.id is None:
         return None
     await ensure_schema()
     now = _naive_utc()
     async with get_session() as session:
-        result = await session.execute(
-            select(WindowIdentity).where(
-                cast(Any, WindowIdentity.project_id == project.id),
-                cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
-                or_(cast(Any, WindowIdentity.expires_ts).is_(None), cast(Any, WindowIdentity.expires_ts) > now),
+        predicates = [
+            cast(Any, WindowIdentity.project_id == project.id),
+            cast(Any, func.lower(WindowIdentity.window_uuid) == window_uuid.lower()),
+        ]
+        if not include_expired:
+            predicates.append(
+                or_(
+                    cast(Any, WindowIdentity.expires_ts).is_(None),
+                    cast(Any, WindowIdentity.expires_ts) > now,
+                )
             )
-        )
+        result = await session.execute(select(WindowIdentity).where(*predicates))
         return result.scalars().first()
 
 
@@ -3623,7 +3782,11 @@ async def _create_window_identity(
         except IntegrityError:
             await session.rollback()
             # Concurrent insert won the race — fetch the existing record
-            existing = await _get_window_identity(project, window_uuid)
+            existing = await _get_window_identity(
+                project,
+                window_uuid,
+                include_expired=True,
+            )
             if existing is not None:
                 return existing
             raise  # Should not happen, but don't swallow unexpected errors
@@ -3756,15 +3919,30 @@ async def _get_or_create_agent(
             runtime_profile=settings.runtime_profile,
             for_mutation=True,
         )
-    git_independent = route.state == GIT_INDEPENDENT
+    database_authoritative = route.database_authoritative
+    managed_identity = route.state == GIT_INDEPENDENT
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     explicit_name_used = False
     # A public window UUID is routing metadata, never authority to select an
     # existing agent on the Git-independent path. Durable pane credentials
     # authenticate that identity after registration.
-    window_uuid = "" if git_independent else effective_window_identity_uuid(settings)
+    window_uuid = "" if managed_identity else effective_window_identity_uuid(settings)
     ttl_days = getattr(settings, "window_identity_ttl_days", 30)
     window_identity: Optional[WindowIdentity] = None
+    if window_uuid and _validate_window_uuid(window_uuid):
+        active_window_identity = await _get_window_identity(project, window_uuid)
+        existing_window_identity = await _get_window_identity(
+            project,
+            window_uuid,
+            include_expired=True,
+        )
+        if active_window_identity is None and existing_window_identity is not None:
+            raise ToolExecutionError(
+                "AUTHENTICATION_REQUIRED",
+                "The persisted window binding has expired; authenticate the bound agent with its registration token to renew it.",
+                recoverable=True,
+                data={"project_key": project.human_key, "window_uuid": window_uuid},
+            )
 
     # Priority chain per bead bd-1tz:
     # 1. Explicit agent_name parameter -> use as-is (highest priority)
@@ -3777,7 +3955,7 @@ async def _get_or_create_agent(
             project,
             settings,
             None,
-            use_archive=not git_independent,
+            use_archive=not database_authoritative,
         )
     elif name is not None and mode != "always_auto":
         # Priority 1: Explicit name/identity provided
@@ -3794,7 +3972,7 @@ async def _get_or_create_agent(
                 if mode == "strict":
                     raise ValueError("Agent name must contain alphanumeric characters.")
                 desired_name = await _generate_unique_agent_name(
-                    project, settings, None, use_archive=not git_independent
+                    project, settings, None, use_archive=not database_authoritative
                 )
             elif validate_agent_name_format(sanitized):
                 desired_name = sanitized
@@ -3818,14 +3996,14 @@ async def _get_or_create_agent(
                         data={"provided_name": sanitized, "valid_examples": ["BlueLake", "GreenCastle", "RedStone", "alpha-one", "cc-0"]},
                     )
                 desired_name = await _generate_unique_agent_name(
-                    project, settings, None, use_archive=not git_independent
+                    project, settings, None, use_archive=not database_authoritative
                 )
     elif window_uuid:
         # Priority 2/3: Window identity resolution
         if not _validate_window_uuid(window_uuid):
             logger.warning("MCP_AGENT_MAIL_WINDOW_ID is not a valid UUID: %s", window_uuid)
             desired_name = await _generate_unique_agent_name(
-                project, settings, None, use_archive=not git_independent
+                project, settings, None, use_archive=not database_authoritative
             )
         else:
             window_identity = await _get_window_identity(project, window_uuid)
@@ -3833,24 +4011,81 @@ async def _get_or_create_agent(
                 # Priority 2: existing window identity -> reuse its display_name
                 desired_name = window_identity.display_name
                 explicit_name_used = True  # treat as explicit to avoid collision retries
-                await _touch_window_identity(window_identity, ttl_days)
+                if not database_authoritative:
+                    await _touch_window_identity(window_identity, ttl_days)
             else:
-                # Priority 3: new window identity -> generate name and create identity
+                # Priority 3: new window identity -> generate a name.  The
+                # database-authoritative path claims the window in the same
+                # BEGIN IMMEDIATE transaction that creates/reuses the agent.
                 desired_name = await _generate_unique_agent_name(
-                    project, settings, None, use_archive=not git_independent
+                    project, settings, None, use_archive=not database_authoritative
                 )
-                window_identity = await _create_window_identity(
-                    project, window_uuid, desired_name, ttl_days,
-                )
+                if not database_authoritative:
+                    window_identity = await _create_window_identity(
+                        project, window_uuid, desired_name, ttl_days,
+                    )
     else:
         # Priority 4: no name, no window ID -> auto-generate
         desired_name = await _generate_unique_agent_name(
-            project, settings, None, use_archive=not git_independent
+            project, settings, None, use_archive=not database_authoritative
         )
     await ensure_schema()
     newly_created = False
-    session_context = get_immediate_session() if git_independent else get_session()
+    session_context = get_immediate_session() if database_authoritative else get_session()
     async with session_context as session:
+        transaction_window_identity: WindowIdentity | None = None
+        valid_window_uuid = bool(window_uuid and _validate_window_uuid(window_uuid))
+        if database_authoritative and valid_window_uuid:
+            identity_result = await session.execute(
+                select(WindowIdentity).where(
+                    cast(Any, WindowIdentity.project_id) == project.id,
+                    cast(Any, WindowIdentity.window_uuid) == window_uuid,
+                )
+            )
+            transaction_window_identity = identity_result.scalar_one_or_none()
+            if transaction_window_identity is not None:
+                now = _naive_utc()
+                expires_ts = transaction_window_identity.expires_ts
+                if getattr(expires_ts, "tzinfo", None) is not None:
+                    expires_ts = _naive_utc(expires_ts)
+                if expires_ts is not None and expires_ts <= now:
+                    raise ToolExecutionError(
+                        "AUTHENTICATION_REQUIRED",
+                        "The persisted window binding has expired; authenticate the bound agent with its registration token to renew it.",
+                        recoverable=True,
+                        data={"project_key": project.human_key, "window_uuid": window_uuid},
+                    )
+                if (
+                    explicit_name_used
+                    and desired_name.casefold()
+                    != transaction_window_identity.display_name.casefold()
+                ):
+                    raise ToolExecutionError(
+                        "WINDOW_IDENTITY_CONFLICT",
+                        (
+                            f"Window '{window_uuid}' is already bound to agent "
+                            f"'{transaction_window_identity.display_name}' in this project."
+                        ),
+                        recoverable=True,
+                        data={
+                            "project_key": project.human_key,
+                            "window_uuid": window_uuid,
+                            "bound_agent_name": transaction_window_identity.display_name,
+                            "requested_agent_name": desired_name,
+                        },
+                    )
+                desired_name = transaction_window_identity.display_name
+                explicit_name_used = True
+                transaction_window_identity.last_active_ts = now
+                minimum_expiry = now + timedelta(days=ttl_days)
+                transaction_window_identity.expires_ts = (
+                    minimum_expiry
+                    if expires_ts is None
+                    else max(expires_ts, minimum_expiry)
+                )
+                session.add(transaction_window_identity)
+                window_identity = transaction_window_identity
+
         for _attempt in range(5):
             # Use case-insensitive matching to be consistent with _agent_name_exists() and _get_agent()
             result = await session.execute(
@@ -3866,7 +4101,23 @@ async def _get_or_create_agent(
                 agent.task_description = task_description
                 agent.last_active_ts = _naive_utc()
                 session.add(agent)
-                if git_independent:
+                if (
+                    database_authoritative
+                    and valid_window_uuid
+                    and transaction_window_identity is None
+                ):
+                    now = _naive_utc()
+                    transaction_window_identity = WindowIdentity(
+                        project_id=project.id,
+                        window_uuid=window_uuid,
+                        display_name=agent.name,
+                        created_ts=now,
+                        last_active_ts=now,
+                        expires_ts=now + timedelta(days=ttl_days),
+                    )
+                    session.add(transaction_window_identity)
+                    window_identity = transaction_window_identity
+                if database_authoritative:
                     await append_audit_event(
                         session,
                         project_id=project.id,
@@ -3901,7 +4152,19 @@ async def _get_or_create_agent(
             )
             session.add(candidate)
             try:
-                if git_independent:
+                if database_authoritative:
+                    if valid_window_uuid and transaction_window_identity is None:
+                        now = _naive_utc()
+                        transaction_window_identity = WindowIdentity(
+                            project_id=project.id,
+                            window_uuid=window_uuid,
+                            display_name=candidate.name,
+                            created_ts=now,
+                            last_active_ts=now,
+                            expires_ts=now + timedelta(days=ttl_days),
+                        )
+                        session.add(transaction_window_identity)
+                        window_identity = transaction_window_identity
                     await session.flush()
                     await append_audit_event(
                         session,
@@ -3947,7 +4210,7 @@ async def _get_or_create_agent(
                     agent.task_description = task_description
                     agent.last_active_ts = _naive_utc()
                     session.add(agent)
-                    if git_independent:
+                    if database_authoritative:
                         await append_audit_event(
                             session,
                             project_id=project.id,
@@ -3972,7 +4235,7 @@ async def _get_or_create_agent(
 
                 # Auto-generated name collision under concurrency: pick a new name and retry.
                 desired_name = await _generate_unique_agent_name(
-                    project, settings, None, use_archive=not git_independent
+                    project, settings, None, use_archive=not database_authoritative
                 )
                 continue
         else:
@@ -3981,9 +4244,19 @@ async def _get_or_create_agent(
     # enrich the archive profile.  We consolidate into a single block to avoid
     # redundant DB lookups (window_identity may already be set from the
     # priority-chain resolution above).
-    if window_uuid and _validate_window_uuid(window_uuid) and window_identity is None and explicit_name_used:
+    if (
+        not database_authoritative
+        and window_uuid
+        and _validate_window_uuid(window_uuid)
+        and window_identity is None
+        and explicit_name_used
+    ):
         # Explicit name was used with a window UUID — look up / create association
-        window_identity = await _get_window_identity(project, window_uuid)
+        window_identity = await _get_window_identity(
+            project,
+            window_uuid,
+            include_expired=True,
+        )
         if window_identity is None:
             window_identity = await _create_window_identity(
                 project, window_uuid, agent.name, ttl_days,
@@ -3991,7 +4264,7 @@ async def _get_or_create_agent(
         else:
             await _touch_window_identity(window_identity, ttl_days)
 
-    if git_independent:
+    if database_authoritative:
         return agent
 
     archive = await ensure_archive(settings, project.slug)
@@ -4423,6 +4696,16 @@ async def _write_file_reservation_records(
     if archive_locked and archive is None:
         raise ValueError("archive_locked=True requires a provided archive")
     settings = get_settings()
+    if project.id is not None:
+        async with get_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=False,
+            )
+        if route.database_authoritative:
+            return
     target_archive = archive or await ensure_archive(settings, project.slug)
 
     async def _write_all() -> None:
@@ -4457,6 +4740,15 @@ async def _collect_file_reservation_statuses(
     await ensure_schema()
     moment = now or datetime.now(timezone.utc)
     settings = get_settings()
+    async with get_session() as route_session:
+        route = await resolve_storage_route(
+            route_session,
+            project_id=project.id,
+            runtime_profile=settings.runtime_profile,
+            for_mutation=False,
+        )
+    if route.database_authoritative:
+        include_git_activity = False
     inactivity_seconds = max(0, int(settings.file_reservation_inactivity_seconds))
     activity_grace = max(0, int(settings.file_reservation_activity_grace_seconds))
 
@@ -4702,7 +4994,7 @@ async def _expire_stale_file_reservations(
             runtime_profile=get_settings().runtime_profile,
             for_mutation=True,
         )
-        if route.state == GIT_INDEPENDENT:
+        if route.database_authoritative:
             expired_rows = await core_session.execute(
                 select(FileReservation, Agent)
                 .outerjoin(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
@@ -5181,6 +5473,17 @@ def _canonical_relpath_for_message(project: Project, message: Message, archive: 
 
 async def _commit_info_for_message(settings: Settings, project: Project, message: Message) -> dict[str, Any] | None:
     """Fetch commit metadata for the canonical message file (hexsha, summary, authored_ts, stats)."""
+    if project.id is None:
+        return None
+    async with get_session() as route_session:
+        route = await resolve_storage_route(
+            route_session,
+            project_id=project.id,
+            runtime_profile=settings.runtime_profile,
+            for_mutation=False,
+        )
+    if route.database_authoritative:
+        return None
     archive = await ensure_archive(settings, project.slug)
     relpath = _canonical_relpath_for_message(project, message, archive)
     if not relpath:
@@ -5710,7 +6013,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             return False
 
         ttl_days = getattr(settings, "window_identity_ttl_days", 30)
-        window_identity = await _get_window_identity(project, window_uuid)
+        # The caller has already authenticated the agent.  Include an expired
+        # row so the exact persisted binding can be renewed instead of trying
+        # to insert a duplicate (or allowing a public UUID to claim it).
+        window_identity = await _get_window_identity(
+            project,
+            window_uuid,
+            include_expired=True,
+        )
         if window_identity is None:
             window_identity = await _create_window_identity(project, window_uuid, agent.name, ttl_days)
 
@@ -5766,6 +6076,151 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
         return agent
 
+    async def _resolve_authoritative_window_agent(
+        project: Project,
+        *,
+        action: str,
+        expected_name: str | None = None,
+    ) -> Agent | None:
+        """Restore a legacy binding from a trusted local window bearer.
+
+        A window UUID is not a general-purpose credential. Compatibility is
+        limited to direct-loopback HTTP requests whose canonical
+        ``Authorization: Bearer mcp-window:<uuid>`` value already has a live,
+        exact project binding. Core projects continue to require pane secrets.
+        """
+        if (
+            settings.runtime_profile == "core"
+            or not request_window_identity_is_authoritative()
+            or project.id is None
+        ):
+            return None
+        window_uuid = effective_window_identity_uuid(settings)
+        if not window_uuid or not _validate_window_uuid(window_uuid):
+            return None
+        async with get_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=False,
+            )
+        if route.state == GIT_INDEPENDENT:
+            return None
+        identity = await _get_window_identity(project, window_uuid)
+        if identity is None:
+            return None
+        if expected_name is not None and identity.display_name.casefold() != expected_name.casefold():
+            return None
+        try:
+            agent = await _get_agent(project, identity.display_name)
+        except NoResultFound:
+            return None
+        if agent.retired_at is None:
+            return agent
+        if not route.database_authoritative or agent.id is None:
+            return _require_active_agent(agent, action)
+
+        # Repair only identities that match the legacy background sweep shape:
+        # stale for at least its configured threshold, no explicit retirement
+        # audit, and no deregistration marker.  This preserves intentional
+        # retire/deregister decisions while letting previously stranded panes
+        # recover from their exact trusted loopback binding without a migration.
+        now = _naive_utc()
+        threshold = max(60, int(settings.auto_retire_stale_agents_threshold_seconds))
+        last_active = agent.last_active_ts
+        retired_at = agent.retired_at
+        if getattr(last_active, "tzinfo", None) is not None:
+            last_active = _naive_utc(last_active)
+        if getattr(retired_at, "tzinfo", None) is not None:
+            retired_at = _naive_utc(retired_at)
+        stale_retirement = (
+            last_active is not None
+            and retired_at is not None
+            and (retired_at - last_active).total_seconds() >= threshold
+        )
+        if not stale_retirement or (agent.task_description or "").startswith("[DEREGISTERED"):
+            return _require_active_agent(agent, action)
+
+        async with get_immediate_session() as recovery_session:
+            transaction_route = await resolve_storage_route(
+                recovery_session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+            binding_result = await recovery_session.execute(
+                select(WindowIdentity).where(
+                    cast(Any, WindowIdentity.project_id) == project.id,
+                    cast(Any, WindowIdentity.window_uuid) == window_uuid,
+                    _sa_or(
+                        cast(Any, WindowIdentity.expires_ts).is_(None),
+                        cast(Any, WindowIdentity.expires_ts) > now,
+                    ),
+                )
+            )
+            live_binding = binding_result.scalar_one_or_none()
+            db_agent = await recovery_session.get(Agent, agent.id)
+            if (
+                live_binding is None
+                or db_agent is None
+                or live_binding.display_name.casefold() != agent.name.casefold()
+            ):
+                return _require_active_agent(agent, action)
+            explicit_retirement = await recovery_session.scalar(
+                select(AuditEvent.id)
+                .where(
+                    cast(Any, AuditEvent.project_id) == project.id,
+                    cast(Any, AuditEvent.entity_type) == "agent",
+                    cast(Any, AuditEvent.entity_id) == str(agent.id),
+                    cast(Any, AuditEvent.operation_kind).in_(
+                        ("agent_retired_v1", "agent_deregistered_v1")
+                    ),
+                )
+                .limit(1)
+            )
+            if explicit_retirement is not None:
+                return _require_active_agent(agent, action)
+            if db_agent.retired_at is not None:
+                previous_retired_at = db_agent.retired_at
+                db_agent.retired_at = None
+                db_agent.last_active_ts = now
+                live_binding.last_active_ts = now
+                minimum_expiry = now + timedelta(
+                    days=getattr(settings, "window_identity_ttl_days", 30)
+                )
+                if (
+                    live_binding.expires_ts is None
+                    or live_binding.expires_ts < minimum_expiry
+                ):
+                    live_binding.expires_ts = minimum_expiry
+                event = await append_audit_event(
+                    recovery_session,
+                    project_id=project.id,
+                    actor_kind="system",
+                    actor_scope_id="system/window-auto-retire-recovery",
+                    actor_agent_id=agent.id,
+                    operation_kind="agent_auto_retire_recovered_v1",
+                    entity_type="agent",
+                    entity_id=str(agent.id),
+                    payload_version="agent-retirement-v1",
+                    payload={"previous_retired_at": _iso(previous_retired_at)},
+                )
+                await assert_route_generation(
+                    recovery_session,
+                    project_id=project.id,
+                    expected_state=transaction_route.state,
+                    expected_generation=transaction_route.generation,
+                )
+                await recovery_session.commit()
+                logger.info(
+                    "Recovered auto-retired agent %s from exact local window binding (audit=%s)",
+                    agent.name,
+                    event.id,
+                )
+            await recovery_session.refresh(db_agent)
+            return db_agent
+
     async def _authenticate_agent(
         ctx: Context,
         project: Project,
@@ -5776,15 +6231,73 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         action: str,
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
-        _require_active_agent(agent, action)
         provided_token = provided_token or effective_request_pane_credential() or None
+        if agent.retired_at is not None and not provided_token:
+            window_agent = await _resolve_authoritative_window_agent(
+                project,
+                action=action,
+                expected_name=agent.name,
+            )
+            if window_agent is not None:
+                _bind_session_agent(ctx, project, window_agent)
+                return window_agent
+        _require_active_agent(agent, action)
+        stored_token = (agent.registration_token or "").strip()
+        if provided_token:
+            authenticated = bool(stored_token) and hmac.compare_digest(
+                provided_token,
+                stored_token,
+            )
+            if not authenticated and settings.credentials.peppers:
+                try:
+                    async with get_immediate_session() as credential_session:
+                        pane = await verify_pane_credential(
+                            credential_session,
+                            provided_token,
+                            peppers=settings.credentials.peppers,
+                        )
+                        authenticated = (
+                            pane.project_id == project.id and pane.agent_id == agent.id
+                        )
+                        if authenticated:
+                            await credential_session.commit()
+                except CredentialError:
+                    authenticated = False
+            if not authenticated:
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    f"Invalid {token_param} for agent '{agent.name}'.",
+                    recoverable=True,
+                    data={"agent_name": agent.name, "project_key": project.human_key, "token_param": token_param},
+                )
+            _bind_session_agent(ctx, project, agent)
+            await _bind_current_window_identity_to_agent(ctx, project, agent)
+            return agent
+
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
             await _bind_current_window_identity_to_agent(ctx, project, agent)
             return agent
 
-        stored_token = (agent.registration_token or "").strip()
-        if not stored_token and not provided_token:
+        window_agent = await _resolve_authoritative_window_agent(
+            project,
+            action=action,
+            expected_name=agent.name,
+        )
+        if window_agent is not None:
+            _bind_session_agent(ctx, project, window_agent)
+            identity = await _get_window_identity(
+                project,
+                effective_window_identity_uuid(settings),
+            )
+            if identity is not None:
+                await _touch_window_identity(
+                    identity,
+                    getattr(settings, "window_identity_ttl_days", 30),
+                )
+            return window_agent
+
+        if not stored_token:
             # Adjacent-agent auth for legacy tokenless agents: retire_agent
             # and hard_delete_agent can be authorized by any other authenticated
             # agent in the same project. This unsticks cleanup of pre-token
@@ -5810,43 +6323,15 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 recoverable=True,
                 data={"agent_name": agent.name, "project_key": project.human_key, "action": action},
             )
-        if not provided_token:
-            raise ToolExecutionError(
-                "AUTHENTICATION_REQUIRED",
-                (
-                    f"{action} requires {token_param} for agent '{agent.name}', unless this MCP session has already "
-                    "authenticated as that agent."
-                ),
-                recoverable=True,
-                data={"agent_name": agent.name, "project_key": project.human_key, "token_param": token_param},
-            )
-        authenticated = hmac.compare_digest(provided_token, stored_token)
-        if not authenticated and settings.credentials.peppers:
-            try:
-                async with get_immediate_session() as credential_session:
-                    pane = await verify_pane_credential(
-                        credential_session,
-                        provided_token,
-                        peppers=settings.credentials.peppers,
-                    )
-                    authenticated = (
-                        pane.project_id == project.id and pane.agent_id == agent.id
-                    )
-                    if authenticated:
-                        await credential_session.commit()
-            except CredentialError:
-                authenticated = False
-        if not authenticated:
-            raise ToolExecutionError(
-                "AUTHENTICATION_REQUIRED",
-                f"Invalid {token_param} for agent '{agent.name}'.",
-                recoverable=True,
-                data={"agent_name": agent.name, "project_key": project.human_key, "token_param": token_param},
-            )
-
-        _bind_session_agent(ctx, project, agent)
-        await _bind_current_window_identity_to_agent(ctx, project, agent)
-        return agent
+        raise ToolExecutionError(
+            "AUTHENTICATION_REQUIRED",
+            (
+                f"{action} requires {token_param} for agent '{agent.name}', unless this MCP session has already "
+                "authenticated as that agent."
+            ),
+            recoverable=True,
+            data={"agent_name": agent.name, "project_key": project.human_key, "token_param": token_param},
+        )
 
     async def _issue_current_pane_credential(
         project: Project,
@@ -5926,10 +6411,37 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     recoverable=True,
                     data={"project_key": project.human_key, "token_param": token_param},
                 ) from exc
+        if pane_bearer:
+            # A supplied credential is an explicit authentication attempt.  It
+            # must never fall through to a session/window compatibility route,
+            # including deployments where pane peppers are not configured.
+            raise ToolExecutionError(
+                "AUTHENTICATION_REQUIRED",
+                "Invalid pane credential for this project.",
+                recoverable=True,
+                data={"project_key": project.human_key, "token_param": token_param},
+            )
 
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
             return _require_active_agent(agent, action)
+
+        window_agent = await _resolve_authoritative_window_agent(
+            project,
+            action=action,
+        )
+        if window_agent is not None:
+            _bind_session_agent(ctx, project, window_agent)
+            identity = await _get_window_identity(
+                project,
+                effective_window_identity_uuid(settings),
+            )
+            if identity is not None:
+                await _touch_window_identity(
+                    identity,
+                    getattr(settings, "window_identity_ttl_days", 30),
+                )
+            return window_agent
 
         raise ToolExecutionError(
             "AUTHENTICATION_REQUIRED",
@@ -6105,7 +6617,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 for_mutation=True,
             )
         operation_kind = "message_reply_v1" if reply_to is not None else "message_send_v1"
-        if route.state == GIT_INDEPENDENT and idempotency_key and idempotency_request_payload:
+        if route.database_authoritative and idempotency_key and idempotency_request_payload:
             async with get_session() as replay_session:
                 replay = await lookup_idempotent_replay(
                     replay_session,
@@ -6121,6 +6633,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     {
                         "replayed": True,
                         "retry_safety": "safe_with_idempotency_key",
+                        "idempotency_mode": "explicit",
                     }
                 )
                 _apply_sender_identity(
@@ -6142,7 +6655,29 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         recipient_records.extend((agent, "cc") for agent in cc_agents)
         recipient_records.extend((agent, "bcc") for agent in bcc_agents)
 
-        if route.state == GIT_INDEPENDENT:
+        if route.database_authoritative:
+            mutation_request_payload = (
+                dict(idempotency_request_payload)
+                if idempotency_request_payload is not None
+                else {
+                    "ack_required": ack_required,
+                    "attachment_paths": list(attachment_paths or []),
+                    "bcc": list(bcc_names),
+                    "body_md": body_md,
+                    "cc": list(cc_names),
+                    "convert_images": convert_images_override,
+                    "delivery_project_id": project.id,
+                    "importance": importance,
+                    "reply_to": reply_to,
+                    "sender_id": sender.id,
+                    "subject": subject,
+                    "thread_id": thread_id,
+                    "to": list(to_names),
+                    "topic": topic,
+                }
+            )
+            if not idempotency_key:
+                mutation_request_payload["delivery_project_id"] = project.id
             processed_body, attachments_meta, blob_attachments = (
                 await _prepare_git_independent_attachments(
                     settings,
@@ -6164,6 +6699,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         or transaction_route.generation != route.generation
                     ):
                         raise RuntimeError("Project storage route changed before message mutation")
+                    effective_idempotency_key, idempotency_mode = (
+                        await _resolve_mutation_idempotency_key(
+                            route_session,
+                            scope_kind="agent",
+                            scope_id=f"{sender_project.id}:{sender.id}",
+                            operation_kind=operation_kind,
+                            explicit_key=idempotency_key,
+                            request_payload=mutation_request_payload,
+                        )
+                    )
                     atomic_result = await create_atomic_message(
                         route_session,
                         project_id=project.id,
@@ -6185,9 +6730,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         topic=topic,
                         reply_to=reply_to,
                         attachments=attachments_meta,
-                        idempotency_key=idempotency_key,
-                        idempotency_request_payload=idempotency_request_payload,
+                        idempotency_key=effective_idempotency_key,
+                        idempotency_request_payload=mutation_request_payload,
                         blob_attachments=blob_attachments,
+                        retry_horizon=(
+                            timedelta(days=30)
+                            if idempotency_mode == "explicit"
+                            else _AUTOMATIC_IDEMPOTENCY_HORIZON
+                        ),
                     )
                     await assert_route_generation(
                         route_session,
@@ -6210,9 +6760,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "replayed": atomic_result.replayed,
                     "retry_safety": (
                         "safe_with_idempotency_key"
-                        if idempotency_key
-                        else "unsafe_without_key"
+                        if idempotency_mode == "explicit"
+                        else "safe_with_automatic_retry_dedupe"
                     ),
+                    "idempotency_mode": idempotency_mode,
                 }
             )
             _apply_sender_identity(
@@ -6239,7 +6790,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             notification_meta,
                         )
             await ctx.info(
-                f"Message {atomic_result.message_id} committed through Git-independent storage."
+                f"Message {atomic_result.message_id} committed through database-authoritative storage."
             )
             return payload
 
@@ -6655,8 +7206,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
           opaque project KEY, and collaborating agents may not share a filesystem.
         - Computes a stable slug from `human_key` (lowercased, safe characters) so
           multiple agents can refer to the same project consistently.
-        - Ensures DB row exists and that the on-disk archive is initialized
-          (e.g., `messages/`, `agents/`, `file_reservations/` directories).
+        - Ensures the database row exists. Legacy/migration profiles also
+          initialize the optional on-disk Git archive.
 
         CRITICAL: Project Identity Rules
         ---------------------------------
@@ -6724,7 +7275,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             project = await _ensure_git_independent_project(human_key)
         else:
             project = await _ensure_project(human_key)
-            await ensure_archive(settings, project.slug)
+            if settings.runtime_profile in {"legacy", "migration"}:
+                await ensure_archive(settings, project.slug)
         payload = _project_to_dict(project)
         # Worktree identity metadata is opt-in to keep default calls lightweight and stable.
         if settings.worktrees_enabled:
@@ -7100,7 +7652,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Create or update an agent identity within a project and persist its profile to Git.
+        Create or update an agent identity within a project and persist it durably.
 
         When to use
         -----------
@@ -7112,7 +7664,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         - If `name` is omitted, a random adjective+noun name is auto-generated.
         - Reusing the same `name` updates the profile (program/model/task) and
           refreshes `last_active_ts`.
-        - A `profile.json` file is written under `agents/<Name>/` in the project archive.
+        - Database mode commits the identity transactionally; legacy/migration
+          profiles also write `agents/<Name>/profile.json` to the Git archive.
 
         Agent Identity
         ---------------
@@ -7202,19 +7755,19 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             if not bootstrap_credential or not idempotency_key:
                 raise ToolExecutionError(
                     "MANAGED_REGISTRATION_REQUIRED",
-                    "Core registration requires bootstrap_credential and idempotency_key.",
+                    "Managed registration requires bootstrap_credential and idempotency_key.",
                     recoverable=True,
                 )
             if not window_uuid or not _validate_window_uuid(window_uuid):
                 raise ToolExecutionError(
                     "PANE_IDENTITY_REQUIRED",
-                    "Core registration requires a valid request-scoped pane window UUID.",
+                    "Managed registration requires a valid request-scoped pane window UUID.",
                     recoverable=True,
                 )
             if not key_id or not settings.credentials.peppers:
                 raise ToolExecutionError(
                     "CREDENTIAL_PEPPER_UNAVAILABLE",
-                    "Core registration requires configured credential peppers.",
+                    "Managed registration requires configured credential peppers.",
                     recoverable=False,
                 )
             if not name or not (
@@ -7222,7 +7775,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             ):
                 raise ToolExecutionError(
                     "EXPLICIT_AGENT_NAME_REQUIRED",
-                    "Managed core registration requires an explicit valid agent name.",
+                    "Managed registration requires an explicit valid agent name.",
                     recoverable=True,
                 )
             request_payload = {
@@ -7445,7 +7998,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_profile=get_settings().runtime_profile,
                 for_mutation=True,
             )
-        if route.state == GIT_INDEPENDENT:
+        if route.database_authoritative:
             retired_at = _naive_utc()
             async with get_immediate_session() as session:
                 transaction_route = await resolve_storage_route(
@@ -7558,7 +8111,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_profile=get_settings().runtime_profile,
                 for_mutation=True,
             )
-        if route.state == GIT_INDEPENDENT:
+        if route.database_authoritative:
             retired_at = _naive_utc()
             async with get_immediate_session() as session:
                 transaction_route = await resolve_storage_route(
@@ -7946,13 +8499,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         files_removed = 0
         dirs_removed = 0
         fs_errors: list[str] = []
-        try:
-            settings = get_settings()
-            archive = await ensure_archive(settings, project.slug)
-            agent_dir = archive.root / "agents" / agent_name
-            files_removed, dirs_removed = await asyncio.to_thread(_delete_tree_with_counts, agent_dir)
-        except Exception as exc:
-            fs_errors.append(f"Failed to remove agent archive directory: {exc}")
+        settings = get_settings()
+        if settings.runtime_profile in {"legacy", "migration"}:
+            try:
+                archive = await ensure_archive(settings, project.slug)
+                agent_dir = archive.root / "agents" / agent_name
+                files_removed, dirs_removed = await asyncio.to_thread(_delete_tree_with_counts, agent_dir)
+            except Exception as exc:
+                fs_errors.append(f"Failed to remove agent archive directory: {exc}")
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed
@@ -8136,15 +8690,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         files_removed = 0
         dirs_removed = 0
         fs_errors: list[str] = []
-        try:
-            settings = get_settings()
-            files_removed, dirs_removed = await asyncio.to_thread(
-                _delete_project_archive_tree,
-                settings.storage.root,
-                project_slug,
-            )
-        except Exception as exc:
-            fs_errors.append(f"Failed to remove project archive directory: {exc}")
+        settings = get_settings()
+        if settings.runtime_profile in {"legacy", "migration"}:
+            try:
+                files_removed, dirs_removed = await asyncio.to_thread(
+                    _delete_project_archive_tree,
+                    settings.storage.root,
+                    project_slug,
+                )
+            except Exception as exc:
+                fs_errors.append(f"Failed to remove project archive directory: {exc}")
 
         deleted_counts["archive_files_removed"] = files_removed
         deleted_counts["archive_dirs_removed"] = dirs_removed
@@ -8220,7 +8775,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         )
         profile = _agent_to_dict(agent)
         recent: list[dict[str, Any]] = []
-        if include_recent_commits:
+        if include_recent_commits and settings.runtime_profile in {"legacy", "migration"}:
             archive = await ensure_archive(settings, project.slug)
             repo: Any = archive.repo
             try:
@@ -8254,7 +8809,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         return_registration_token: bool = True,
     ) -> dict[str, Any]:
         """
-        Create a new, unique agent identity and persist its profile to Git.
+        Create a new, unique agent identity and persist it durably.
 
         How this differs from `register_agent`
         --------------------------------------
@@ -8322,7 +8877,21 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         """
         _validate_program_model(program, model)
         project = await _get_project_by_identifier(project_key)
-        unique_name = await _generate_unique_agent_name(project, settings, name_hint)
+        if project.id is None:
+            raise ValueError("Project must be persisted before creating an agent identity.")
+        async with get_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+        unique_name = await _generate_unique_agent_name(
+            project,
+            settings,
+            name_hint,
+            use_archive=route.use_legacy_adapter,
+        )
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
             ap = "auto"
@@ -8337,20 +8906,21 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 await session.refresh(db_agent)
                 agent = db_agent
         agent, token = await _ensure_agent_registration_token(agent)
-        archive = await ensure_archive(settings, project.slug)
-        try:
-            async with _archive_write_lock(archive):
-                await write_agent_profile(archive, _agent_to_dict(agent))
-        except Exception:
-            # Roll back the DB record so the caller doesn't get an error
-            # while the agent already exists in the database (issue #121).
-            with suppress(Exception):
-                async with get_session() as rollback_session:
-                    db_agent = await rollback_session.get(Agent, agent.id)
-                    if db_agent:
-                        await rollback_session.delete(db_agent)
-                        await rollback_session.commit()
-            raise
+        if route.use_legacy_adapter:
+            archive = await ensure_archive(settings, project.slug)
+            try:
+                async with _archive_write_lock(archive):
+                    await write_agent_profile(archive, _agent_to_dict(agent))
+            except Exception:
+                # Roll back the DB record if a selected legacy archive write
+                # fails so the two explicit legacy stores remain consistent.
+                with suppress(Exception):
+                    async with get_session() as rollback_session:
+                        db_agent = await rollback_session.get(Agent, agent.id)
+                        if db_agent:
+                            await rollback_session.delete(db_agent)
+                            await rollback_session.commit()
+                raise
         _bind_session_agent(ctx, project, agent)
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
@@ -8571,7 +9141,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_arg="project_key",
         agent_arg="sender_name",
     )
-    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def send_message(
         ctx: Context,
         project_key: str,
@@ -8596,7 +9165,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Send a Markdown message to one or more recipients and persist canonical and mailbox copies to Git.
+        Send a Markdown message to one or more recipients and persist it durably.
 
         Discovery
         ---------
@@ -8771,7 +9340,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     runtime_profile=get_settings().runtime_profile,
                     for_mutation=True,
                 )
-                if replay_route.state == GIT_INDEPENDENT:
+                if replay_route.database_authoritative:
                     replay = await lookup_idempotent_replay(
                         replay_route_session,
                         scope_kind="agent",
@@ -8786,6 +9355,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             {
                                 "replayed": True,
                                 "retry_safety": "safe_with_idempotency_key",
+                                "idempotency_mode": "explicit",
                             }
                         )
                         _apply_sender_identity(
@@ -10063,14 +10633,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 recoverable=True,
                 data={"arguments": ["sender_name", "agent_name"]},
             )
-        effective_sender_name = (sender_name or agent_name or "").strip()
-        if not effective_sender_name:
-            raise ToolExecutionError(
-                "INVALID_ARGUMENT",
-                "reply_message requires sender_name (or compatibility alias agent_name).",
-                recoverable=True,
-                data={"argument": "sender_name", "accepted_alias": "agent_name"},
-            )
+        effective_sender_name = (sender_name or agent_name or "").strip() or None
         if sender_token and registration_token and not hmac.compare_digest(
             sender_token,
             registration_token,
@@ -10084,11 +10647,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         effective_sender_token = sender_token or registration_token
 
         project = await _get_project_by_identifier(project_key)
-        sender = await _authenticate_agent(
+        sender = await _resolve_authenticated_agent(
             ctx,
             project,
-            effective_sender_name,
-            effective_sender_token,
+            agent_name=effective_sender_name,
+            provided_token=effective_sender_token,
             token_param="sender_token",
             action="reply_message",
         )
@@ -10110,7 +10673,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     runtime_profile=get_settings().runtime_profile,
                     for_mutation=True,
                 )
-                if replay_route.state == GIT_INDEPENDENT:
+                if replay_route.database_authoritative:
                     replay = await lookup_idempotent_replay(
                         replay_session,
                         scope_kind="agent",
@@ -10125,6 +10688,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             {
                                 "replayed": True,
                                 "retry_safety": "safe_with_idempotency_key",
+                                "idempotency_mode": "explicit",
                                 "reply_to": message_id,
                             }
                         )
@@ -10640,7 +11204,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_arg="project_key",
         agent_arg="from_agent",
     )
-    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def request_contact(
         ctx: Context,
         project_key: str,
@@ -10904,7 +11467,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_arg="project_key",
         agent_arg="to_agent",
     )
-    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def respond_contact(
         ctx: Context,
         project_key: str,
@@ -11579,7 +12141,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         )
         return messages
 
-    async def _uses_git_independent_storage(project: Project) -> bool:
+    async def _uses_database_authoritative_storage(project: Project) -> bool:
         if project.id is None:
             return False
         async with get_session() as session:
@@ -11589,7 +12151,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_profile=get_settings().runtime_profile,
                 for_mutation=True,
             )
-        return route.state == GIT_INDEPENDENT
+        return route.database_authoritative
 
     async def _update_core_message_receipt(
         project: Project,
@@ -11711,7 +12273,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 action="mark_message_read",
             )
             await _get_visible_message(project, agent, message_id)
-            if await _uses_git_independent_storage(project):
+            if await _uses_database_authoritative_storage(project):
                 read_ts, _, audit_event_id = await _update_core_message_receipt(
                     project,
                     agent,
@@ -11809,7 +12371,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 action="acknowledge_message",
             )
             await _get_visible_message(project, agent, message_id)
-            if await _uses_git_independent_storage(project):
+            if await _uses_database_authoritative_storage(project):
                 read_ts, ack_ts, audit_event_id = await _update_core_message_receipt(
                     project,
                     agent,
@@ -12109,7 +12671,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_arg="project_key",
         agent_arg="requester",
     )
-    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
     async def macro_contact_handshake(
         ctx: Context,
         project_key: str,
@@ -13271,7 +13832,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         ---------
         - Conflicts are reported if an overlapping active exclusive reservation exists held by another agent
         - Glob matching is symmetric (`fnmatchcase(a,b)` or `fnmatchcase(b,a)`), including exact matches
-        - When granted, a JSON artifact is written under `file_reservations/<sha1(path)>.json` and the DB is updated
+        - Database mode commits reservations transactionally; legacy/migration
+          profiles also write JSON artifacts to the Git archive
         - TTL must be >= 60 seconds (enforced by the server settings/policy)
         - Server-side enforcement (if enabled) only checks reservations that target mail archive paths
           such as `agents/`, `messages/`, or `attachments/`; code repo enforcement is via the pre-commit guard
@@ -13371,7 +13933,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_profile=settings.runtime_profile,
                 for_mutation=True,
             )
-        if route.state == GIT_INDEPENDENT:
+        if route.database_authoritative:
             warnings_list: list[str] = []
             advisory_only_paths = [p for p in paths if not _looks_like_archive_path(p)]
             if advisory_only_paths:
@@ -13534,23 +14096,26 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     or transaction_route.generation != route.generation
                 ):
                     raise RuntimeError("Project storage route changed before reservation mutation")
-                if idempotency_key:
+                explicit_idempotency_key = (idempotency_key or "").strip()
+                if explicit_idempotency_key:
                     atomic_result = await run_idempotent_mutation(
                         session,
                         scope_kind="agent",
                         scope_id=f"{project_id}:{agent.id}",
                         operation_kind="file_reservations_acquire_v1",
-                        idempotency_key=idempotency_key,
+                        idempotency_key=explicit_idempotency_key,
                         request_payload=request_payload,
                         expires_ts=_naive_utc() + timedelta(days=30),
                         mutate=reserve_atomic,
                     )
                     response = dict(atomic_result.response)
                     replayed = atomic_result.replayed
+                    idempotency_mode = "explicit"
                 else:
-                    receipt = await reserve_atomic(session)
-                    response = dict(receipt.response)
+                    mutation = await reserve_atomic(session)
+                    response = dict(mutation.response)
                     replayed = False
+                    idempotency_mode = "state"
                 await assert_route_generation(
                     session,
                     project_id=project_id,
@@ -13560,10 +14125,13 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 await session.commit()
             response["replayed"] = replayed
             response["retry_safety"] = (
-                "safe_with_idempotency_key" if idempotency_key else "unsafe_without_key"
+                "safe_with_idempotency_key"
+                if idempotency_mode == "explicit"
+                else "safe_state_reconciled"
             )
+            response["idempotency_mode"] = idempotency_mode
             await ctx.info(
-                f"Issued {len(response['granted'])} Git-independent file_reservations "
+                f"Issued {len(response['granted'])} database-authoritative file_reservations "
                 f"for '{agent.name}'. Conflicts: {len(response['conflicts'])}"
             )
             return response
@@ -13777,7 +14345,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         --------
         - If both `paths` and `file_reservation_ids` are omitted, all active reservations for the agent are released
         - Otherwise, restricts release to matching ids and/or path patterns
-        - JSON artifacts stay in Git for audit; DB records get `released_ts`
+        - Database records get `released_ts`; legacy/migration archive artifacts
+          remain as historical audit records
 
         Returns
         -------
@@ -13852,7 +14421,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     runtime_profile=get_settings().runtime_profile,
                     for_mutation=True,
                 )
-            if route.state == GIT_INDEPENDENT:
+            if route.database_authoritative:
                 request_payload = {
                     "file_reservation_ids": file_reservation_ids,
                     "paths": paths,
@@ -13936,23 +14505,26 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         or transaction_route.generation != route.generation
                     ):
                         raise RuntimeError("Project storage route changed before reservation release")
-                    if idempotency_key:
+                    explicit_idempotency_key = (idempotency_key or "").strip()
+                    if explicit_idempotency_key:
                         atomic_result = await run_idempotent_mutation(
                             session,
                             scope_kind="agent",
                             scope_id=f"{project.id}:{agent.id}",
                             operation_kind="file_reservations_release_v1",
-                            idempotency_key=idempotency_key,
+                            idempotency_key=explicit_idempotency_key,
                             request_payload=request_payload,
                             expires_ts=_naive_utc() + timedelta(days=30),
                             mutate=release_atomic,
                         )
                         response = dict(atomic_result.response)
                         replayed = atomic_result.replayed
+                        idempotency_mode = "explicit"
                     else:
-                        receipt = await release_atomic(session)
-                        response = dict(receipt.response)
+                        mutation = await release_atomic(session)
+                        response = dict(mutation.response)
                         replayed = False
+                        idempotency_mode = "state"
                     await assert_route_generation(
                         session,
                         project_id=project.id,
@@ -13962,10 +14534,13 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     await session.commit()
                 response["replayed"] = replayed
                 response["retry_safety"] = (
-                    "safe_with_idempotency_key" if idempotency_key else "safe_natural_noop"
+                    "safe_with_idempotency_key"
+                    if idempotency_mode == "explicit"
+                    else "safe_state_idempotent"
                 )
+                response["idempotency_mode"] = idempotency_mode
                 await ctx.info(
-                    f"Released {response['released']} Git-independent file_reservations "
+                    f"Released {response['released']} database-authoritative file_reservations "
                     f"for '{agent.name}'."
                 )
                 return response
@@ -14338,7 +14913,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_profile=get_settings().runtime_profile,
                 for_mutation=True,
             )
-        if route.state == GIT_INDEPENDENT:
+        if route.database_authoritative:
             bump = max(60, int(extend_seconds))
             request_payload = {
                 "extend_seconds": extend_seconds,
@@ -14423,23 +14998,26 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     or transaction_route.generation != route.generation
                 ):
                     raise RuntimeError("Project storage route changed before reservation renewal")
-                if idempotency_key:
+                explicit_idempotency_key = (idempotency_key or "").strip()
+                if explicit_idempotency_key:
                     atomic_result = await run_idempotent_mutation(
                         session,
                         scope_kind="agent",
                         scope_id=f"{project.id}:{agent.id}",
                         operation_kind="file_reservations_renew_v1",
-                        idempotency_key=idempotency_key,
+                        idempotency_key=explicit_idempotency_key,
                         request_payload=request_payload,
                         expires_ts=_naive_utc() + timedelta(days=30),
                         mutate=renew_atomic,
                     )
                     response = dict(atomic_result.response)
                     replayed = atomic_result.replayed
+                    idempotency_mode = "explicit"
                 else:
-                    receipt = await renew_atomic(session)
-                    response = dict(receipt.response)
+                    mutation = await renew_atomic(session)
+                    response = dict(mutation.response)
                     replayed = False
+                    idempotency_mode = "none"
                 await assert_route_generation(
                     session,
                     project_id=project.id,
@@ -14449,10 +15027,13 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 await session.commit()
             response["replayed"] = replayed
             response["retry_safety"] = (
-                "safe_with_idempotency_key" if idempotency_key else "unsafe_without_key"
+                "safe_with_idempotency_key"
+                if idempotency_mode == "explicit"
+                else "unsafe_without_idempotency_key"
             )
+            response["idempotency_mode"] = idempotency_mode
             await ctx.info(
-                f"Renewed {response['renewed']} Git-independent file_reservation(s) "
+                f"Renewed {response['renewed']} database-authoritative file_reservation(s) "
                 f"for '{agent.name}'."
             )
             return response
@@ -14526,7 +15107,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
     # --- Build slots (coarse concurrency control) --------------------------------------------
     # Only registered when WORKTREES_ENABLED=1 to reduce token overhead for single-worktree setups
 
-    if settings.worktrees_enabled:
+    if settings.worktrees_enabled and settings.runtime_profile in {"legacy", "migration"}:
         def _safe_component(value: str) -> str:
             # Keep it simple and dependency-free: replace common problematic filesystem chars
             safe = value.strip()
@@ -15776,7 +16357,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         """Return lock metadata from the shared archive storage."""
 
         settings_local = get_settings()
-        payload = collect_lock_status(settings_local)
+        payload = (
+            collect_lock_status(settings_local)
+            if settings_local.runtime_profile in {"legacy", "migration"}
+            else {"active": [], "runtime_profile": settings_local.runtime_profile}
+        )
         return _apply_resource_output_format(
             payload,
             settings=settings,

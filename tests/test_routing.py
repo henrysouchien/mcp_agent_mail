@@ -52,11 +52,15 @@ async def _mark_git_independent(project_id: int, *, generation: int) -> None:
         await session.commit()
 
 
-def test_runtime_profile_defaults_legacy_and_rejects_unknown(
+def test_runtime_profile_defaults_database_and_rejects_unknown(
     isolated_env: object,
     monkeypatch,
+    tmp_path,
 ) -> None:
-    assert get_settings().runtime_profile == "legacy"
+    monkeypatch.delenv("RUNTIME_PROFILE")
+    monkeypatch.chdir(tmp_path)
+    clear_settings_cache()
+    assert get_settings().runtime_profile == "database"
     monkeypatch.setenv("RUNTIME_PROFILE", "surprise")
     clear_settings_cache()
     with pytest.raises(ConfigError, match="RUNTIME_PROFILE"):
@@ -64,20 +68,24 @@ def test_runtime_profile_defaults_legacy_and_rejects_unknown(
 
 
 @pytest.mark.asyncio
-async def test_missing_cutover_is_legacy_only_outside_core(isolated_env: object) -> None:
+async def test_missing_cutover_preserves_legacy_and_migration_profiles(
+    isolated_env: object,
+) -> None:
     await ensure_schema()
     project_id = await _project()
     async with get_immediate_session() as session:
-        legacy = await resolve_storage_route(
-            session,
-            project_id=project_id,
-            runtime_profile="migration",
-            for_mutation=True,
-        )
-        assert legacy.state == "legacy"
-        assert legacy.generation == 0
-        assert legacy.retry_safety == "unsafe_legacy"
-        assert legacy.use_legacy_adapter is True
+        for runtime_profile in ("legacy", "migration"):
+            legacy = await resolve_storage_route(
+                session,
+                project_id=project_id,
+                runtime_profile=runtime_profile,
+                for_mutation=True,
+            )
+            assert legacy.state == "legacy"
+            assert legacy.generation == 0
+            assert legacy.retry_safety == "unsafe_legacy"
+            assert legacy.use_legacy_adapter is True
+            assert legacy.database_authoritative is False
         with pytest.raises(StorageRoutingError):
             await resolve_storage_route(
                 session,
@@ -88,10 +96,32 @@ async def test_missing_cutover_is_legacy_only_outside_core(isolated_env: object)
 
 
 @pytest.mark.asyncio
+async def test_database_route_needs_no_cutover_row(isolated_env: object) -> None:
+    await ensure_schema()
+    project_id = await _project()
+    async with get_immediate_session() as session:
+        route = await resolve_storage_route(
+            session,
+            project_id=project_id,
+            runtime_profile="database",
+            for_mutation=True,
+        )
+
+        assert route.state == "legacy"
+        assert route.generation == 0
+        assert route.retry_safety == "safe_with_idempotency_key"
+        assert route.use_legacy_adapter is False
+        assert route.database_authoritative is True
+        assert await session.get(ProjectStorageCutover, project_id) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["quiescing", "baseline_committed"])
+@pytest.mark.parametrize("runtime_profile", ["migration", "database"])
 async def test_cutover_intermediate_states_reject_mutations(
     isolated_env: object,
     state: str,
+    runtime_profile: str,
 ) -> None:
     await ensure_schema()
     project_id = await _project()
@@ -103,7 +133,7 @@ async def test_cutover_intermediate_states_reject_mutations(
             await resolve_storage_route(
                 session,
                 project_id=project_id,
-                runtime_profile="migration",
+                runtime_profile=runtime_profile,
                 for_mutation=True,
             )
 
@@ -122,6 +152,7 @@ async def test_git_independent_route_is_safe_and_never_legacy(isolated_env: obje
         )
         assert route.retry_safety == "safe_with_idempotency_key"
         assert route.use_legacy_adapter is False
+        assert route.database_authoritative is True
 
 
 @pytest.mark.asyncio

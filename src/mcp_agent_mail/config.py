@@ -197,7 +197,7 @@ class Settings:
     """Top-level application settings."""
 
     environment: str
-    runtime_profile: str  # "legacy" | "migration" | "core"
+    runtime_profile: str  # "database" | "legacy" | "migration" | "core"
     # Global gate for worktree-friendly behavior (opt-in; default False)
     worktrees_enabled: bool
     # Identity preferences (phase 1: read-only; behavior remains 'dir' unless features enabled)
@@ -456,9 +456,9 @@ def _build_settings() -> Settings:
     database_settings = DatabaseSettings(
         url=decouple_config("DATABASE_URL", default="sqlite+aiosqlite:///./storage.sqlite3"),
         echo=_b("DATABASE_ECHO", default=False),
-        pool_size=_io("DATABASE_POOL_SIZE", default=50),
-        max_overflow=_io("DATABASE_MAX_OVERFLOW"),
-        pool_timeout=_io("DATABASE_POOL_TIMEOUT"),
+        pool_size=_io("DATABASE_POOL_SIZE", default=8),
+        max_overflow=_io("DATABASE_MAX_OVERFLOW", default=2),
+        pool_timeout=_io("DATABASE_POOL_TIMEOUT", default=3),
     )
 
     allow_abs_default = "false"
@@ -594,8 +594,8 @@ def _build_settings() -> Settings:
         environment=environment,
         runtime_profile=_e(
             "RUNTIME_PROFILE",
-            default="legacy",
-            allowed=frozenset({"legacy", "migration", "core"}),
+            default="database",
+            allowed=frozenset({"database", "legacy", "migration", "core"}),
         ),
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(

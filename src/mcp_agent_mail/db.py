@@ -5,14 +5,14 @@ This module provides robust SQLite handling for high-concurrency multi-agent wor
 Concurrency Architecture:
 - WAL mode with optimized checkpoint strategy (passive checkpoints to avoid blocking)
 - Connection pooling with conservative limits to prevent file descriptor exhaustion
-- Exponential backoff with jitter on lock contention (prevents thundering herd)
+- Process-local writer admission before connection checkout (prevents pool starvation)
 - Circuit breaker pattern to fail fast during prolonged database issues
 
 Key invariants:
 - One writer at a time (SQLite constraint), concurrent readers allowed
 - Connections recycled after 1 hour to prevent stale handle accumulation
-- Pool timeout of 30s fails fast with clear error vs hanging indefinitely
-- busy_timeout of 60s gives writers time to complete during checkpoint
+- SQLite pool timeout of 3s fails before typical MCP client deadlines
+- busy_timeout of 2s fails well before typical MCP client deadlines
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _schema_ready = False
 _schema_lock: asyncio.Lock | None = None
+_sqlite_writer_lock: asyncio.Lock | None = None
 
 # Circuit breaker state for database operations
 _circuit_breaker_failures: int = 0
@@ -68,6 +69,14 @@ def _get_circuit_breaker_lock() -> asyncio.Lock:
     if _CIRCUIT_BREAKER_LOCK is None:
         _CIRCUIT_BREAKER_LOCK = asyncio.Lock()
     return _CIRCUIT_BREAKER_LOCK
+
+
+def _get_sqlite_writer_lock() -> asyncio.Lock:
+    """Return the process-local admission lock for SQLite write transactions."""
+    global _sqlite_writer_lock
+    if _sqlite_writer_lock is None:
+        _sqlite_writer_lock = asyncio.Lock()
+    return _sqlite_writer_lock
 
 
 def get_circuit_state() -> CircuitState:
@@ -321,13 +330,13 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
     SQLite Concurrency Tuning:
     - WAL mode: Allows concurrent readers + one writer (vs default rollback journal)
     - NORMAL sync: 10x faster than FULL, still durable (WAL provides crash safety)
-    - busy_timeout=60s: Extended timeout during checkpoint operations
+    - busy_timeout=2s: Bounded wait below typical MCP client deadlines
     - wal_autocheckpoint=1000: Checkpoint every 1000 pages (~4MB) to prevent WAL bloat
     - cache_size=-32768: 32MB page cache for better read performance
 
     Pool Tuning:
-    - Higher default pool size for bursty multi-agent workloads (50 base for SQLite)
-    - 45s pool timeout - long enough for checkpoint but not indefinite
+    - Bounded SQLite pool (8 base + 2 overflow) avoids excess writer contenders
+    - 3s pool timeout returns control before MCP clients abandon requests
     - pool_pre_ping: Detect and recycle stale connections
     """
     from sqlalchemy import event
@@ -381,17 +390,17 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
         sqlite3.register_converter("timestamp", convert_datetime)
 
         connect_args = {
-            "timeout": 60.0,  # Extended timeout (60s) to handle checkpoint stalls
+            "timeout": 2.0,
             "check_same_thread": False,  # Required for async SQLite
         }
 
     # SQLite concurrency tuning:
-    # - Larger pool to support high-concurrency multi-agent workloads (50 base + 4 overflow = 54 max connections)
-    # - Longer timeout to handle WAL checkpoint blocking
+    # - A bounded pool limits SQLite writer contention under multi-agent bursts.
+    # - Timeouts stay below common MCP client request deadlines.
     # For non-SQLite (PostgreSQL, etc.), keep existing defaults unless overridden
-    pool_size = settings.pool_size if settings.pool_size is not None else (50 if is_sqlite else 25)
-    max_overflow = settings.max_overflow if settings.max_overflow is not None else (4 if is_sqlite else 25)
-    pool_timeout = settings.pool_timeout if settings.pool_timeout is not None else (45 if is_sqlite else 30)
+    pool_size = settings.pool_size if settings.pool_size is not None else (8 if is_sqlite else 25)
+    max_overflow = settings.max_overflow if settings.max_overflow is not None else (2 if is_sqlite else 25)
+    pool_timeout = settings.pool_timeout if settings.pool_timeout is not None else (3 if is_sqlite else 30)
 
     engine = create_async_engine(
         settings.url,
@@ -400,7 +409,7 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
         pool_pre_ping=True,  # Detect and recycle stale connections
         pool_size=pool_size,
         max_overflow=max_overflow,
-        pool_timeout=pool_timeout,  # Extended timeout for SQLite checkpoint scenarios
+        pool_timeout=pool_timeout,
         pool_recycle=1800,  # Recycle connections every 30 minutes (was 1 hour)
         pool_reset_on_return="rollback",  # Ensure uncommitted transactions are rolled back on return
         connect_args=connect_args,
@@ -418,7 +427,7 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
 
             - journal_mode=WAL: Write-Ahead Logging for concurrent reads during writes
             - synchronous=NORMAL: 10x faster than FULL, WAL provides crash safety
-            - busy_timeout=60000: 60s wait for locks (handles checkpoint stalls)
+            - busy_timeout=2000: bounded wait below typical MCP client deadlines
             - wal_autocheckpoint=1000: Checkpoint every ~4MB to prevent WAL bloat
             - cache_size=-32768: 32MB page cache (negative = KB, positive = pages)
             - temp_store=MEMORY: Temp tables in memory for faster operations
@@ -434,10 +443,9 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
                 # With WAL mode, NORMAL provides durability without the FULL penalty
                 cursor.execute("PRAGMA synchronous=NORMAL")
 
-                # Extended busy timeout (60 seconds) to handle:
-                # - WAL checkpoint blocking (can take seconds with large WAL)
-                # - Concurrent write contention from multiple agents
-                cursor.execute("PRAGMA busy_timeout=60000")
+                # Bound lock waits so a lost client response cannot leave a
+                # seemingly failed mutation running for another full minute.
+                cursor.execute("PRAGMA busy_timeout=2000")
 
                 # WAL autocheckpoint: checkpoint every 1000 pages (~4MB)
                 # Prevents WAL file from growing unbounded while not checkpointing too often
@@ -457,26 +465,6 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
 
             finally:
                 cursor.close()
-
-        @event.listens_for(engine.sync_engine, "checkin")
-        def on_checkin(dbapi_conn: Any, connection_record: Any) -> None:
-            """Perform passive WAL checkpoint when connection returns to pool.
-
-            PASSIVE checkpoint doesn't block writers - it only checkpoints pages
-            that can be checkpointed without waiting. This helps keep WAL size
-            manageable without causing lock contention.
-            """
-            try:
-                cursor = dbapi_conn.cursor()
-                try:
-                    # PASSIVE mode: checkpoint what we can without blocking
-                    # Returns (blocked, wal_pages, checkpointed_pages)
-                    cursor.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                finally:
-                    cursor.close()
-            except Exception:
-                # Ignore checkpoint errors - they're non-critical
-                pass
 
     return engine
 
@@ -668,9 +656,22 @@ async def get_immediate_session(*, check_circuit_breaker: bool = False) -> Async
                 "This typically indicates sustained database lock contention."
             )
 
-    factory = get_session_factory()
-    session = factory()
+    engine = get_engine()
+    writer_lock = (
+        _get_sqlite_writer_lock()
+        if engine.url.get_backend_name() == "sqlite"
+        else None
+    )
+    writer_lock_acquired = False
+    session: AsyncSession | None = None
     try:
+        # SQLite permits one writer.  Queue before checking out a connection so
+        # a burst of agents cannot fill the pool with BEGIN IMMEDIATE waiters.
+        if writer_lock is not None:
+            await writer_lock.acquire()
+            writer_lock_acquired = True
+        factory = get_session_factory()
+        session = factory()
         # Obtain the underlying connection and issue BEGIN IMMEDIATE *before*
         # SQLAlchemy's autobegin can issue a plain BEGIN.
         conn = await session.connection()
@@ -678,16 +679,22 @@ async def get_immediate_session(*, check_circuit_breaker: bool = False) -> Async
         yield session
     except BaseException:
         # Roll back on any error so the IMMEDIATE lock is released.
-        with suppress(BaseException):
-            await session.rollback()
+        if session is not None:
+            with suppress(BaseException):
+                await session.rollback()
         raise
     finally:
         try:
-            await asyncio.shield(session.close())
-        except BaseException:
-            with suppress(BaseException):
-                await session.close()
-            raise
+            if session is not None:
+                try:
+                    await asyncio.shield(session.close())
+                except BaseException:
+                    with suppress(BaseException):
+                        await session.close()
+                    raise
+        finally:
+            if writer_lock is not None and writer_lock_acquired:
+                writer_lock.release()
 
 
 def get_db_health_status() -> dict[str, Any]:
@@ -762,7 +769,7 @@ async def ensure_schema(settings: Settings | None = None) -> None:
 
 def reset_database_state() -> None:
     """Test helper to reset global engine/session state."""
-    global _engine, _session_factory, _schema_ready, _schema_lock, _QUERY_HOOKS_INSTALLED
+    global _engine, _session_factory, _schema_ready, _schema_lock, _sqlite_writer_lock, _QUERY_HOOKS_INSTALLED
     # Dispose any existing engine/pool first to avoid leaking file descriptors across tests.
     if _engine is not None:
         engine = _engine
@@ -776,6 +783,7 @@ def reset_database_state() -> None:
     _session_factory = None
     _schema_ready = False
     _schema_lock = None
+    _sqlite_writer_lock = None
     # Query hooks bind to the disposed engine; reset the one-shot flag so the
     # rebuilt engine gets re-instrumented on the next init_engine() call.
     _QUERY_HOOKS_INSTALLED = False

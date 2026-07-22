@@ -38,8 +38,10 @@ from .app import (
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
     reset_request_pane_credential,
+    reset_request_window_identity_authoritative,
     reset_request_window_identity_uuid,
     set_request_pane_credential,
+    set_request_window_identity_authoritative,
     set_request_window_identity_uuid,
     sweep_stale_agents,
     update_project_sibling_status,
@@ -78,7 +80,7 @@ def _core_legacy_http_error(operation: str) -> HTTPException:
             "error": "optional_component_unavailable",
             "component": "legacy_git_archive",
             "operation": operation,
-            "runtime_profile": "core",
+            "runtime_profile": get_settings().runtime_profile,
         },
     )
 
@@ -161,7 +163,11 @@ async def _ensure_ack_escalation_holder(
                     "contact_policy": "auto",
                 }
 
-    if holder_profile_payload is not None and project_slug:
+    if (
+        holder_profile_payload is not None
+        and project_slug
+        and settings.runtime_profile in {"legacy", "migration"}
+    ):
         archive = await ensure_archive(settings, project_slug)
         async with archive_write_lock(archive):
             await write_agent_profile(archive, holder_profile_payload)
@@ -683,6 +689,27 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
     return candidates
 
 
+_PROXY_HINT_HEADER_NAMES = frozenset(
+    {
+        "forwarded",
+        "via",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+        "fastly-client-ip",
+        "fly-client-ip",
+    }
+)
+_PROXY_HINT_HEADER_NAMES_BYTES = frozenset(
+    name.encode("ascii") for name in _PROXY_HINT_HEADER_NAMES
+)
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     def __init__(
         self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
@@ -711,10 +738,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     def _has_forwarded_headers(request: Request) -> bool:
         """Detect proxy-forwarded headers to avoid trusting localhost behind proxies."""
         headers = request.headers
-        return any(
-            name in headers
-            for name in ("x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded")
-        )
+        return any(name in headers for name in _PROXY_HINT_HEADER_NAMES)
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         if request.method == "OPTIONS":  # allow CORS preflight
@@ -778,10 +802,31 @@ def _normalize_window_identity_candidate(value: str) -> str:
         return candidate
 
 
-def _extract_window_identity_from_headers(headers: list[tuple[bytes, bytes]]) -> str:
+def _extract_window_identity_carrier(
+    headers: list[tuple[bytes, bytes]],
+) -> tuple[str, bool]:
+    """Return the routing UUID and whether it came from the auth bearer.
+
+    Only the canonical ``mcp-window:`` Authorization carrier can become
+    authority, and the caller must still verify direct loopback provenance.
+    Compatibility headers and the older bearer alias remain routing metadata.
+    """
+    for raw_name, raw_value in headers:
+        if raw_name.lower() != b"authorization":
+            continue
+        auth = raw_value.decode("latin1").strip()
+        if not auth.lower().startswith("bearer "):
+            continue
+        bearer = auth[7:].strip()
+        if bearer.startswith("mcp-window:"):
+            return (
+                _normalize_window_identity_candidate(bearer[len("mcp-window:"):]),
+                True,
+            )
+
     for raw_name, raw_value in headers:
         if raw_name.lower() in _WINDOW_IDENTITY_HEADER_NAMES:
-            return _normalize_window_identity_candidate(raw_value.decode("latin1"))
+            return _normalize_window_identity_candidate(raw_value.decode("latin1")), False
 
     for raw_name, raw_value in headers:
         if raw_name.lower() != b"authorization":
@@ -790,10 +835,33 @@ def _extract_window_identity_from_headers(headers: list[tuple[bytes, bytes]]) ->
         if not auth.lower().startswith("bearer "):
             continue
         bearer = auth[7:].strip()
-        for prefix in _WINDOW_IDENTITY_BEARER_PREFIXES:
+        for prefix in _WINDOW_IDENTITY_BEARER_PREFIXES[1:]:
             if bearer.startswith(prefix):
-                return _normalize_window_identity_candidate(bearer[len(prefix):])
-    return ""
+                return _normalize_window_identity_candidate(bearer[len(prefix):]), False
+    return "", False
+
+
+def _extract_window_identity_from_headers(headers: list[tuple[bytes, bytes]]) -> str:
+    """Compatibility wrapper returning only the routing UUID."""
+    return _extract_window_identity_carrier(headers)[0]
+
+
+def _scope_is_trusted_loopback(
+    scope: Scope,
+    headers: list[tuple[bytes, bytes]],
+    *,
+    allow_localhost: bool,
+) -> bool:
+    if not allow_localhost:
+        return False
+    client = scope.get("client")
+    client_host = str(client[0]) if isinstance(client, tuple) and client else ""
+    if not BearerAuthMiddleware._is_localhost(client_host):
+        return False
+    return not any(
+        raw_name.lower() in _PROXY_HINT_HEADER_NAMES_BYTES
+        for raw_name, _ in headers
+    )
 
 
 def _extract_pane_credential_from_headers(headers: list[tuple[bytes, bytes]]) -> str:
@@ -1115,6 +1183,8 @@ async def readiness_check() -> None:
     # Fail readiness if FD usage from lockfile leaks is critically high.
     # This gives orchestrators a signal to restart the process before it
     # becomes completely wedged (issue #116).
+    if get_settings().runtime_profile not in {"legacy", "migration"}:
+        return
     current, limit = get_fd_usage()
     if current >= 0 and limit > 0:
         headroom_pct = (limit - current) / limit
@@ -1327,26 +1397,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                                 },
                                             )
                                             await s2.commit()
-                                        # Also write JSON artifact to archive
-                                        if not project_slug:
-                                            raise ValueError(f"Project id {project_id} has no slug; cannot write archive artifacts.")
-                                        archive = await ensure_archive(settings, project_slug)
-                                        expires_at = now + _dt.timedelta(
-                                            seconds=settings.ack_escalation_claim_ttl_seconds
-                                        )
-                                        async with archive_write_lock(archive):
-                                            await write_file_reservation_record(
-                                                archive,
-                                                {
-                                                    "project": project_slug,
-                                                    "agent": holder_agent_name,
-                                                    "path_pattern": pattern,
-                                                    "exclusive": settings.ack_escalation_claim_exclusive,
-                                                    "reason": "ack-overdue",
-                                                    "created_ts": now.isoformat(),
-                                                    "expires_ts": expires_at.isoformat(),
-                                                },
+                                        if settings.runtime_profile in {"legacy", "migration"}:
+                                            if not project_slug:
+                                                raise ValueError(f"Project id {project_id} has no slug; cannot write archive artifacts.")
+                                            archive = await ensure_archive(settings, project_slug)
+                                            expires_at = now + _dt.timedelta(
+                                                seconds=settings.ack_escalation_claim_ttl_seconds
                                             )
+                                            async with archive_write_lock(archive):
+                                                await write_file_reservation_record(
+                                                    archive,
+                                                    {
+                                                        "project": project_slug,
+                                                        "agent": holder_agent_name,
+                                                        "path_pattern": pattern,
+                                                        "exclusive": settings.ack_escalation_claim_exclusive,
+                                                        "reason": "ack-overdue",
+                                                        "created_ts": now.isoformat(),
+                                                        "expires_ts": expires_at.isoformat(),
+                                                    },
+                                                )
                                     except Exception:
                                         pass
                 except Exception:
@@ -1493,7 +1563,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         tasks = []
         # The legacy FD worker inspects the Git archive repository cache. Core
         # intentionally has no archive module in its import or execution graph.
-        if settings.runtime_profile != "core":
+        if settings.runtime_profile in {"legacy", "migration"}:
             tasks.append(asyncio.create_task(_worker_fd_health()))
         if settings.file_reservations_cleanup_enabled:
             tasks.append(asyncio.create_task(_worker_cleanup()))
@@ -1503,7 +1573,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             tasks.append(asyncio.create_task(_worker_tool_metrics()))
         if settings.retention_report_enabled or settings.quota_enabled:
             tasks.append(asyncio.create_task(_worker_retention_quota()))
-        if settings.auto_retire_stale_agents_enabled and settings.runtime_profile != "core":
+        # Database-authoritative identities are durable pane/session bindings.
+        # The legacy 24-hour sweep caused those bindings to become unusable and
+        # was the source of recurring agent_name/registration_token failures.
+        if (
+            settings.auto_retire_stale_agents_enabled
+            and settings.runtime_profile in {"legacy", "migration"}
+        ):
             tasks.append(asyncio.create_task(_worker_auto_retire_stale_agents()))
         fastapi_app.state._background_tasks = tasks
 
@@ -1548,8 +1624,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         lifespan=lifespan_context,
     )
 
-    if settings.runtime_profile == "core":
-        class CoreLegacySurfaceGuard(BaseHTTPMiddleware):
+    if settings.runtime_profile in {"core", "database"}:
+        class DatabaseLegacySurfaceGuard(BaseHTTPMiddleware):
             """Fail closed for web routes that still mutate/read Git archives."""
 
             async def dispatch(
@@ -1565,7 +1641,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
                 return await call_next(request)
 
-        cast(Any, fastapi_app).add_middleware(CoreLegacySurfaceGuard)
+        cast(Any, fastapi_app).add_middleware(DatabaseLegacySurfaceGuard)
 
     # Simple request logging (configurable)
     if settings.http.request_log_enabled:
@@ -1797,21 +1873,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             new_scope = dict(scope)
             new_scope["headers"] = headers
 
-            window_uuid = _extract_window_identity_from_headers(headers)
+            window_uuid, bearer_carrier = _extract_window_identity_carrier(headers)
             pane_credential = _extract_pane_credential_from_headers(headers)
-            window_token = set_request_window_identity_uuid(window_uuid) if window_uuid else None
-            pane_token = (
-                set_request_pane_credential(pane_credential)
-                if pane_credential
-                else None
+            window_token = set_request_window_identity_uuid(window_uuid)
+            authority_token = set_request_window_identity_authoritative(
+                bearer_carrier
+                and _scope_is_trusted_loopback(
+                    scope,
+                    headers,
+                    allow_localhost=settings.http.allow_localhost_unauthenticated,
+                )
             )
+            pane_token = set_request_pane_credential(pane_credential)
             try:
                 await self._app(new_scope, receive, send)
             finally:
-                if pane_token is not None:
-                    reset_request_pane_credential(pane_token)
-                if window_token is not None:
-                    reset_request_window_identity_uuid(window_token)
+                reset_request_pane_credential(pane_token)
+                reset_request_window_identity_authoritative(authority_token)
+                reset_request_window_identity_uuid(window_token)
 
     # Mount at both '/base' and '/base/' to tolerate either form from clients/tests.
     # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.
@@ -2052,7 +2131,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             """Return metadata about active archive locks for observability."""
 
             settings_local = get_settings()
-            payload = collect_lock_status(settings_local)
+            payload = (
+                collect_lock_status(settings_local)
+                if settings_local.runtime_profile in {"legacy", "migration"}
+                else {"active": [], "runtime_profile": settings_local.runtime_profile}
+            )
             return JSONResponse(payload)
 
         async def _build_unified_inbox_payload(
@@ -3012,7 +3095,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # Get commit SHA for provenance badge
             commit_sha = None
             settings = get_settings()
-            if settings.runtime_profile != "core":
+            if settings.runtime_profile in {"legacy", "migration"}:
                 try:
                     archive = await ensure_archive(settings, prow[1])
                     commit_sha = await get_message_commit_sha(archive, mid)
@@ -3723,7 +3806,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def overseer_send(project: str, request: Request) -> JSONResponse:
             """Send message from Human Overseer to selected agents."""
             settings = get_settings()
-            if settings.runtime_profile == "core":
+            if settings.runtime_profile in {"core", "database"}:
                 # Fail before schema initialization, agent creation, message
                 # insertion, or any other mutation. The legacy overseer path
                 # has no core idempotency/audit contract.

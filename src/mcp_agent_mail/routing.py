@@ -1,4 +1,4 @@
-"""Fail-closed per-project routing for the storage migration."""
+"""Fail-closed per-project routing across database and legacy storage."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ GIT_INDEPENDENT: Final = "git_independent"
 VALID_STATES: Final = frozenset(
     {LEGACY, QUIESCING, BASELINE_COMMITTED, GIT_INDEPENDENT}
 )
-VALID_PROFILES: Final = frozenset({"legacy", "migration", "core"})
+VALID_PROFILES: Final = frozenset({"database", "legacy", "migration", "core"})
 
 
 class StorageRoutingError(RuntimeError):
@@ -58,6 +58,11 @@ class StorageRoute:
     generation: int
     retry_safety: str
     use_legacy_adapter: bool
+
+    @property
+    def database_authoritative(self) -> bool:
+        """Whether runtime durability comes from the transactional database path."""
+        return not self.use_legacy_adapter
 
 
 async def resolve_storage_route(
@@ -102,7 +107,7 @@ async def resolve_storage_route(
         raise MutationQuiescedError(
             f"project {project_id} mutations are stopped during cutover state {state!r}"
         )
-    if state == GIT_INDEPENDENT:
+    if runtime_profile == "database" or state == GIT_INDEPENDENT:
         return StorageRoute(
             state=state,
             generation=generation,

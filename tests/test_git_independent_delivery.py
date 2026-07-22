@@ -378,11 +378,13 @@ async def test_core_startup_rejects_existing_legacy_project(
 
 
 @pytest.mark.asyncio
-async def test_live_registration_never_opens_archive_for_git_independent_project(
+@pytest.mark.parametrize("runtime_profile", ["migration", "database"])
+async def test_managed_registration_follows_project_route_outside_core_profile(
     isolated_env: object,
     monkeypatch,
+    runtime_profile: str,
 ) -> None:
-    monkeypatch.setenv("RUNTIME_PROFILE", "migration")
+    monkeypatch.setenv("RUNTIME_PROFILE", runtime_profile)
     _configure_managed_registration(monkeypatch)
     clear_settings_cache()
     await ensure_schema()
@@ -396,6 +398,16 @@ async def test_live_registration_never_opens_archive_for_git_independent_project
 
     monkeypatch.setattr("mcp_agent_mail.app.ensure_archive", archive_must_not_open)
     async with Client(build_mcp_server()) as client:
+        with pytest.raises(Exception, match="Managed registration requires"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": "/git-independent-registration",
+                    "program": "test",
+                    "model": "test",
+                    "name": "BlueLake",
+                },
+            )
         bootstrap = await client.call_tool(
             "issue_registration_bootstrap",
             {
@@ -416,11 +428,185 @@ async def test_live_registration_never_opens_archive_for_git_independent_project
             },
         )
     assert result.data["name"] == "BlueLake"
+    assert result.data["pane_credential"]
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Agent)) == 1
+        consumed_bootstrap = (
+            await session.execute(select(BootstrapCredential))
+        ).scalar_one()
+        assert consumed_bootstrap.consumed_ts is not None
+        assert await session.scalar(select(func.count()).select_from(PaneCredential)) == 1
         assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 3
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_profile", ["migration", "database"])
+async def test_managed_unretire_follows_project_route_outside_core_profile(
+    isolated_env: object,
+    monkeypatch,
+    runtime_profile: str,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", runtime_profile)
+    _configure_managed_registration(monkeypatch)
+    clear_settings_cache()
+    await ensure_schema()
+    project_id = await _create_git_independent_project(
+        "/git-independent-unretire",
+        "git-independent-unretire",
+    )
+    async with get_immediate_session() as session:
+        agent = Agent(
+            project_id=project_id,
+            name="BlueLake",
+            program="test",
+            model="test",
+            registration_token="self-secret",
+            retired_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        session.add(agent)
+        await session.commit()
+
+    async with Client(build_mcp_server()) as client:
+        with pytest.raises(Exception, match="owner"):
+            await client.call_tool(
+                "unretire_agent",
+                {
+                    "project_key": "/git-independent-unretire",
+                    "agent_name": "BlueLake",
+                    "registration_token": "self-secret",
+                },
+            )
+        restored = await client.call_tool(
+            "unretire_agent",
+            {
+                "project_key": "/git-independent-unretire",
+                "agent_name": "BlueLake",
+                "owner_token": "owner-secret",
+            },
+        )
+
+    assert restored.data["status"] == "active"
+    async with get_session() as session:
+        db_agent = (
+            await session.execute(
+                select(Agent).where(cast(Any, Agent.name) == "BlueLake")
+            )
+        ).scalar_one()
+        assert db_agent.retired_at is None
+
+
+@pytest.mark.asyncio
+async def test_database_profile_uses_existing_db_without_cutover_or_git(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    """Ordinary projects get atomic/replay-safe writes without a cutover row."""
+    monkeypatch.setenv("RUNTIME_PROFILE", "database")
+    clear_settings_cache()
+
+    async def legacy_path_must_not_run(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("database profile crossed the legacy Git/archive boundary")
+
+    monkeypatch.setattr("mcp_agent_mail.app.ensure_archive", legacy_path_must_not_run)
+    monkeypatch.setattr("mcp_agent_mail.app.write_agent_profile", legacy_path_must_not_run)
+    monkeypatch.setattr("mcp_agent_mail.app.write_message_bundle", legacy_path_must_not_run)
+
+    async with Client(build_mcp_server()) as client:
+        project = await client.call_tool(
+            "ensure_project",
+            {"human_key": "/database-authoritative"},
+        )
+        sender = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/database-authoritative",
+                "program": "test",
+                "model": "test",
+                "name": "BlueLake",
+            },
+        )
+        recipient = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/database-authoritative",
+                "program": "test",
+                "model": "test",
+                "name": "GreenCastle",
+            },
+        )
+        send_arguments = {
+            "project_key": "/database-authoritative",
+            "sender_name": "BlueLake",
+            "sender_token": sender.data["registration_token"],
+            "to": ["GreenCastle"],
+            "subject": "Retry-safe without Git",
+            "body_md": "The first response may be lost.",
+        }
+        first_send = await client.call_tool("send_message", send_arguments)
+        replayed_send = await client.call_tool("send_message", send_arguments)
+        message_id = first_send.data["deliveries"][0]["payload"]["id"]
+
+        reply_arguments = {
+            "project_key": "/database-authoritative",
+            "message_id": message_id,
+            "sender_name": "GreenCastle",
+            "sender_token": recipient.data["registration_token"],
+            "body_md": "Acknowledged.",
+        }
+        first_reply = await client.call_tool("reply_message", reply_arguments)
+        replayed_reply = await client.call_tool("reply_message", reply_arguments)
+
+        reserve_arguments = {
+            "project_key": "/database-authoritative",
+            "agent_name": "BlueLake",
+            "registration_token": sender.data["registration_token"],
+            "paths": ["src/database.py"],
+            "ttl_seconds": 600,
+        }
+        first_reserve = await client.call_tool("file_reservation_paths", reserve_arguments)
+        replayed_reserve = await client.call_tool("file_reservation_paths", reserve_arguments)
+        release_arguments = {
+            "project_key": "/database-authoritative",
+            "agent_name": "BlueLake",
+            "registration_token": sender.data["registration_token"],
+            "paths": ["src/database.py"],
+        }
+        first_release = await client.call_tool(
+            "release_file_reservations",
+            release_arguments,
+        )
+        replayed_release = await client.call_tool(
+            "release_file_reservations",
+            release_arguments,
+        )
+
+    first_payload = first_send.data["deliveries"][0]["payload"]
+    replayed_payload = replayed_send.data["deliveries"][0]["payload"]
+    assert first_payload["replayed"] is False
+    assert replayed_payload["replayed"] is True
+    assert replayed_payload["id"] == first_payload["id"]
+    assert replayed_payload["retry_safety"] == "safe_with_automatic_retry_dedupe"
+    assert first_reply.data["replayed"] is False
+    assert replayed_reply.data["replayed"] is True
+    assert replayed_reply.data["id"] == first_reply.data["id"]
+    assert first_reserve.data["replayed"] is False
+    assert replayed_reserve.data["replayed"] is False
+    assert replayed_reserve.data["granted"][0]["id"] == first_reserve.data["granted"][0]["id"]
+    assert replayed_reserve.data["granted"][0]["reused"] is True
+    assert replayed_reserve.data["idempotency_mode"] == "state"
+    assert first_release.data["released"] == 1
+    assert replayed_release.data["released"] == 0
+    assert replayed_release.data["replayed"] is False
+    assert replayed_release.data["idempotency_mode"] == "state"
+
+    async with get_session() as session:
+        assert await session.get(ProjectStorageCutover, project.data["id"]) is None
+        assert await session.scalar(select(func.count()).select_from(Project)) == 1
+        assert await session.scalar(select(func.count()).select_from(Agent)) == 2
+        assert await session.scalar(select(func.count()).select_from(Message)) == 2
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 2
 
 
 @pytest.mark.asyncio
@@ -604,14 +790,14 @@ async def test_live_send_installs_blob_attachments_before_atomic_references(
     assert replay_payload["replayed"] is True
     assert replay_payload["id"] == first_payload["id"]
     assert len(first_payload["attachments"]) == 2
-    assert "data:image" not in first_payload["body_md"]
-    assert first_payload["body_md"].count("blob:sha256:") == 1
+    assert "body_md" not in first_payload
 
     async with get_session() as session:
         message = (await session.execute(select(Message))).scalar_one()
         blobs = (await session.execute(select(Blob))).scalars().all()
         references = (await session.execute(select(BlobReference))).scalars().all()
     assert "data:image" not in message.body_md
+    assert message.body_md.count("blob:sha256:") == 1
     assert len(blobs) == 2
     assert len(references) == 2
     for blob in blobs:
