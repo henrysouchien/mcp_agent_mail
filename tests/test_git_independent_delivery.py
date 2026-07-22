@@ -76,15 +76,25 @@ async def test_core_ensure_project_bootstraps_baseline_without_archive(
             "ensure_project",
             {"human_key": "/new-core-project"},
         )
+        registered = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/new-core-project",
+                "program": "test",
+                "model": "test",
+                "name": "core-1",
+            },
+        )
 
     assert second.data["id"] == first.data["id"]
+    assert registered.data["name"] == "core-1"
     async with get_session() as session:
         cutover = await session.get(ProjectStorageCutover, first.data["id"])
         assert cutover is not None
         assert cutover.state == "git_independent"
         assert cutover.baseline_event_id is not None
         assert await session.scalar(select(func.count()).select_from(Project)) == 1
-        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 1
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
 
 
 @pytest.mark.asyncio
