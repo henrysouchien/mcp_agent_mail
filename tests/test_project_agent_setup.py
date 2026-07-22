@@ -165,12 +165,8 @@ async def test_project_slug_generated_from_human_key(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_ensure_project_resolves_symlinks(isolated_env, tmp_path):
-    """ensure_project resolves symlinks to canonical paths.
-
-    This ensures that /dp/ntm and /data/projects/ntm resolve to the same
-    project when /dp is a symlink to /data/projects.
-    """
+async def test_ensure_project_preserves_distinct_symlink_identity(isolated_env, tmp_path):
+    """User-visible symlink paths remain distinct project identities (#126)."""
 
     # Create a real directory and a symlink to it
     real_dir = tmp_path / "real_project"
@@ -188,28 +184,23 @@ async def test_ensure_project_resolves_symlinks(isolated_env, tmp_path):
             "ensure_project", {"human_key": symlink_path}
         )
 
-        # The stored human_key should be the resolved (canonical) path
-        assert result1.data["human_key"] == real_path, \
-            f"human_key should be resolved path {real_path}, got {result1.data['human_key']}"
+        assert result1.data["human_key"] == symlink_path
 
         # Create project via real path - should return same project
         result2 = await client.call_tool(
             "ensure_project", {"human_key": real_path}
         )
 
-        # Should be the same project
-        assert result1.data["id"] == result2.data["id"], \
-            "Symlink and real path should resolve to same project"
-        assert result1.data["slug"] == result2.data["slug"], \
-            "Symlink and real path should have same slug"
+        assert result1.data["id"] != result2.data["id"]
+        assert result1.data["slug"] != result2.data["slug"]
 
         # Register an agent via the symlinked project_key and ensure it lands on the canonical project
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": symlink_path, "program": "test-program", "model": "test-model"},
         )
-        project = await get_project_from_db(real_path)
-        assert project is not None, "Canonical project should exist"
+        project = await get_project_from_db(symlink_path)
+        assert project is not None, "Symlink-keyed project should exist"
         agent = await get_agent_from_db(project["id"], agent_result.data["name"])
         assert agent is not None, "Agent registered via symlink should attach to canonical project"
 
