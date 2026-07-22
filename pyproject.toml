@@ -46,7 +46,6 @@ dependencies = [
   "orjson>=3.10.7,<4",
   "tiktoken>=0.7.0",
   "pillow>=10.4.0",
-  "GitPython>=3.1.43",
   "filelock>=3.16.0",
   "jsonschema>=4.23.0",
   "attrs>=24.2.0",
@@ -58,10 +57,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+legacy-git = [
+  "GitPython>=3.1.43",
+]
 postgres = [
   "asyncpg>=0.30.0",
 ]
 dev = [
+  "GitPython>=3.1.43",
   "ruff>=0.5.7",
   "mypy>=1.11.1",
   "pytest>=8.3.3",

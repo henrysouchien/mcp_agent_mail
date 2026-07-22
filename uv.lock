@@ -1618,7 +1618,6 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "filelock" },
-    { name = "gitpython" },
     { name = "httpx", extra = ["http2"] },
     { name = "jinja2" },
     { name = "jsonschema" },
@@ -1646,12 +1645,16 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "gitpython" },
     { name = "ipython" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+]
+legacy-git = [
+    { name = "gitpython" },
 ]
 postgres = [
     { name = "asyncpg" },
@@ -1675,7 +1678,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110.0" },
     { name = "fastmcp", specifier = ">=2.10.5" },
     { name = "filelock", specifier = ">=3.16.0" },
-    { name = "gitpython", specifier = ">=3.1.43" },
+    { name = "gitpython", marker = "extra == 'dev'", specifier = ">=3.1.43" },
+    { name = "gitpython", marker = "extra == 'legacy-git'", specifier = ">=3.1.43" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27.2" },
     { name = "ipython", marker = "extra == 'dev'", specifier = ">=8.27.0" },
     { name = "jinja2", specifier = ">=3.1.4" },
@@ -1706,7 +1710,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.15.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
 ]
-provides-extras = ["postgres", "dev"]
+provides-extras = ["legacy-git", "postgres", "dev"]
 
 [package.metadata.requires-dev]
 dev = [

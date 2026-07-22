@@ -33,12 +33,37 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
-from git import Actor, Repo
-from git.objects.tree import Tree
 from PIL import Image
+
+if TYPE_CHECKING:
+    from git import Actor, Repo
+    from git.objects.tree import Tree
+else:
+    class _LazyGitType:
+        """Resolve a GitPython type only when a legacy/export path uses it."""
+
+        def __init__(self, module: str, name: str) -> None:
+            self._module = module
+            self._name = name
+
+        def _resolve(self) -> Any:
+            import importlib
+
+            module = importlib.import_module(self._module)
+            return getattr(module, self._name)
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return self._resolve()(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._resolve(), name)
+
+    Actor = _LazyGitType("git", "Actor")
+    Repo = _LazyGitType("git", "Repo")
+    Tree = _LazyGitType("git.objects.tree", "Tree")
 
 from .config import Settings
 from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths

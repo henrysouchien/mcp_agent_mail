@@ -34,8 +34,6 @@ from urllib.parse import parse_qsl
 import uuid
 
 from fastmcp import Context, FastMCP
-from git import Repo
-from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import aliased
@@ -195,6 +193,8 @@ def _git_repo(path: str | Path, search_parent_directories: bool = True) -> Any:
     """
     repo = None
     try:
+        from git import Repo
+
         repo = Repo(path, search_parent_directories=search_parent_directories)
         yield repo
     finally:
@@ -1416,7 +1416,7 @@ def _latest_filesystem_activity(
 
 
 def _reservation_repo_pathspec(
-    repo: Repo, workspace: Path, pattern: str
+    repo: Any, workspace: Path, pattern: str
 ) -> Optional[str]:
     """Build a single repo-root-relative git pathspec for a reservation pattern.
 
@@ -1444,7 +1444,7 @@ def _reservation_repo_pathspec(
     return f":(glob){rel}" if _contains_glob(normalized) else rel
 
 
-def _latest_git_activity(repo: Optional[Repo], pathspec: Optional[str]) -> Optional[datetime]:
+def _latest_git_activity(repo: Any | None, pathspec: Optional[str]) -> Optional[datetime]:
     """Latest commit time touching the reservation tree, via a SINGLE rev walk.
 
     ``git rev-list --max-count=1 -- <pathspec>`` returns the most recent commit
@@ -1482,7 +1482,7 @@ def _latest_git_activity(repo: Optional[Repo], pathspec: Optional[str]) -> Optio
 
 def _compute_reservation_activity(
     workspace: Optional[Path],
-    repo: Optional[Repo],
+    repo: Any | None,
     pattern: str,
     *,
     recent_after: Optional[datetime],
@@ -1507,7 +1507,7 @@ def _compute_reservation_activity(
 
 async def _compute_reservation_activity_async(
     workspace: Optional[Path],
-    repo: Optional[Repo],
+    repo: Any | None,
     pattern: str,
     *,
     recent_after: Optional[datetime],
@@ -1533,13 +1533,13 @@ def _project_workspace_path(project: Project) -> Optional[Path]:
     return None
 
 
-def _open_repo_if_available(workspace: Optional[Path]) -> Optional[Repo]:
+def _open_repo_if_available(workspace: Optional[Path]) -> Any | None:
     if workspace is None:
         return None
     try:
+        from git import Repo
+
         repo = Repo(workspace, search_parent_directories=True)
-    except (InvalidGitRepositoryError, NoSuchPathError):
-        return None
     except Exception:
         return None
     try:
@@ -2173,7 +2173,7 @@ def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -
                     base = normalized.rsplit("/", 1)[-1] or "repo"
                     canonical = normalized  # privacy-safe canonical string
                     return f"{base}-{_short_sha1(canonical)}"
-        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+        except Exception:
             # Non-git directory or error; fall through to fallback
             pass
         # Fallback to dir behavior if we cannot resolve a normalized remote
@@ -2190,7 +2190,7 @@ def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -
                     top_real = str(_P(top).resolve())
                     base = _P(top_real).name or "repo"
                     return f"{base}-{_short_sha1(top_real)}"
-        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+        except Exception:
             return slugify(human_key)
         return slugify(human_key)
 
@@ -2216,7 +2216,7 @@ def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -
                     gdir_real = str(gdir_path.resolve())
                     base = "repo"
                     return f"{base}-{_short_sha1(gdir_real)}"
-        except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+        except Exception:
             return slugify(human_key)
         return slugify(human_key)
 
@@ -2417,7 +2417,7 @@ def _resolve_project_identity(
                     default_branch = sym.rsplit("/", 1)[-1]
             except Exception:
                 default_branch = "main"
-    except (InvalidGitRepositoryError, NoSuchPathError, Exception):
+    except Exception:
         pass  # Non-git directory; continue with fallback values
 
     # Resolve git_common_dir to an absolute path. `git rev-parse --git-common-dir`
@@ -7055,7 +7055,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         recent: list[dict[str, Any]] = []
         if include_recent_commits:
             archive = await ensure_archive(settings, project.slug)
-            repo: Repo = archive.repo
+            repo: Any = archive.repo
             try:
                 # Limit to archive path; extract last commits
                 count = max(1, min(50, commit_limit))
