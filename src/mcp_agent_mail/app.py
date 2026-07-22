@@ -75,6 +75,7 @@ from .models import (
     MessageSummary,
     PaneCredential,
     Project,
+    ProjectStorageCutover,
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
@@ -2707,6 +2708,59 @@ async def _ensure_project(human_key: str) -> Project:
             await asyncio.sleep(min(0.05 * (2**attempt), 0.5))
 
     raise RuntimeError("ensure_project retry loop exited unexpectedly")
+
+
+async def _ensure_git_independent_project(human_key: str) -> Project:
+    """Create a core project with its baseline and route in one transaction."""
+    await ensure_schema()
+    normalized_key = _normalize_project_human_key(human_key)
+    slug = _compute_project_slug(normalized_key)
+    async with get_immediate_session() as session:
+        result = await session.execute(select(Project).where(Project.slug == slug))
+        project = result.scalars().first()
+        if project is not None:
+            if project.id is None:
+                raise RuntimeError("Existing project has no durable identity")
+            await resolve_storage_route(
+                session,
+                project_id=project.id,
+                runtime_profile="core",
+                for_mutation=False,
+            )
+            return project
+
+        project = Project(slug=slug, human_key=normalized_key)
+        session.add(project)
+        await session.flush()
+        if project.id is None:
+            raise RuntimeError("Project id was not allocated")
+        baseline = await append_audit_event(
+            session,
+            project_id=project.id,
+            actor_kind="system",
+            actor_scope_id="system/core-project-bootstrap",
+            actor_agent_id=None,
+            operation_kind="project_created_v1",
+            entity_type="project",
+            entity_id=str(project.id),
+            payload_version="project-created-v1",
+            payload={"human_key": normalized_key, "slug": slug},
+        )
+        await session.flush()
+        if baseline.id is None:
+            raise RuntimeError("Project baseline audit id was not allocated")
+        session.add(
+            ProjectStorageCutover(
+                project_id=project.id,
+                state=GIT_INDEPENDENT,
+                generation=1,
+                baseline_event_id=baseline.id,
+                completed_ts=_naive_utc(),
+            )
+        )
+        await session.commit()
+        await session.refresh(project)
+        return project
 
     # -- Identity inspection resource is registered inside build_mcp_server below
 
@@ -6427,8 +6481,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
 
         await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
-        project = await _ensure_project(human_key)
-        await ensure_archive(settings, project.slug)
+        if settings.runtime_profile == "core":
+            project = await _ensure_git_independent_project(human_key)
+        else:
+            project = await _ensure_project(human_key)
+            await ensure_archive(settings, project.slug)
         payload = _project_to_dict(project)
         # Worktree identity metadata is opt-in to keep default calls lightweight and stable.
         if settings.worktrees_enabled:

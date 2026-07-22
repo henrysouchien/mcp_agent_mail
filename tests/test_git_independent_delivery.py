@@ -56,6 +56,38 @@ async def _create_git_independent_project(human_key: str, slug: str) -> int:
 
 
 @pytest.mark.asyncio
+async def test_core_ensure_project_bootstraps_baseline_without_archive(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    clear_settings_cache()
+
+    async def archive_must_not_open(*args, **kwargs):
+        raise AssertionError("Core project bootstrap attempted to open the legacy archive")
+
+    monkeypatch.setattr("mcp_agent_mail.app.ensure_archive", archive_must_not_open)
+    async with Client(build_mcp_server()) as client:
+        first = await client.call_tool(
+            "ensure_project",
+            {"human_key": "/new-core-project"},
+        )
+        second = await client.call_tool(
+            "ensure_project",
+            {"human_key": "/new-core-project"},
+        )
+
+    assert second.data["id"] == first.data["id"]
+    async with get_session() as session:
+        cutover = await session.get(ProjectStorageCutover, first.data["id"])
+        assert cutover is not None
+        assert cutover.state == "git_independent"
+        assert cutover.baseline_event_id is not None
+        assert await session.scalar(select(func.count()).select_from(Project)) == 1
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 1
+
+
+@pytest.mark.asyncio
 async def test_live_registration_never_opens_archive_for_git_independent_project(
     isolated_env: object,
     monkeypatch,
