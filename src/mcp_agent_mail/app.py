@@ -4600,6 +4600,77 @@ async def _expire_stale_file_reservations(
     if project is None:
         return []
 
+    async with get_immediate_session() as core_session:
+        route = await resolve_storage_route(
+            core_session,
+            project_id=project_id,
+            runtime_profile=get_settings().runtime_profile,
+            for_mutation=True,
+        )
+        if route.state == GIT_INDEPENDENT:
+            expired_rows = await core_session.execute(
+                select(FileReservation, Agent)
+                .outerjoin(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+                .where(
+                    cast(Any, FileReservation.project_id) == project_id,
+                    cast(Any, FileReservation.released_ts).is_(None),
+                    cast(Any, FileReservation.expires_ts) < naive_now,
+                )
+            )
+            expired_pairs = [
+                cast(tuple[FileReservation, Optional[Agent]], row)
+                for row in expired_rows.all()
+            ]
+            expired_ids = [
+                reservation.id
+                for reservation, _agent in expired_pairs
+                if reservation.id is not None
+            ]
+            if expired_ids:
+                await core_session.execute(
+                    update(FileReservation)
+                    .where(
+                        cast(Any, FileReservation.project_id) == project_id,
+                        cast(Any, FileReservation.id).in_(expired_ids),
+                        cast(Any, FileReservation.released_ts).is_(None),
+                    )
+                    .values(released_ts=naive_now)
+                )
+                await append_audit_event(
+                    core_session,
+                    project_id=project_id,
+                    actor_kind="system",
+                    actor_scope_id="system/reservation-expiry",
+                    actor_agent_id=None,
+                    operation_kind="file_reservations_expired_v1",
+                    entity_type="file_reservation_batch",
+                    entity_id=f"expiry:{int(now.timestamp())}",
+                    payload_version="file-reservation-expiry-v1",
+                    payload={"reservation_ids": expired_ids},
+                )
+                await assert_route_generation(
+                    core_session,
+                    project_id=project_id,
+                    expected_state=route.state,
+                    expected_generation=route.generation,
+                )
+                await core_session.commit()
+            for reservation, _agent in expired_pairs:
+                reservation.released_ts = naive_now
+            return [
+                FileReservationStatus(
+                    reservation=reservation,
+                    agent=agent,
+                    stale=True,
+                    stale_reasons=["reservation TTL expired"],
+                    last_agent_activity=agent.last_active_ts if agent is not None else None,
+                    last_mail_activity=None,
+                    last_fs_activity=None,
+                    last_git_activity=None,
+                )
+                for reservation, agent in expired_pairs
+            ]
+
     expired_pairs: list[tuple[FileReservation, Optional[Agent]]] = []
     # Release any entries whose TTL has already elapsed.
     # Use BEGIN IMMEDIATE so the release is immediately visible to

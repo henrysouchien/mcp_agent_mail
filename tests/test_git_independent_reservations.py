@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from typing import Any, cast
+
 import pytest
 from fastmcp import Client
 from sqlalchemy import func, select
@@ -185,5 +188,53 @@ async def test_core_reservation_conflict_is_audited_without_git(
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(FileReservation)) == 2
         assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 2
+        chain = await verify_audit_chain(session, project_id)
+    assert chain.valid is True
+
+
+@pytest.mark.asyncio
+async def test_core_reservation_resource_expires_with_atomic_audit_and_no_archive(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "migration")
+    clear_settings_cache()
+    await ensure_schema()
+    project_id = await _create_project_and_agents()
+    async with get_immediate_session() as session:
+        agent = (
+            await session.execute(
+                select(Agent).where(cast(Any, Agent.name) == "FirstAgent")
+            )
+        ).scalar_one()
+        session.add(
+            FileReservation(
+                project_id=project_id,
+                agent_id=agent.id,
+                path_pattern="expired.txt",
+                exclusive=True,
+                expires_ts=(datetime.now(timezone.utc) - timedelta(minutes=1)).replace(
+                    tzinfo=None
+                ),
+            )
+        )
+        await session.commit()
+
+    async def legacy_path_must_not_run(*args, **kwargs):
+        raise AssertionError("Core expiry attempted to write a legacy archive")
+
+    monkeypatch.setattr(
+        "mcp_agent_mail.app._write_file_reservation_records",
+        legacy_path_must_not_run,
+    )
+    async with Client(build_mcp_server()) as client:
+        await client.read_resource(
+            "resource://file_reservations/reservation-core?active_only=false"
+        )
+
+    async with get_session() as session:
+        reservation = (await session.execute(select(FileReservation))).scalar_one()
+        assert reservation.released_ts is not None
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True
