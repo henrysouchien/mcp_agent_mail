@@ -119,6 +119,10 @@ _request_window_identity_uuid: ContextVar[str] = ContextVar(
     "mcp_agent_mail_request_window_identity_uuid",
     default="",
 )
+_request_pane_credential: ContextVar[str] = ContextVar(
+    "mcp_agent_mail_request_pane_credential",
+    default="",
+)
 
 
 def set_request_window_identity_uuid(window_uuid: str) -> Token[str]:
@@ -138,6 +142,19 @@ def effective_window_identity_uuid(settings: Settings | None = None) -> str:
         return request_uuid
     resolved_settings = settings or get_settings()
     return (getattr(resolved_settings, "window_identity_uuid", "") or "").strip()
+
+
+def set_request_pane_credential(bearer: str) -> Token[str]:
+    """Attach an opaque pane bearer to the current HTTP request."""
+    return _request_pane_credential.set((bearer or "").strip())
+
+
+def reset_request_pane_credential(token: Token[str]) -> None:
+    _request_pane_credential.reset(token)
+
+
+def effective_request_pane_credential() -> str:
+    return (_request_pane_credential.get("") or "").strip()
 
 
 class _FastMCPToolGetter(Protocol):
@@ -5671,6 +5688,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         action: str,
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
+        provided_token = provided_token or effective_request_pane_credential() or None
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
             await _bind_current_window_identity_to_agent(ctx, project, agent)
@@ -5795,6 +5813,24 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 token_param=token_param,
                 action=action,
             )
+
+        pane_bearer = provided_token or effective_request_pane_credential()
+        if pane_bearer and settings.credentials.peppers and project.id is not None:
+            try:
+                async with get_immediate_session() as credential_session:
+                    pane = await verify_pane_credential(
+                        credential_session,
+                        pane_bearer,
+                        peppers=settings.credentials.peppers,
+                    )
+                    if pane.project_id != project.id:
+                        raise CredentialError("pane credential belongs to another project")
+                    await credential_session.commit()
+                agent = await _get_agent_by_id(project, pane.agent_id)
+                _bind_session_agent(ctx, project, agent)
+                return agent
+            except CredentialError:
+                pass
 
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
@@ -7675,10 +7711,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
     async def send_message(
         ctx: Context,
         project_key: str,
-        sender_name: str,
         to: list[str],
         subject: str,
         body_md: str,
+        sender_name: Optional[str] = None,
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
         attachment_paths: Optional[list[str]] = None,
@@ -7690,6 +7726,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         topic: Optional[str] = None,
         auto_contact_if_blocked: Optional[bool] = None,
         sender_token: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        registration_token: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -7816,6 +7854,30 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         ```
         """
         project = await _get_project_by_identifier(project_key)
+        if sender_name and agent_name and sender_name.casefold() != agent_name.casefold():
+            raise ToolExecutionError(
+                "IDENTITY_ALIAS_CONFLICT",
+                "sender_name and agent_name identify different agents.",
+                recoverable=True,
+            )
+        if sender_token and registration_token and not hmac.compare_digest(
+            sender_token,
+            registration_token,
+        ):
+            raise ToolExecutionError(
+                "TOKEN_ALIAS_CONFLICT",
+                "sender_token and registration_token contain different credentials.",
+                recoverable=True,
+            )
+        sender = await _resolve_authenticated_agent(
+            ctx,
+            project,
+            agent_name=sender_name or agent_name,
+            provided_token=sender_token or registration_token,
+            token_param="sender_token",
+            action="send_message",
+        )
+        sender_name = sender.name
 
         # Validate topic format if provided.
         #
@@ -7999,14 +8061,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 c.print(Panel(body, title=title, border_style="green"))
             except Exception:
                 logger.debug("Failed to log send_message call with rich console", exc_info=True)
-        sender = await _authenticate_agent(
-            ctx,
-            project,
-            sender_name,
-            sender_token,
-            token_param="sender_token",
-            action="send_message",
-        )
         verified_sender = True
         # Enforce contact policies (per-recipient) with auto-allow heuristics
         settings_local = get_settings()

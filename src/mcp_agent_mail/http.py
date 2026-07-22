@@ -37,7 +37,9 @@ from .app import (
     build_mcp_server,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
+    reset_request_pane_credential,
     reset_request_window_identity_uuid,
+    set_request_pane_credential,
     set_request_window_identity_uuid,
     sweep_stale_agents,
     update_project_sibling_status,
@@ -740,6 +742,10 @@ _WINDOW_IDENTITY_HEADER_NAMES = (
     b"x-mcp-agent-mail-window-id",
     b"x-agent-mail-window-id",
 )
+_PANE_CREDENTIAL_HEADER_NAMES = (
+    b"x-mcp-agent-mail-pane-credential",
+    b"x-agent-mail-pane-credential",
+)
 _WINDOW_IDENTITY_BEARER_PREFIXES = (
     "mcp-window:",
     "agent-mail-window:",
@@ -773,6 +779,13 @@ def _extract_window_identity_from_headers(headers: list[tuple[bytes, bytes]]) ->
         for prefix in _WINDOW_IDENTITY_BEARER_PREFIXES:
             if bearer.startswith(prefix):
                 return _normalize_window_identity_candidate(bearer[len(prefix):])
+    return ""
+
+
+def _extract_pane_credential_from_headers(headers: list[tuple[bytes, bytes]]) -> str:
+    for raw_name, raw_value in headers:
+        if raw_name.lower() in _PANE_CREDENTIAL_HEADER_NAMES:
+            return raw_value.decode("latin1").strip()
     return ""
 
 
@@ -1740,12 +1753,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             new_scope["headers"] = headers
 
             window_uuid = _extract_window_identity_from_headers(headers)
-            token = set_request_window_identity_uuid(window_uuid) if window_uuid else None
+            pane_credential = _extract_pane_credential_from_headers(headers)
+            window_token = set_request_window_identity_uuid(window_uuid) if window_uuid else None
+            pane_token = (
+                set_request_pane_credential(pane_credential)
+                if pane_credential
+                else None
+            )
             try:
                 await self._app(new_scope, receive, send)
             finally:
-                if token is not None:
-                    reset_request_window_identity_uuid(token)
+                if pane_token is not None:
+                    reset_request_pane_credential(pane_token)
+                if window_token is not None:
+                    reset_request_window_identity_uuid(window_token)
 
     # Mount at both '/base' and '/base/' to tolerate either form from clients/tests.
     # Also mount compatibility aliases for both '/api' and '/mcp' regardless of configured base.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import time
@@ -146,6 +147,73 @@ async def test_http_window_identity_header_routes_but_does_not_authenticate(isol
         )
         assert with_header.status_code == 200
         assert _jsonrpc_failed(with_header.json())
+
+
+@pytest.mark.asyncio
+async def test_http_pane_credential_header_authenticates_without_tool_secret(
+    isolated_env,
+    monkeypatch,
+) -> None:
+    project_key = "/test/http-pane-carrier"
+    window_uuid = str(uuid.uuid4())
+    encoded_pepper = base64.urlsafe_b64encode(b"h" * 32).rstrip(b"=").decode("ascii")
+    monkeypatch.setenv("CREDENTIAL_PEPPERS_JSON", json.dumps({"http-test": encoded_pepper}))
+    monkeypatch.setenv("CREDENTIAL_CURRENT_PEPPER_KEY_ID", "http-test")
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
+    _config.clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        sender = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "codex",
+                "model": "test-model",
+                "name": "BlueLake",
+            },
+        )
+        recipient = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "codex",
+                "model": "test-model",
+                "name": "RedStone",
+            },
+        )
+        await client.call_tool(
+            "set_contact_policy",
+            {
+                "project_key": project_key,
+                "agent_name": recipient.data["name"],
+                "policy": "open",
+            },
+        )
+    pane_credential = str(sender.data["pane_credential"])
+
+    settings = _config.get_settings()
+    app = build_http_app(settings, server)
+    transport = ASGITransport(app=app)
+    arguments = {
+        "project_key": project_key,
+        "to": [recipient.data["name"]],
+        "subject": "Persistent HTTP pane",
+        "body_md": "Authenticated by a secret-bearing request carrier.",
+    }
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthenticated = await client.post(
+            settings.http.path,
+            json=_tool("send_message", arguments),
+        )
+        authenticated = await client.post(
+            settings.http.path,
+            headers={"X-MCP-Agent-Mail-Pane-Credential": pane_credential},
+            json=_tool("send_message", arguments),
+        )
+
+    assert _jsonrpc_failed(unauthenticated.json())
+    assert not _jsonrpc_failed(authenticated.json())
 
 
 @pytest.mark.asyncio
