@@ -241,6 +241,40 @@ class TestNotifications:
         assert data["message"]["importance"] == "high"
 
     @pytest.mark.asyncio
+    async def test_v2_signal_generation_never_moves_backward(
+        self, isolated_env, monkeypatch, tmp_path
+    ):
+        """A late older writer cannot replace a newer advisory generation."""
+        from mcp_agent_mail.config import clear_settings_cache, get_settings
+        from mcp_agent_mail.notification_signals import emit_notification_signal_v2
+
+        signals_dir = tmp_path / "signals"
+        monkeypatch.setenv("NOTIFICATIONS_ENABLED", "true")
+        monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", str(signals_dir))
+        clear_settings_cache()
+        settings = get_settings()
+
+        common = {
+            "settings": settings,
+            "project_id": 7,
+            "recipient_agent_id": 11,
+            "runtime_generation": 3,
+            "route_generation": 3,
+            "obligations": [],
+        }
+        assert await emit_notification_signal_v2(
+            **common, generation=9, max_message_id=90
+        )
+        assert await emit_notification_signal_v2(
+            **common, generation=8, max_message_id=80
+        )
+
+        signal_path = signals_dir / "v2" / "projects" / "7" / "agents" / "11.signal"
+        data = json.loads(signal_path.read_text())
+        assert data["generation"] == 9
+        assert data["max_message_id"] == 90
+
+    @pytest.mark.asyncio
     async def test_clear_notification_signal(self, isolated_env, monkeypatch, tmp_path):
         """Clear signal removes the signal file."""
         from mcp_agent_mail.config import clear_settings_cache, get_settings

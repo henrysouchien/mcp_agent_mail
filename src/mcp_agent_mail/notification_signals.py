@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from typing import Any
 from .config import Settings
 
 _SIGNAL_DEBOUNCE: dict[tuple[str, str], float] = {}
+_V2_SIGNAL_WRITE_LOCK = threading.Lock()
 
 
 def _signal_path(settings: Settings, project_slug: str, agent_name: str) -> Path:
@@ -102,15 +104,23 @@ async def emit_notification_signal_v2(
     }
 
     def write_signal() -> None:
-        signal_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = signal_path.with_suffix(
-            f"{signal_path.suffix}.tmp-{uuid.uuid4().hex}"
-        )
-        temporary_path.write_text(
-            json.dumps(signal_data, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        temporary_path.replace(signal_path)
+        with _V2_SIGNAL_WRITE_LOCK:
+            signal_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                current = json.loads(signal_path.read_text(encoding="utf-8"))
+                current_generation = int(current.get("generation", -1))
+            except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                current_generation = -1
+            if current_generation >= generation:
+                return
+            temporary_path = signal_path.with_suffix(
+                f"{signal_path.suffix}.tmp-{uuid.uuid4().hex}"
+            )
+            temporary_path.write_text(
+                json.dumps(signal_data, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            temporary_path.replace(signal_path)
 
     try:
         await asyncio.to_thread(write_signal)
