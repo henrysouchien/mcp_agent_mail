@@ -145,6 +145,7 @@ class TestToolFilter:
         names = {tool.name for tool in agent_tools}
         assert names == {
             "identity_status",
+            "reconcile_runtime_binding",
             "heartbeat_runtime_binding",
             "macro_start_session",
             "sync_inbox",

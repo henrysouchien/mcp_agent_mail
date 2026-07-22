@@ -416,6 +416,7 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
         "tools": [
             "macro_start_session",
             "identity_status",
+            "reconcile_runtime_binding",
             "heartbeat_runtime_binding",
             "sync_inbox",
             "watch_inbox",
