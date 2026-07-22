@@ -11419,6 +11419,74 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         )
         return messages
 
+    async def _uses_git_independent_storage(project: Project) -> bool:
+        if project.id is None:
+            return False
+        async with get_session() as session:
+            route = await resolve_storage_route(
+                session,
+                project_id=project.id,
+                runtime_profile=get_settings().runtime_profile,
+                for_mutation=True,
+            )
+        return route.state == GIT_INDEPENDENT
+
+    async def _update_core_message_receipt(
+        project: Project,
+        agent: Agent,
+        message_id: int,
+        *,
+        acknowledge: bool,
+    ) -> tuple[datetime | None, datetime | None, int | None]:
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must be persisted before receipt update.")
+        async with get_immediate_session() as session:
+            route = await resolve_storage_route(
+                session,
+                project_id=project.id,
+                runtime_profile=get_settings().runtime_profile,
+                for_mutation=True,
+            )
+            recipient = await session.get(MessageRecipient, (message_id, agent.id))
+            if recipient is None:
+                raise ToolExecutionError(
+                    "NOT_FOUND",
+                    f"Message {message_id} is not addressed to agent '{agent.name}'.",
+                )
+            now = _naive_utc()
+            changed: list[str] = []
+            if recipient.read_ts is None:
+                recipient.read_ts = now
+                changed.append("read_ts")
+            if acknowledge and recipient.ack_ts is None:
+                recipient.ack_ts = now
+                changed.append("ack_ts")
+            event_id: int | None = None
+            if changed:
+                event = await append_audit_event(
+                    session,
+                    project_id=project.id,
+                    actor_kind="agent",
+                    actor_scope_id=f"agent/{project.id}:{agent.id}",
+                    actor_agent_id=agent.id,
+                    operation_kind=(
+                        "message_acknowledged_v1" if acknowledge else "message_marked_read_v1"
+                    ),
+                    entity_type="message_recipient",
+                    entity_id=f"{message_id}:{agent.id}",
+                    payload_version="message-receipt-v1",
+                    payload={"changed": changed, "message_id": message_id},
+                )
+                event_id = event.id
+            await assert_route_generation(
+                session,
+                project_id=project.id,
+                expected_state=route.state,
+                expected_generation=route.generation,
+            )
+            await session.commit()
+            return recipient.read_ts, recipient.ack_ts, event_id
+
     @mcp.tool(name="mark_message_read")
     @_instrument_tool(
         "mark_message_read",
@@ -11483,9 +11551,23 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 action="mark_message_read",
             )
             await _get_visible_message(project, agent, message_id)
-            read_ts = await _update_recipient_timestamp(agent, message_id, "read_ts")
+            if await _uses_git_independent_storage(project):
+                read_ts, _, audit_event_id = await _update_core_message_receipt(
+                    project,
+                    agent,
+                    message_id,
+                    acknowledge=False,
+                )
+            else:
+                read_ts = await _update_recipient_timestamp(agent, message_id, "read_ts")
+                audit_event_id = None
             await ctx.info(f"Marked message {message_id} read for '{agent.name}'.")
-            return {"message_id": message_id, "read": bool(read_ts), "read_at": _iso(read_ts) if read_ts else None}
+            return {
+                "message_id": message_id,
+                "read": bool(read_ts),
+                "read_at": _iso(read_ts) if read_ts else None,
+                "audit_event_id": audit_event_id,
+            }
         except Exception as exc:
             if get_settings().tools_log_enabled:
                 try:
@@ -11567,14 +11649,24 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 action="acknowledge_message",
             )
             await _get_visible_message(project, agent, message_id)
-            read_ts = await _update_recipient_timestamp(agent, message_id, "read_ts")
-            ack_ts = await _update_recipient_timestamp(agent, message_id, "ack_ts")
+            if await _uses_git_independent_storage(project):
+                read_ts, ack_ts, audit_event_id = await _update_core_message_receipt(
+                    project,
+                    agent,
+                    message_id,
+                    acknowledge=True,
+                )
+            else:
+                read_ts = await _update_recipient_timestamp(agent, message_id, "read_ts")
+                ack_ts = await _update_recipient_timestamp(agent, message_id, "ack_ts")
+                audit_event_id = None
             await ctx.info(f"Acknowledged message {message_id} for '{agent.name}'.")
             return {
                 "message_id": message_id,
                 "acknowledged": bool(ack_ts),
                 "acknowledged_at": _iso(ack_ts) if ack_ts else None,
                 "read_at": _iso(read_ts) if read_ts else None,
+                "audit_event_id": audit_event_id,
             }
         except Exception as exc:
             if get_settings().tools_log_enabled:

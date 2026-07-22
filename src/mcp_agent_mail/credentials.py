@@ -326,7 +326,7 @@ async def verify_bootstrap_credential(
             record.consumed_ts is not None
             and record.consumed_idempotency_key != allow_consumed_idempotency_key
         )
-        or record.expires_ts < timestamp
+        or (record.consumed_ts is None and record.expires_ts < timestamp)
         or record.window_uuid != window_uuid
     ):
         raise InvalidCredentialError("bootstrap credential is invalid")

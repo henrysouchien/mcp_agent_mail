@@ -183,6 +183,7 @@ async def test_bootstrap_is_window_bound_and_single_use(isolated_env: object) ->
             agent_id=agent_id,
             idempotency_key="registration-key",
         )
+        record.expires_ts = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
         await session.commit()
 
     async with get_immediate_session() as session:
@@ -193,6 +194,14 @@ async def test_bootstrap_is_window_bound_and_single_use(isolated_env: object) ->
                 peppers=PEPPERS,
                 window_uuid="window-bootstrap",
             )
+        replay_record = await verify_bootstrap_credential(
+            session,
+            issued.bearer,
+            peppers=PEPPERS,
+            window_uuid="window-bootstrap",
+            allow_consumed_idempotency_key="registration-key",
+        )
+        assert replay_record.consumed_idempotency_key == "registration-key"
 
 
 @pytest.mark.asyncio

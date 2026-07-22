@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -115,6 +115,14 @@ async def test_core_ensure_project_bootstraps_baseline_without_archive(
             "register_agent",
             registration_arguments,
         )
+        async with get_immediate_session() as session:
+            consumed_bootstrap = (
+                await session.execute(select(BootstrapCredential))
+            ).scalar_one()
+            consumed_bootstrap.expires_ts = (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
+            )
+            await session.commit()
         replay = await client.call_tool(
             "register_agent",
             registration_arguments,
@@ -564,6 +572,26 @@ async def test_live_send_uses_atomic_path_and_never_opens_archive(
             "idempotency_key": "reply-live-route-key",
         }
         first_reply = await client.call_tool("reply_message", reply_arguments)
+        marked = await client.call_tool(
+            "mark_message_read",
+            {
+                "project_key": "/git-independent-live",
+                "agent_name": "AtomicRecipient",
+                "registration_token": "recipient-secret",
+                "message_id": first_message_id,
+            },
+        )
+        acknowledged = await client.call_tool(
+            "acknowledge_message",
+            {
+                "project_key": "/git-independent-live",
+                "agent_name": "AtomicRecipient",
+                "registration_token": "recipient-secret",
+                "message_id": first_message_id,
+            },
+        )
+        assert marked.data["audit_event_id"] is not None
+        assert acknowledged.data["audit_event_id"] is not None
         async with get_immediate_session() as session:
             recipient = (
                 await session.execute(
@@ -599,6 +627,6 @@ async def test_live_send_uses_atomic_path_and_never_opens_archive(
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Message)) == 2
         assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 2
-        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 3
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 5
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True
