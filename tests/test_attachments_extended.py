@@ -15,6 +15,7 @@ from mcp_agent_mail.config import get_settings
 @pytest.mark.asyncio
 async def test_attachments_keep_originals_and_manifest(isolated_env, monkeypatch):
     monkeypatch.setenv("KEEP_ORIGINAL_IMAGES", "true")
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
     storage_root = Path(get_settings().storage.root).expanduser().resolve()
@@ -54,6 +55,7 @@ async def test_attachments_keep_originals_and_manifest(isolated_env, monkeypatch
 async def test_attachment_inline_vs_file_threshold(isolated_env, monkeypatch):
     # Large threshold -> inline
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "1048576")
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
     storage_root = Path(get_settings().storage.root).expanduser().resolve()
@@ -101,4 +103,3 @@ async def test_attachment_inline_vs_file_threshold(isolated_env, monkeypatch):
         atts2 = (r_file.data.get("deliveries") or [{}])[0].get("payload", {}).get("attachments", [])
         assert any(a.get("type") == "file" for a in atts2)
     img_path.unlink(missing_ok=True)
-
