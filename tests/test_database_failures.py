@@ -75,6 +75,10 @@ class TestDatabaseAutoCreation:
         assert "message_recipients" in table_names
         assert "file_reservations" in table_names
         assert "agent_links" in table_names
+        assert "audit_heads" in table_names
+        assert "audit_events" in table_names
+        assert "blobs" in table_names
+        assert "blob_references" in table_names
 
     @pytest.mark.asyncio
     async def test_ensure_schema_creates_fts_table(self, isolated_env):
@@ -115,6 +119,12 @@ class TestDatabaseAutoCreation:
         assert "idx_file_reservations_project_released_expires" in index_names
         assert "idx_file_reservations_project_agent_released" in index_names
         assert "idx_product_project" in index_names
+        assert "idx_audit_events_project_created" in index_names
+        assert "idx_audit_events_actor" in index_names
+        assert "idx_audit_events_entity" in index_names
+        assert "idx_audit_events_operation" in index_names
+        assert "idx_blobs_verification_created" in index_names
+        assert "idx_blob_references_entity" in index_names
 
     @pytest.mark.asyncio
     async def test_ensure_schema_is_idempotent(self, isolated_env):

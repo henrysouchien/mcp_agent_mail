@@ -201,6 +201,86 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class AuditHead(SQLModel, table=True):
+    """Latest verified audit-chain position for one project."""
+
+    __tablename__ = "audit_heads"
+
+    project_id: int = Field(foreign_key="projects.id", primary_key=True)
+    last_sequence: int = Field(default=0, ge=0)
+    last_event_hash: str = Field(default="0" * 64, min_length=64, max_length=64)
+
+
+class AuditEvent(SQLModel, table=True):
+    """Immutable, per-project ordered mutation event."""
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        UniqueConstraint("project_id", "project_sequence", name="uq_audit_event_project_sequence"),
+        UniqueConstraint("event_hash", name="uq_audit_event_hash"),
+        Index("idx_audit_events_project_created", "project_id", "created_ts"),
+        Index("idx_audit_events_actor", "actor_kind", "actor_scope_id"),
+        Index("idx_audit_events_entity", "entity_type", "entity_id"),
+        Index("idx_audit_events_operation", "operation_kind"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    project_sequence: int = Field(ge=1)
+    actor_kind: str = Field(max_length=32)
+    actor_scope_id: str = Field(max_length=255)
+    actor_agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
+    operation_kind: str = Field(max_length=128)
+    entity_type: str = Field(max_length=64)
+    entity_id: str = Field(max_length=255)
+    payload_version: str = Field(max_length=64)
+    payload_json: str
+    previous_event_hash: str = Field(min_length=64, max_length=64)
+    event_hash: str = Field(min_length=64, max_length=64)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class Blob(SQLModel, table=True):
+    """Durable content-addressed object metadata."""
+
+    __tablename__ = "blobs"
+    __table_args__ = (
+        UniqueConstraint("storage_key", name="uq_blob_storage_key"),
+        Index("idx_blobs_verification_created", "verification_state", "created_ts"),
+    )
+
+    digest: str = Field(primary_key=True, min_length=64, max_length=64)
+    byte_length: int = Field(ge=0)
+    media_type: str = Field(default="application/octet-stream", max_length=255)
+    storage_key: str = Field(max_length=512)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    verification_state: str = Field(default="verified", max_length=32)
+
+
+class BlobReference(SQLModel, table=True):
+    """Links a content-addressed object to a domain entity."""
+
+    __tablename__ = "blob_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "blob_digest",
+            "entity_type",
+            "entity_id",
+            "role",
+            name="uq_blob_reference_entity_role",
+        ),
+        Index("idx_blob_references_entity", "entity_type", "entity_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    blob_digest: str = Field(foreign_key="blobs.digest", index=True, max_length=64)
+    entity_type: str = Field(max_length=64)
+    entity_id: str = Field(max_length=255)
+    role: str = Field(max_length=64)
+    display_name: str = Field(default="", max_length=512)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
