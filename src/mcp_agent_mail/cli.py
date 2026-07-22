@@ -63,6 +63,7 @@ from .db import (
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
+from .legacy_adapter import archive_write_lock, ensure_archive
 from .models import (
     Agent,
     AgentLink,
@@ -94,7 +95,6 @@ from .share import (
     sign_manifest,
     summarize_snapshot,
 )
-from .storage import archive_write_lock, ensure_archive
 from .utils import slugify
 
 # Suppress annoying bleach CSS sanitizer warning from dependencies

@@ -46,10 +46,11 @@ from .app import (
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
-from .storage import (
+from .legacy_adapter import (
     ProjectArchive,
     archive_write_lock,
     collect_lock_status,
+    create_project_archive,
     ensure_archive,
     get_agent_communication_graph,
     get_archive_tree,
@@ -66,7 +67,20 @@ from .storage import (
     proactive_fd_cleanup,
     write_agent_profile,
     write_file_reservation_record,
+    write_message_bundle,
 )
+
+
+def _core_legacy_http_error(operation: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "optional_component_unavailable",
+            "component": "legacy_git_archive",
+            "operation": operation,
+            "runtime_profile": "core",
+        },
+    )
 
 
 async def _project_slug_from_id(pid: int | None) -> str | None:
@@ -323,7 +337,7 @@ async def _open_existing_project_archive(settings: Settings, slug: str) -> Proje
     if not await asyncio.to_thread(_path_exists, project_root):
         return None
     repo = await asyncio.to_thread(_open_git_repo, repo_root)
-    return ProjectArchive(
+    return create_project_archive(
         settings=settings,
         slug=slug,
         root=project_root,
@@ -1129,6 +1143,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     if server is None:
         server = build_mcp_server()
 
+    if (
+        settings.runtime_profile == "core"
+        and settings.ack_escalation_enabled
+        and (settings.ack_escalation_mode or "log").lower() == "file_reservation"
+    ):
+        raise RuntimeError(
+            "core runtime cannot start with ACK escalation mode 'file_reservation'; "
+            "use 'log' or disable ACK escalation"
+        )
+
     # Build MCP HTTP sub-app with stateless mode for ASGI test transports
     mcp_http_app = cast(_FastMCPHttpApp, server).http_app(
         path="/",
@@ -1467,8 +1491,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await asyncio.sleep(interval)
 
         tasks = []
-        # FD health monitor always runs - it's critical for preventing EMFILE cascades
-        tasks.append(asyncio.create_task(_worker_fd_health()))
+        # The legacy FD worker inspects the Git archive repository cache. Core
+        # intentionally has no archive module in its import or execution graph.
+        if settings.runtime_profile != "core":
+            tasks.append(asyncio.create_task(_worker_fd_health()))
         if settings.file_reservations_cleanup_enabled:
             tasks.append(asyncio.create_task(_worker_cleanup()))
         if settings.ack_ttl_enabled:
@@ -1477,7 +1503,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             tasks.append(asyncio.create_task(_worker_tool_metrics()))
         if settings.retention_report_enabled or settings.quota_enabled:
             tasks.append(asyncio.create_task(_worker_retention_quota()))
-        if settings.auto_retire_stale_agents_enabled:
+        if settings.auto_retire_stale_agents_enabled and settings.runtime_profile != "core":
             tasks.append(asyncio.create_task(_worker_auto_retire_stale_agents()))
         fastapi_app.state._background_tasks = tasks
 
@@ -1521,6 +1547,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         version=_package_version(),
         lifespan=lifespan_context,
     )
+
+    if settings.runtime_profile == "core":
+        class CoreLegacySurfaceGuard(BaseHTTPMiddleware):
+            """Fail closed for web routes that still mutate/read Git archives."""
+
+            async def dispatch(
+                self,
+                request: Request,
+                call_next: RequestResponseEndpoint,
+            ) -> Response:
+                path = request.url.path
+                legacy_archive_read = path.startswith("/mail/archive")
+                unmanaged_mail_mutation = request.method not in {"GET", "HEAD", "OPTIONS"} and path.startswith("/mail")
+                if legacy_archive_read or unmanaged_mail_mutation:
+                    error = _core_legacy_http_error(f"{request.method} {path}")
+                    return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+                return await call_next(request)
+
+        cast(Any, fastapi_app).add_middleware(CoreLegacySurfaceGuard)
 
     # Simple request logging (configurable)
     if settings.http.request_log_enabled:
@@ -2966,12 +3011,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
             # Get commit SHA for provenance badge
             commit_sha = None
-            try:
-                settings = get_settings()
-                archive = await ensure_archive(settings, prow[1])
-                commit_sha = await get_message_commit_sha(archive, mid)
-            except Exception:
-                pass  # Commit SHA is optional
+            settings = get_settings()
+            if settings.runtime_profile != "core":
+                try:
+                    archive = await ensure_archive(settings, prow[1])
+                    commit_sha = await get_message_commit_sha(archive, mid)
+                except Exception:
+                    pass  # Commit SHA is optional
 
             sender_display, sender_meta = _http_sender_identity(
                 message_project_id=pid,
@@ -3888,9 +3934,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                     await session.commit()
 
-                from .storage import ensure_archive, write_message_bundle
-
                 settings = get_settings()
+                if settings.runtime_profile == "core":
+                    raise _core_legacy_http_error("overseer_send")
                 archive = await ensure_archive(settings, project_slug)
                 message_dict = {
                     "id": message_id,

@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 from .config import Settings
-from .storage import ProjectArchive, ensure_archive
+from .legacy_adapter import ProjectArchive, ensure_archive
 
 __all__ = [
     "install_guard",

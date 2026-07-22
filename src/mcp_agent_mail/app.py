@@ -91,8 +91,7 @@ from .routing import (
     assert_route_generation,
     resolve_storage_route,
 )
-from .storage import (
-    GitIndexLockError,
+from .legacy_adapter import (
     ProjectArchive,
     archive_write_lock,
     clear_notification_signal,
@@ -723,25 +722,6 @@ def _instrument_tool(
                 )
                 error = wrapped_exc
                 raise wrapped_exc from exc
-            except GitIndexLockError as exc:
-                # Git index.lock contention (concurrent git operations)
-                # This is an expected error in multi-agent environments
-                metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
-                wrapped_exc = ToolExecutionError(
-                    "GIT_INDEX_LOCK",
-                    f"Git repository is temporarily locked by another operation. "
-                    f"This is normal in multi-agent environments. "
-                    f"Wait a moment and retry. (Attempted {exc.attempts} times before giving up)",
-                    recoverable=True,
-                    data={
-                        "tool": tool_name,
-                        "lock_path": str(exc.lock_path),
-                        "attempts": exc.attempts,
-                    },
-                )
-                error = wrapped_exc
-                raise wrapped_exc from exc
             except OSError as exc:
                 # Handle file descriptor exhaustion (EMFILE) with cache cleanup
                 import errno
@@ -749,7 +729,11 @@ def _instrument_tool(
                 _record_tool_error(tool_name, exc)
                 if exc.errno == errno.EMFILE:
                     # Clear repo cache to free file handles and allow recovery
-                    cleared = clear_repo_cache()
+                    cleared = (
+                        0
+                        if get_settings().runtime_profile == "core"
+                        else clear_repo_cache()
+                    )
                     wrapped_exc = ToolExecutionError(
                         "RESOURCE_EXHAUSTED",
                         f"Too many open files. Freed {cleared} cached repos. Retry the operation.",
@@ -773,7 +757,11 @@ def _instrument_tool(
                 error_msg = str(exc)
 
                 # Try to categorize common error patterns
-                if "database" in error_msg.lower() or "sqlite" in error_msg.lower():
+                if error_type == "GitIndexLockError":
+                    error_category = "GIT_INDEX_LOCK"
+                    friendly_msg = "Git repository is temporarily locked. Wait a moment and retry."
+                    recoverable = True
+                elif "database" in error_msg.lower() or "sqlite" in error_msg.lower():
                     error_category = "DATABASE_ERROR"
                     friendly_msg = "A database error occurred. This may be a transient issue - try again."
                     recoverable = True

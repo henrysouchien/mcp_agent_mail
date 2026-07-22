@@ -20,8 +20,11 @@ def test_gitpython_is_not_a_core_dependency() -> None:
 def test_core_server_imports_and_builds_when_gitpython_is_blocked(tmp_path: Path) -> None:
     script = r'''
 import importlib.abc
+import asyncio
 import os
 import sys
+
+from httpx import ASGITransport, AsyncClient
 
 class BlockGit(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
@@ -34,10 +37,33 @@ for name in tuple(sys.modules):
     if name == "git" or name.startswith("git."):
         del sys.modules[name]
 os.environ["PATH"] = ""
+os.environ["RUNTIME_PROFILE"] = "core"
+os.environ["CORE_OWNER_TOKEN"] = "owner-secret"
+os.environ["CREDENTIAL_PEPPERS_JSON"] = '{"core":"YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE"}'
+os.environ["CREDENTIAL_CURRENT_PEPPER_KEY_ID"] = "core"
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.config import get_settings
+from mcp_agent_mail.http import build_http_app
 server = build_mcp_server()
 assert server is not None
+http_app = build_http_app(get_settings(), server)
+assert http_app is not None
+
+async def exercise_lifecycle():
+    async with http_app.router.lifespan_context(http_app):
+        transport = ASGITransport(app=http_app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/health/liveness")
+            assert response.status_code == 200
+            response = await client.get("/mail/archive")
+            assert response.status_code == 409
+            response = await client.post("/mail/api/delete-messages", json={"message_ids": [1]})
+            assert response.status_code == 409
+        await asyncio.sleep(0)
+
+asyncio.run(exercise_lifecycle())
 assert not any(name == "git" or name.startswith("git.") for name in sys.modules)
+assert "mcp_agent_mail.storage" not in sys.modules
 '''
     environment = dict(os.environ)
     environment["DATABASE_URL"] = f"sqlite+aiosqlite:///{tmp_path / 'core.sqlite3'}"
