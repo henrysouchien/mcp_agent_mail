@@ -231,6 +231,16 @@ async def test_owner_can_rotate_revoke_and_reissue_pane_credentials(
                 "send_message",
                 {
                     "project_key": "/credential-lifecycle",
+                    "to": ["credential-1"],
+                    "subject": "bound session must fail",
+                    "body_md": "permanent binding cannot bypass retirement",
+                },
+            )
+        with pytest.raises(Exception, match="retired"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/credential-lifecycle",
                     "sender_name": "credential-1",
                     "sender_token": reissued.data["pane_credential"],
                     "to": ["credential-1"],

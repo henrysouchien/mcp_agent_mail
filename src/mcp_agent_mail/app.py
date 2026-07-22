@@ -5755,6 +5755,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             return await _get_agent_by_id(project, bound_agent_ids[0])
         return None
 
+    def _require_active_agent(agent: Agent, action: str) -> Agent:
+        if agent.retired_at is not None and action != "unretire_agent":
+            raise ToolExecutionError(
+                "AGENT_RETIRED",
+                f"Agent '{agent.name}' is retired and cannot authenticate for {action}.",
+                recoverable=True,
+                data={"agent_name": agent.name, "retired_at": _iso(agent.retired_at)},
+            )
+        return agent
+
     async def _authenticate_agent(
         ctx: Context,
         project: Project,
@@ -5765,13 +5775,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         action: str,
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
-        if agent.retired_at is not None and action != "unretire_agent":
-            raise ToolExecutionError(
-                "AGENT_RETIRED",
-                f"Agent '{agent.name}' is retired and cannot authenticate for {action}.",
-                recoverable=True,
-                data={"agent_name": agent.name, "retired_at": _iso(agent.retired_at)},
-            )
+        _require_active_agent(agent, action)
         provided_token = provided_token or effective_request_pane_credential() or None
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
@@ -5911,6 +5915,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         raise CredentialError("pane credential belongs to another project")
                     await credential_session.commit()
                 agent = await _get_agent_by_id(project, pane.agent_id)
+                _require_active_agent(agent, action)
                 _bind_session_agent(ctx, project, agent)
                 return agent
             except CredentialError:
@@ -5918,7 +5923,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
 
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
-            return agent
+            return _require_active_agent(agent, action)
 
         raise ToolExecutionError(
             "AUTHENTICATION_REQUIRED",
