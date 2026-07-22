@@ -18,6 +18,73 @@ from mcp_agent_mail.models import (
 )
 
 
+async def _create_git_independent_project(human_key: str, slug: str) -> int:
+    async with get_immediate_session() as session:
+        project = Project(slug=slug, human_key=human_key)
+        session.add(project)
+        await session.flush()
+        assert project.id is not None
+        baseline = await append_audit_event(
+            session,
+            project_id=project.id,
+            actor_kind="system",
+            actor_scope_id="system/new-project",
+            actor_agent_id=None,
+            operation_kind="project_created_v1",
+            entity_type="project",
+            entity_id=str(project.id),
+            payload_version="project-created-v1",
+            payload={"slug": project.slug},
+        )
+        await session.flush()
+        assert baseline.id is not None
+        session.add(
+            ProjectStorageCutover(
+                project_id=project.id,
+                state="git_independent",
+                generation=1,
+                baseline_event_id=baseline.id,
+            )
+        )
+        await session.commit()
+        return project.id
+
+
+@pytest.mark.asyncio
+async def test_live_registration_never_opens_archive_for_git_independent_project(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "migration")
+    clear_settings_cache()
+    await ensure_schema()
+    project_id = await _create_git_independent_project(
+        "/git-independent-registration",
+        "git-independent-registration",
+    )
+
+    async def archive_must_not_open(*args, **kwargs):
+        raise AssertionError("Git-independent registration attempted to open the legacy archive")
+
+    monkeypatch.setattr("mcp_agent_mail.app.ensure_archive", archive_must_not_open)
+    async with Client(build_mcp_server()) as client:
+        result = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/git-independent-registration",
+                "program": "test",
+                "model": "test",
+                "name": "BlueLake",
+            },
+        )
+    assert result.data["name"] == "BlueLake"
+    async with get_session() as session:
+        assert await session.scalar(select(func.count()).select_from(Agent)) == 1
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
+        chain = await verify_audit_chain(session, project_id)
+    assert chain.valid is True
+
+
 @pytest.mark.asyncio
 async def test_live_send_uses_atomic_path_and_never_opens_archive(
     isolated_env: object,

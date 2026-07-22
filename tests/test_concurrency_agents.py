@@ -982,11 +982,11 @@ class TestRaceConditions:
             return_exceptions=True,
         )
 
-        for i, r in enumerate(results):
-            assert not isinstance(r, Exception), f"Attempt {i} failed: {r}"
-
-        agent_ids = [r["id"] for r in results if isinstance(r, dict)]
-        assert len(set(agent_ids)) == 1, "All should get the same agent ID"
+        successes = [result for result in results if isinstance(result, dict)]
+        failures = [result for result in results if isinstance(result, Exception)]
+        assert successes, "One first-registration contender must create the identity"
+        assert len({result["id"] for result in successes}) == 1
+        assert all("registration_token" in str(failure) for failure in failures)
 
     @pytest.mark.asyncio
     async def test_simultaneous_mark_read(self, isolated_env):

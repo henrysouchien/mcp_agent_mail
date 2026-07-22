@@ -41,6 +41,7 @@ from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, Time
 from sqlalchemy.orm import aliased
 
 from . import rich_logger
+from .audit import append_audit_event
 from .config import Settings, get_settings
 from .credentials import (
     CredentialError,
@@ -3390,12 +3391,16 @@ async def _generate_unique_agent_name(
     project: Project,
     settings: Settings,
     name_hint: Optional[str] = None,
+    *,
+    use_archive: bool = True,
 ) -> str:
-    archive = await ensure_archive(settings, project.slug)
+    archive = await ensure_archive(settings, project.slug) if use_archive else None
 
     async def available(candidate: str) -> bool:
         if await _agent_name_exists(project, candidate):
             return False
+        if archive is None:
+            return True
         candidate_path = archive.root / "agents" / candidate
         return not await asyncio.to_thread(candidate_path.exists)
 
@@ -3475,9 +3480,20 @@ async def _get_or_create_agent(
 ) -> Agent:
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
+    async with get_session() as route_session:
+        route = await resolve_storage_route(
+            route_session,
+            project_id=project.id,
+            runtime_profile=settings.runtime_profile,
+            for_mutation=True,
+        )
+    git_independent = route.state == GIT_INDEPENDENT
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
     explicit_name_used = False
-    window_uuid = effective_window_identity_uuid(settings)
+    # A public window UUID is routing metadata, never authority to select an
+    # existing agent on the Git-independent path. Durable pane credentials
+    # authenticate that identity after registration.
+    window_uuid = "" if git_independent else effective_window_identity_uuid(settings)
     ttl_days = getattr(settings, "window_identity_ttl_days", 30)
     window_identity: Optional[WindowIdentity] = None
 
@@ -3488,7 +3504,12 @@ async def _get_or_create_agent(
     # 4. No window ID, no explicit name -> auto-generate (current behavior)
 
     if mode == "always_auto" and not window_uuid:
-        desired_name = await _generate_unique_agent_name(project, settings, None)
+        desired_name = await _generate_unique_agent_name(
+            project,
+            settings,
+            None,
+            use_archive=not git_independent,
+        )
     elif name is not None and mode != "always_auto":
         # Priority 1: Explicit name/identity provided
         _is_reserved = _looks_like_program_name(name) or _looks_like_model_name(name)
@@ -3503,7 +3524,9 @@ async def _get_or_create_agent(
             if not sanitized:
                 if mode == "strict":
                     raise ValueError("Agent name must contain alphanumeric characters.")
-                desired_name = await _generate_unique_agent_name(project, settings, None)
+                desired_name = await _generate_unique_agent_name(
+                    project, settings, None, use_archive=not git_independent
+                )
             elif validate_agent_name_format(sanitized):
                 desired_name = sanitized
                 explicit_name_used = True
@@ -3525,12 +3548,16 @@ async def _get_or_create_agent(
                         recoverable=True,
                         data={"provided_name": sanitized, "valid_examples": ["BlueLake", "GreenCastle", "RedStone", "alpha-one", "cc-0"]},
                     )
-                desired_name = await _generate_unique_agent_name(project, settings, None)
+                desired_name = await _generate_unique_agent_name(
+                    project, settings, None, use_archive=not git_independent
+                )
     elif window_uuid:
         # Priority 2/3: Window identity resolution
         if not _validate_window_uuid(window_uuid):
             logger.warning("MCP_AGENT_MAIL_WINDOW_ID is not a valid UUID: %s", window_uuid)
-            desired_name = await _generate_unique_agent_name(project, settings, None)
+            desired_name = await _generate_unique_agent_name(
+                project, settings, None, use_archive=not git_independent
+            )
         else:
             window_identity = await _get_window_identity(project, window_uuid)
             if window_identity:
@@ -3540,16 +3567,21 @@ async def _get_or_create_agent(
                 await _touch_window_identity(window_identity, ttl_days)
             else:
                 # Priority 3: new window identity -> generate name and create identity
-                desired_name = await _generate_unique_agent_name(project, settings, None)
+                desired_name = await _generate_unique_agent_name(
+                    project, settings, None, use_archive=not git_independent
+                )
                 window_identity = await _create_window_identity(
                     project, window_uuid, desired_name, ttl_days,
                 )
     else:
         # Priority 4: no name, no window ID -> auto-generate
-        desired_name = await _generate_unique_agent_name(project, settings, None)
+        desired_name = await _generate_unique_agent_name(
+            project, settings, None, use_archive=not git_independent
+        )
     await ensure_schema()
     newly_created = False
-    async with get_session() as session:
+    session_context = get_immediate_session() if git_independent else get_session()
+    async with session_context as session:
         for _attempt in range(5):
             # Use case-insensitive matching to be consistent with _agent_name_exists() and _get_agent()
             result = await session.execute(
@@ -3565,6 +3597,25 @@ async def _get_or_create_agent(
                 agent.task_description = task_description
                 agent.last_active_ts = _naive_utc()
                 session.add(agent)
+                if git_independent:
+                    await append_audit_event(
+                        session,
+                        project_id=project.id,
+                        actor_kind="agent",
+                        actor_scope_id=f"{project.id}:{agent.id}",
+                        actor_agent_id=agent.id,
+                        operation_kind="agent_profile_updated_v1",
+                        entity_type="agent",
+                        entity_id=str(agent.id),
+                        payload_version="agent-profile-v1",
+                        payload={"agent_id": agent.id, "name": agent.name},
+                    )
+                    await assert_route_generation(
+                        session,
+                        project_id=project.id,
+                        expected_state=route.state,
+                        expected_generation=route.generation,
+                    )
                 await session.commit()
                 await session.refresh(agent)
                 break
@@ -3575,9 +3626,32 @@ async def _get_or_create_agent(
                 program=program,
                 model=model,
                 task_description=task_description,
+                # Mint with the identity row so concurrent observers never see
+                # a transient unclaimable agent between registration commits.
+                registration_token=secrets.token_urlsafe(32),
             )
             session.add(candidate)
             try:
+                if git_independent:
+                    await session.flush()
+                    await append_audit_event(
+                        session,
+                        project_id=project.id,
+                        actor_kind="system",
+                        actor_scope_id="system/agent-registration",
+                        actor_agent_id=candidate.id,
+                        operation_kind="agent_registered_v1",
+                        entity_type="agent",
+                        entity_id=str(candidate.id),
+                        payload_version="agent-registration-v1",
+                        payload={"agent_id": candidate.id, "name": candidate.name},
+                    )
+                    await assert_route_generation(
+                        session,
+                        project_id=project.id,
+                        expected_state=route.state,
+                        expected_generation=route.generation,
+                    )
                 await session.commit()
                 await session.refresh(candidate)
                 agent = candidate
@@ -3604,12 +3678,33 @@ async def _get_or_create_agent(
                     agent.task_description = task_description
                     agent.last_active_ts = _naive_utc()
                     session.add(agent)
+                    if git_independent:
+                        await append_audit_event(
+                            session,
+                            project_id=project.id,
+                            actor_kind="agent",
+                            actor_scope_id=f"{project.id}:{agent.id}",
+                            actor_agent_id=agent.id,
+                            operation_kind="agent_profile_updated_v1",
+                            entity_type="agent",
+                            entity_id=str(agent.id),
+                            payload_version="agent-profile-v1",
+                            payload={"agent_id": agent.id, "name": agent.name},
+                        )
+                        await assert_route_generation(
+                            session,
+                            project_id=project.id,
+                            expected_state=route.state,
+                            expected_generation=route.generation,
+                        )
                     await session.commit()
                     await session.refresh(agent)
                     break
 
                 # Auto-generated name collision under concurrency: pick a new name and retry.
-                desired_name = await _generate_unique_agent_name(project, settings, None)
+                desired_name = await _generate_unique_agent_name(
+                    project, settings, None, use_archive=not git_independent
+                )
                 continue
         else:
             raise RuntimeError("Failed to create a unique agent after multiple retries.")
@@ -3626,6 +3721,9 @@ async def _get_or_create_agent(
             )
         else:
             await _touch_window_identity(window_identity, ttl_days)
+
+    if git_independent:
+        return agent
 
     archive = await ensure_archive(settings, project.slug)
     agent_dict = _agent_to_dict(agent)
