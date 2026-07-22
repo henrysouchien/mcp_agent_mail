@@ -5918,8 +5918,13 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 _require_active_agent(agent, action)
                 _bind_session_agent(ctx, project, agent)
                 return agent
-            except CredentialError:
-                pass
+            except CredentialError as exc:
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    "Invalid pane credential for this project.",
+                    recoverable=True,
+                    data={"project_key": project.human_key, "token_param": token_param},
+                ) from exc
 
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
@@ -7633,11 +7638,79 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_key: str,
         agent_name: str,
         registration_token: Optional[str] = None,
+        owner_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Restore a retired agent back to active status."""
         project = await _get_project_by_identifier(project_key)
         if not project:
             raise ValueError(f"Project '{project_key}' not found")
+
+        if project.id is None:
+            raise ValueError("Project must be persisted before unretirement.")
+        async with get_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=get_settings().runtime_profile,
+                for_mutation=True,
+            )
+        if route.state == GIT_INDEPENDENT:
+            _require_core_owner(get_settings(), owner_token)
+            agent = await _get_agent(project, agent_name)
+            if agent.id is None:
+                raise ValueError("Agent must be persisted before unretirement.")
+            async with get_immediate_session() as session:
+                transaction_route = await resolve_storage_route(
+                    session,
+                    project_id=project.id,
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+                db_agent = await session.get(Agent, agent.id)
+                if db_agent is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Agent '{agent_name}' not found.")
+                was_retired = db_agent.retired_at is not None
+                db_agent.retired_at = None
+                active_credentials = await session.scalar(
+                    select(func.count()).select_from(PaneCredential).where(
+                        cast(Any, PaneCredential.project_id) == project.id,
+                        cast(Any, PaneCredential.agent_id) == agent.id,
+                        cast(Any, PaneCredential.revoked_ts).is_(None),
+                    )
+                )
+                event = await append_audit_event(
+                    session,
+                    project_id=project.id,
+                    actor_kind="owner",
+                    actor_scope_id="owner/core-agent-unretire",
+                    actor_agent_id=None,
+                    operation_kind="agent_unretired_v1",
+                    entity_type="agent",
+                    entity_id=str(agent.id),
+                    payload_version="agent-retirement-v1",
+                    payload={
+                        "active_pane_credentials": int(active_credentials or 0),
+                        "was_retired": was_retired,
+                    },
+                )
+                await assert_route_generation(
+                    session,
+                    project_id=project.id,
+                    expected_state=transaction_route.state,
+                    expected_generation=transaction_route.generation,
+                )
+                await session.commit()
+            await ctx.info(
+                f"Restored agent '{agent_name}'; revoked pane credentials remain revoked."
+            )
+            return {
+                "status": "active",
+                "agent_name": agent_name,
+                "project_key": project_key,
+                "active_pane_credentials": int(active_credentials or 0),
+                "pane_recovery": "call reissue_pane_credential with owner authority",
+                "audit_event_id": event.id,
+            }
 
         agent = await _authenticate_agent(
             ctx,

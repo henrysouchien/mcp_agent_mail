@@ -226,6 +226,15 @@ async def test_owner_can_rotate_revoke_and_reissue_pane_credentials(
                     "body_md": "deregistered identities cannot send",
                 },
             )
+        with pytest.raises(Exception, match="owner"):
+            await client.call_tool(
+                "unretire_agent",
+                {
+                    "project_key": "/credential-lifecycle",
+                    "agent_name": "credential-1",
+                    "registration_token": registered.data["registration_token"],
+                },
+            )
         with pytest.raises(Exception, match="retired"):
             await client.call_tool(
                 "send_message",
@@ -248,10 +257,43 @@ async def test_owner_can_rotate_revoke_and_reissue_pane_credentials(
                     "body_md": "revoked pane identities cannot send",
                 },
             )
+        restored = await client.call_tool(
+            "unretire_agent",
+            {
+                "project_key": "/credential-lifecycle",
+                "agent_name": "credential-1",
+                "owner_token": "owner-secret",
+            },
+        )
+        with pytest.raises(Exception, match="Invalid pane credential"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/credential-lifecycle",
+                    "sender_token": reissued.data["pane_credential"],
+                    "to": ["credential-1"],
+                    "subject": "revoked pane remains invalid",
+                    "body_md": "owner unretire does not revive pane credentials",
+                },
+            )
+        resumed = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/credential-lifecycle",
+                "sender_name": "credential-1",
+                "sender_token": registered.data["registration_token"],
+                "to": ["credential-1"],
+                "subject": "registration authority restored",
+                "body_md": "owner unretire restores active identity state",
+                "idempotency_key": "post-unretire-send",
+            },
+        )
 
     assert reissued.data["credential_id"] == credential_id
     assert reissued.data["generation"] == 3
     assert retired.data["revoked_pane_credentials"] == 1
+    assert restored.data["active_pane_credentials"] == 0
+    assert resumed.data["count"] == 1
     async with get_session() as session:
         active_count = await session.scalar(
             select(func.count()).select_from(PaneCredential).where(
