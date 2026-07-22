@@ -44,6 +44,7 @@ os.environ["CREDENTIAL_CURRENT_PEPPER_KEY_ID"] = "core"
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.http import build_http_app
+from mcp_agent_mail.legacy_adapter import LegacyStorageUnavailableError, clear_repo_cache
 server = build_mcp_server()
 assert server is not None
 http_app = build_http_app(get_settings(), server)
@@ -62,6 +63,12 @@ async def exercise_lifecycle():
         await asyncio.sleep(0)
 
 asyncio.run(exercise_lifecycle())
+try:
+    clear_repo_cache()
+except LegacyStorageUnavailableError:
+    pass
+else:
+    raise AssertionError("core runtime crossed the legacy storage boundary")
 assert not any(name == "git" or name.startswith("git.") for name in sys.modules)
 assert "mcp_agent_mail.storage" not in sys.modules
 '''
