@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from mcp_agent_mail.audit import append_audit_event
 from mcp_agent_mail.config import ConfigError, clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_immediate_session
 from mcp_agent_mail.models import Project, ProjectStorageCutover
@@ -22,6 +23,33 @@ async def _project() -> int:
         assert project.id is not None
         await session.commit()
         return project.id
+
+
+async def _mark_git_independent(project_id: int, *, generation: int) -> None:
+    async with get_immediate_session() as session:
+        event = await append_audit_event(
+            session,
+            project_id=project_id,
+            actor_kind="system",
+            actor_scope_id="system/test-baseline",
+            actor_agent_id=None,
+            operation_kind="project_created_v1",
+            entity_type="project",
+            entity_id=str(project_id),
+            payload_version="project-created-v1",
+            payload={"project_id": project_id},
+        )
+        await session.flush()
+        assert event.id is not None
+        session.add(
+            ProjectStorageCutover(
+                project_id=project_id,
+                state=GIT_INDEPENDENT,
+                generation=generation,
+                baseline_event_id=event.id,
+            )
+        )
+        await session.commit()
 
 
 def test_runtime_profile_defaults_legacy_and_rejects_unknown(
@@ -84,15 +112,7 @@ async def test_cutover_intermediate_states_reject_mutations(
 async def test_git_independent_route_is_safe_and_never_legacy(isolated_env: object) -> None:
     await ensure_schema()
     project_id = await _project()
-    async with get_immediate_session() as session:
-        session.add(
-            ProjectStorageCutover(
-                project_id=project_id,
-                state=GIT_INDEPENDENT,
-                generation=4,
-            )
-        )
-        await session.commit()
+    await _mark_git_independent(project_id, generation=4)
     async with get_immediate_session() as session:
         route = await resolve_storage_route(
             session,
@@ -108,15 +128,7 @@ async def test_git_independent_route_is_safe_and_never_legacy(isolated_env: obje
 async def test_route_generation_change_fails_closed(isolated_env: object) -> None:
     await ensure_schema()
     project_id = await _project()
-    async with get_immediate_session() as session:
-        session.add(
-            ProjectStorageCutover(
-                project_id=project_id,
-                state=GIT_INDEPENDENT,
-                generation=2,
-            )
-        )
-        await session.commit()
+    await _mark_git_independent(project_id, generation=2)
     async with get_immediate_session() as session:
         await assert_route_generation(
             session,

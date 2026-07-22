@@ -58,6 +58,12 @@ async def resolve_storage_route(
         generation = cutover.generation
     if state not in VALID_STATES:
         raise StorageRoutingError(f"project {project_id} has invalid cutover state {state!r}")
+    if state == GIT_INDEPENDENT and (
+        cutover is None or cutover.baseline_event_id is None
+    ):
+        raise StorageRoutingError(
+            f"git_independent project {project_id} has no authoritative baseline event"
+        )
 
     if runtime_profile == "legacy" and state != LEGACY:
         raise StorageRoutingError(

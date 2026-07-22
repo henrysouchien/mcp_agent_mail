@@ -56,6 +56,7 @@ from .db import (
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .llm import complete_system_user
+from .message_service import RecipientIdentity, create_atomic_message
 from .models import (
     Agent,
     AgentLink,
@@ -69,6 +70,7 @@ from .models import (
     ProductProjectLink,
     WindowIdentity,
 )
+from .routing import GIT_INDEPENDENT, assert_route_generation, resolve_storage_route
 from .storage import (
     GitIndexLockError,
     ProjectArchive,
@@ -5541,6 +5543,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         thread_id: Optional[str],
         topic: Optional[str] = None,
         reply_to: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -5573,9 +5576,100 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         recipient_records.extend((agent, "cc") for agent in cc_agents)
         recipient_records.extend((agent, "bcc") for agent in bcc_agents)
 
-        archive = await ensure_archive(settings, project.slug)
         sender_project = project if sender.project_id == project.id else await _get_project_by_id(sender.project_id)
         sender_is_local = sender_project.id == project.id
+        if project.id is None or sender.id is None or sender_project.id is None:
+            raise ValueError("Project and sender identities must be persisted before delivery.")
+
+        async with get_immediate_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+            if route.state == GIT_INDEPENDENT:
+                if attachment_paths or "data:image" in body_md:
+                    raise ToolExecutionError(
+                        "GIT_INDEPENDENT_ATTACHMENT_MIGRATION_REQUIRED",
+                        "This project requires blob-backed attachment ingestion for this message.",
+                        recoverable=True,
+                    )
+                atomic_result = await create_atomic_message(
+                    route_session,
+                    project_id=project.id,
+                    sender_id=sender.id,
+                    actor_scope_id=f"{sender_project.id}:{sender.id}",
+                    recipients=[
+                        RecipientIdentity(
+                            agent_id=cast(int, recipient.id),
+                            name=recipient.name,
+                            kind=kind,
+                        )
+                        for recipient, kind in recipient_records
+                    ],
+                    subject=subject,
+                    body_md=body_md,
+                    importance=importance,
+                    ack_required=ack_required,
+                    thread_id=thread_id,
+                    topic=topic,
+                    reply_to=reply_to,
+                    attachments=[],
+                    idempotency_key=idempotency_key,
+                )
+                await assert_route_generation(
+                    route_session,
+                    project_id=project.id,
+                    expected_state=route.state,
+                    expected_generation=route.generation,
+                )
+                await route_session.commit()
+
+                payload = dict(atomic_result.response)
+                payload.update(
+                    {
+                        "to": [agent.name for agent in to_agents],
+                        "cc": [agent.name for agent in cc_agents],
+                        "bcc": [agent.name for agent in bcc_agents],
+                        "attachments": [],
+                        "replayed": atomic_result.replayed,
+                        "retry_safety": (
+                            "safe_with_idempotency_key"
+                            if idempotency_key
+                            else "unsafe_without_key"
+                        ),
+                    }
+                )
+                _apply_sender_identity(
+                    payload,
+                    message_project_id=project.id,
+                    sender_name=sender.name,
+                    sender_project_id=sender_project.id,
+                    sender_project_human_key=sender_project.human_key,
+                    sender_project_slug=sender_project.slug,
+                )
+                if settings.notifications.enabled and not atomic_result.replayed:
+                    notification_meta = {
+                        "id": atomic_result.message_id,
+                        "from": sender.name,
+                        "subject": subject,
+                        "importance": importance,
+                    }
+                    for target in to_agents + cc_agents:
+                        with suppress(Exception):
+                            await emit_notification_signal(
+                                settings,
+                                project.slug,
+                                target.name,
+                                notification_meta,
+                            )
+                await ctx.info(
+                    f"Message {atomic_result.message_id} committed through Git-independent storage."
+                )
+                return payload
+
+        archive = await ensure_archive(settings, project.slug)
         sender_archive_label = _sender_display_name(
             message_project_id=project.id,
             sender_name=sender.name,
@@ -5808,6 +5902,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         )
         if payload is None:
             raise RuntimeError("Message payload was not generated.")
+        payload["retry_safety"] = "unsafe_legacy"
         return payload
 
     def _extract_delivery_error_payload(payload: Any) -> dict[str, Any] | None:
@@ -7179,6 +7274,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         topic: Optional[str] = None,
         auto_contact_if_blocked: Optional[bool] = None,
         sender_token: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -8360,6 +8456,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 ack_required,
                 thread_id,
                 topic=topic,
+                idempotency_key=idempotency_key,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
         # External per-target project deliver using the original sender identity.
@@ -8382,6 +8479,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     ack_required,
                     thread_id,
                     topic=topic,
+                    idempotency_key=(
+                        f"{idempotency_key}:project:{p.id}"
+                        if idempotency_key
+                        else None
+                    ),
                 )
                 _collect_delivery_result(deliveries, delivery_errors, p, payload_ext)
             except Exception as exc:
@@ -8486,6 +8588,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         sender_token: Optional[str] = None,
         agent_name: Optional[str] = None,
         registration_token: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -9015,6 +9118,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 thread_id=thread_key,
                 topic=original.topic,
                 reply_to=original.id,
+                idempotency_key=idempotency_key,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
 
@@ -9038,6 +9142,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     thread_id=thread_key,
                     topic=original.topic,
                     reply_to=original.id,
+                    idempotency_key=(
+                        f"{idempotency_key}:project:{target_project.id}"
+                        if idempotency_key
+                        else None
+                    ),
                 )
                 _collect_delivery_result(deliveries, delivery_errors, target_project, payload_ext)
             except Exception as exc:
