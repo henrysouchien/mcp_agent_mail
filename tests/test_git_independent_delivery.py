@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastmcp import Client
@@ -130,6 +131,90 @@ async def test_core_ensure_project_bootstraps_baseline_without_archive(
         assert await session.scalar(select(func.count()).select_from(Project)) == 1
         assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 3
         assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_can_rotate_revoke_and_reissue_pane_credentials(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    _configure_managed_registration(monkeypatch)
+    clear_settings_cache()
+    window_uuid = "95ae694c-0210-4baa-88ab-62dc69295dc9"
+
+    async with Client(build_mcp_server()) as client:
+        await client.call_tool(
+            "ensure_project",
+            {"human_key": "/credential-lifecycle", "owner_token": "owner-secret"},
+        )
+        bootstrap = await client.call_tool(
+            "issue_registration_bootstrap",
+            {
+                "project_key": "/credential-lifecycle",
+                "window_uuid": window_uuid,
+                "owner_token": "owner-secret",
+            },
+        )
+        registered = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/credential-lifecycle",
+                "program": "test",
+                "model": "test",
+                "name": "credential-1",
+                "bootstrap_credential": bootstrap.data["bootstrap_credential"],
+                "idempotency_key": "register-credential-1",
+            },
+        )
+        credential_id = str(registered.data["pane_credential"]).split(".", 1)[0]
+        rotated = await client.call_tool(
+            "rotate_pane_credential",
+            {
+                "project_key": "/credential-lifecycle",
+                "credential_id": credential_id,
+                "expected_generation": 1,
+                "owner_token": "owner-secret",
+            },
+        )
+        assert rotated.data["generation"] == 2
+        revoked = await client.call_tool(
+            "revoke_pane_credential",
+            {
+                "project_key": "/credential-lifecycle",
+                "credential_id": credential_id,
+                "owner_token": "owner-secret",
+                "reason": "test compromise",
+            },
+        )
+        assert revoked.data["revoked"] is True
+        reissued = await client.call_tool(
+            "reissue_pane_credential",
+            {
+                "project_key": "/credential-lifecycle",
+                "agent_name": "credential-1",
+                "window_uuid": window_uuid,
+                "owner_token": "owner-secret",
+            },
+        )
+        retired = await client.call_tool(
+            "retire_agent",
+            {
+                "project_key": "/credential-lifecycle",
+                "agent_name": "credential-1",
+            },
+        )
+
+    assert reissued.data["credential_id"] == credential_id
+    assert reissued.data["generation"] == 3
+    assert retired.data["revoked_pane_credentials"] == 1
+    async with get_session() as session:
+        active_count = await session.scalar(
+            select(func.count()).select_from(PaneCredential).where(
+                cast(Any, PaneCredential.revoked_ts).is_(None)
+            )
+        )
+        assert active_count == 0
 
 
 @pytest.mark.asyncio

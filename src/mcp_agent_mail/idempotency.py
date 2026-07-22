@@ -37,6 +37,8 @@ class IdempotencyKeyReuseMismatchError(IdempotencyError):
 class IdempotencyVersionUnavailableError(IdempotencyError):
     """A retained record references a canonicalizer this binary cannot replay."""
 
+    code: Final = "IDEMPOTENCY_VERSION_UNAVAILABLE"
+
 
 class IdempotencyReceiptExpiredError(IdempotencyError):
     """The retry horizon has passed; the compact record still blocks reuse."""

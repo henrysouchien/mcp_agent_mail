@@ -50,6 +50,9 @@ from .credentials import (
     create_bootstrap_credential,
     create_pane_credential,
     derive_registration_credentials,
+    reissue_pane_credential as reissue_pane_credential_record,
+    revoke_pane_credential as revoke_pane_credential_record,
+    rotate_pane_credential as rotate_pane_credential_record,
     verify_bootstrap_credential,
     verify_pane_credential,
 )
@@ -66,7 +69,13 @@ from .db import (
     stop_query_tracking,
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
-from .idempotency import MutationReceipt, run_idempotent_mutation
+from .idempotency import (
+    IdempotencyKeyReuseMismatchError,
+    IdempotencyReceiptExpiredError,
+    IdempotencyVersionUnavailableError,
+    MutationReceipt,
+    run_idempotent_mutation,
+)
 from .llm import complete_system_user
 from .blob_store import BlobStore
 from .message_service import AtomicAttachment, RecipientIdentity, create_atomic_message
@@ -634,6 +643,48 @@ def _instrument_tool(
                 _record_tool_error(tool_name, exc)
                 error = exc
                 raise
+            except IdempotencyKeyReuseMismatchError as exc:
+                metrics["errors"] += 1
+                _record_tool_error(tool_name, exc)
+                wrapped_exc = ToolExecutionError(
+                    exc.code,
+                    str(exc),
+                    recoverable=True,
+                    data={
+                        "tool": tool_name,
+                        "recovery": "retry with the original request or a new idempotency key",
+                    },
+                )
+                error = wrapped_exc
+                raise wrapped_exc from exc
+            except IdempotencyReceiptExpiredError as exc:
+                metrics["errors"] += 1
+                _record_tool_error(tool_name, exc)
+                wrapped_exc = ToolExecutionError(
+                    exc.code,
+                    str(exc),
+                    recoverable=True,
+                    data={
+                        "tool": tool_name,
+                        "recovery": "reconcile the committed entity before choosing a new key",
+                    },
+                )
+                error = wrapped_exc
+                raise wrapped_exc from exc
+            except IdempotencyVersionUnavailableError as exc:
+                metrics["errors"] += 1
+                _record_tool_error(tool_name, exc)
+                wrapped_exc = ToolExecutionError(
+                    exc.code,
+                    str(exc),
+                    recoverable=False,
+                    data={
+                        "tool": tool_name,
+                        "recovery": "restore a server version that supports the retained fingerprint version",
+                    },
+                )
+                error = wrapped_exc
+                raise wrapped_exc from exc
             except NoResultFound as exc:
                 # Handle agent/project not found errors with helpful messages
                 metrics["errors"] += 1
@@ -6724,6 +6775,261 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "audit_event_id": event.id,
         }
 
+    @mcp.tool(name="reissue_pane_credential")
+    @_instrument_tool(
+        "reissue_pane_credential",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def reissue_pane_credential(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        window_uuid: str,
+        owner_token: str,
+        revoke_existing: bool = True,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Owner-authorized recovery for a lost pane bearer."""
+        _require_core_owner(settings, owner_token)
+        if not _validate_window_uuid(window_uuid):
+            raise ToolExecutionError("INVALID_WINDOW_UUID", "window_uuid must be a canonical UUID.")
+        key_id = settings.credentials.current_pepper_key_id
+        if not key_id or not settings.credentials.peppers:
+            raise ToolExecutionError(
+                "CREDENTIAL_PEPPER_UNAVAILABLE",
+                "Pane credential issuance requires configured credential peppers.",
+                recoverable=False,
+            )
+        project = await _get_project_by_identifier(project_key)
+        agent = await _get_agent(project, agent_name)
+        async with get_immediate_session() as session:
+            route = await resolve_storage_route(
+                session,
+                project_id=cast(int, project.id),
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+            if route.state != GIT_INDEPENDENT:
+                raise ToolExecutionError(
+                    "CORE_CREDENTIAL_OPERATION_REQUIRED",
+                    "Pane credential recovery is available for Git-independent projects.",
+                )
+            revoked_ids: list[str] = []
+            binding: PaneCredential | None = None
+            if revoke_existing:
+                result = await session.execute(
+                    select(PaneCredential).where(
+                        cast(Any, PaneCredential.project_id) == project.id,
+                        cast(Any, PaneCredential.agent_id) == agent.id,
+                        cast(Any, PaneCredential.window_uuid) == window_uuid,
+                        cast(Any, PaneCredential.revoked_ts).is_(None),
+                    )
+                )
+                for credential in result.scalars().all():
+                    binding = credential
+                    await revoke_pane_credential_record(
+                        session,
+                        credential.id,
+                        reason="owner_reissue",
+                    )
+                    revoked_ids.append(credential.id)
+            if binding is None:
+                existing_binding = await session.execute(
+                    select(PaneCredential).where(
+                        cast(Any, PaneCredential.project_id) == project.id,
+                        cast(Any, PaneCredential.window_uuid) == window_uuid,
+                    )
+                )
+                binding = existing_binding.scalars().first()
+            if binding is None:
+                issued = await create_pane_credential(
+                    session,
+                    project_id=cast(int, project.id),
+                    agent_id=cast(int, agent.id),
+                    window_uuid=window_uuid,
+                    pepper_key_id=key_id,
+                    peppers=settings.credentials.peppers,
+                )
+            else:
+                issued = await reissue_pane_credential_record(
+                    session,
+                    binding,
+                    agent_id=cast(int, agent.id),
+                    pepper_key_id=key_id,
+                    peppers=settings.credentials.peppers,
+                )
+            event = await append_audit_event(
+                session,
+                project_id=cast(int, project.id),
+                actor_kind="owner",
+                actor_scope_id="owner/core-credential-reissue",
+                actor_agent_id=None,
+                operation_kind="pane_credential_reissued_v1",
+                entity_type="pane_credential",
+                entity_id=issued.record.id,
+                payload_version="pane-credential-lifecycle-v1",
+                payload={
+                    "agent_id": agent.id,
+                    "revoked_credential_ids": revoked_ids,
+                    "window_uuid": window_uuid,
+                },
+            )
+            await assert_route_generation(
+                session,
+                project_id=cast(int, project.id),
+                expected_state=route.state,
+                expected_generation=route.generation,
+            )
+            await session.commit()
+        await ctx.info(f"Reissued pane credential for '{agent.name}'.")
+        return {
+            "credential_id": issued.record.id,
+            "generation": issued.record.generation,
+            "pane_credential": issued.bearer,
+            "revoked_credential_ids": revoked_ids,
+            "audit_event_id": event.id,
+        }
+
+    @mcp.tool(name="rotate_pane_credential")
+    @_instrument_tool(
+        "rotate_pane_credential",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def rotate_pane_credential(
+        ctx: Context,
+        project_key: str,
+        credential_id: str,
+        expected_generation: int,
+        owner_token: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Rotate a pane bearer using owner authority and generation fencing."""
+        _require_core_owner(settings, owner_token)
+        key_id = settings.credentials.current_pepper_key_id
+        if not key_id or not settings.credentials.peppers:
+            raise ToolExecutionError(
+                "CREDENTIAL_PEPPER_UNAVAILABLE",
+                "Pane credential rotation requires configured credential peppers.",
+                recoverable=False,
+            )
+        project = await _get_project_by_identifier(project_key)
+        async with get_immediate_session() as session:
+            route = await resolve_storage_route(
+                session,
+                project_id=cast(int, project.id),
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+            record = await session.get(PaneCredential, credential_id)
+            if record is None or record.project_id != project.id:
+                raise ToolExecutionError("PANE_CREDENTIAL_NOT_FOUND", "Pane credential was not found.")
+            try:
+                issued = await rotate_pane_credential_record(
+                    session,
+                    credential_id,
+                    expected_generation=expected_generation,
+                    pepper_key_id=key_id,
+                    peppers=settings.credentials.peppers,
+                )
+            except CredentialError as exc:
+                raise ToolExecutionError(
+                    "PANE_CREDENTIAL_ROTATION_FAILED",
+                    str(exc),
+                    recoverable=True,
+                    data={"credential_id": credential_id, "expected_generation": expected_generation},
+                ) from exc
+            event = await append_audit_event(
+                session,
+                project_id=cast(int, project.id),
+                actor_kind="owner",
+                actor_scope_id="owner/core-credential-rotate",
+                actor_agent_id=None,
+                operation_kind="pane_credential_rotated_v1",
+                entity_type="pane_credential",
+                entity_id=credential_id,
+                payload_version="pane-credential-lifecycle-v1",
+                payload={"generation": issued.record.generation},
+            )
+            await assert_route_generation(
+                session,
+                project_id=cast(int, project.id),
+                expected_state=route.state,
+                expected_generation=route.generation,
+            )
+            await session.commit()
+        await ctx.info(f"Rotated pane credential '{credential_id}'.")
+        return {
+            "credential_id": credential_id,
+            "generation": issued.record.generation,
+            "pane_credential": issued.bearer,
+            "audit_event_id": event.id,
+        }
+
+    @mcp.tool(name="revoke_pane_credential")
+    @_instrument_tool(
+        "revoke_pane_credential",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def revoke_pane_credential(
+        ctx: Context,
+        project_key: str,
+        credential_id: str,
+        owner_token: str,
+        reason: str = "owner_revoked",
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Revoke one pane bearer immediately using owner authority."""
+        _require_core_owner(settings, owner_token)
+        project = await _get_project_by_identifier(project_key)
+        async with get_immediate_session() as session:
+            route = await resolve_storage_route(
+                session,
+                project_id=cast(int, project.id),
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+            record = await session.get(PaneCredential, credential_id)
+            if record is None or record.project_id != project.id:
+                raise ToolExecutionError("PANE_CREDENTIAL_NOT_FOUND", "Pane credential was not found.")
+            revoked = await revoke_pane_credential_record(
+                session,
+                credential_id,
+                reason=(reason or "owner_revoked")[:200],
+            )
+            event = await append_audit_event(
+                session,
+                project_id=cast(int, project.id),
+                actor_kind="owner",
+                actor_scope_id="owner/core-credential-revoke",
+                actor_agent_id=None,
+                operation_kind="pane_credential_revoked_v1",
+                entity_type="pane_credential",
+                entity_id=credential_id,
+                payload_version="pane-credential-lifecycle-v1",
+                payload={"reason": revoked.revoke_reason},
+            )
+            await assert_route_generation(
+                session,
+                project_id=cast(int, project.id),
+                expected_state=route.state,
+                expected_generation=route.generation,
+            )
+            await session.commit()
+        await ctx.info(f"Revoked pane credential '{credential_id}'.")
+        return {
+            "credential_id": credential_id,
+            "revoked": True,
+            "revoked_ts": _iso(revoked.revoked_ts),
+            "audit_event_id": event.id,
+        }
+
     @mcp.tool(name="register_agent")
     @_instrument_tool("register_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name", project_arg="project_key")
     async def register_agent(
@@ -7116,6 +7422,74 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             token_param="registration_token",
             action="retire_agent",
         )
+
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must be persisted before retirement.")
+        async with get_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=get_settings().runtime_profile,
+                for_mutation=True,
+            )
+        if route.state == GIT_INDEPENDENT:
+            retired_at = _naive_utc()
+            async with get_immediate_session() as session:
+                transaction_route = await resolve_storage_route(
+                    session,
+                    project_id=project.id,
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+                db_agent = await session.get(Agent, agent.id)
+                if db_agent is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Agent '{agent_name}' not found.")
+                db_agent.retired_at = retired_at
+                credentials = await session.execute(
+                    select(PaneCredential).where(
+                        cast(Any, PaneCredential.project_id) == project.id,
+                        cast(Any, PaneCredential.agent_id) == agent.id,
+                        cast(Any, PaneCredential.revoked_ts).is_(None),
+                    )
+                )
+                revoked_ids: list[str] = []
+                for credential in credentials.scalars().all():
+                    await revoke_pane_credential_record(
+                        session,
+                        credential.id,
+                        reason="agent_retired",
+                        now=retired_at,
+                    )
+                    revoked_ids.append(credential.id)
+                event = await append_audit_event(
+                    session,
+                    project_id=project.id,
+                    actor_kind="agent",
+                    actor_scope_id=f"agent/{project.id}:{agent.id}",
+                    actor_agent_id=agent.id,
+                    operation_kind="agent_retired_v1",
+                    entity_type="agent",
+                    entity_id=str(agent.id),
+                    payload_version="agent-retirement-v1",
+                    payload={"revoked_pane_credential_ids": revoked_ids},
+                )
+                await assert_route_generation(
+                    session,
+                    project_id=project.id,
+                    expected_state=transaction_route.state,
+                    expected_generation=transaction_route.generation,
+                )
+                await session.commit()
+            await ctx.info(
+                f"Retired agent '{agent_name}' and revoked {len(revoked_ids)} pane credential(s)."
+            )
+            return {
+                "status": "retired",
+                "agent_name": agent_name,
+                "project_key": project_key,
+                "revoked_pane_credentials": len(revoked_ids),
+                "audit_event_id": event.id,
+            }
 
         async with get_session() as session:
             db_agent = await session.get(Agent, agent.id)

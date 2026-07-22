@@ -228,6 +228,34 @@ async def rotate_pane_credential(
     )
 
 
+async def reissue_pane_credential(
+    session: AsyncSession,
+    record: PaneCredential,
+    *,
+    agent_id: int,
+    pepper_key_id: str,
+    peppers: Mapping[str, bytes],
+) -> IssuedPaneCredential:
+    """Replace a pane secret even when its unique binding row was revoked."""
+    secret = secrets.token_bytes(_SECRET_BYTES)
+    record.agent_id = agent_id
+    record.generation += 1
+    record.pepper_key_id = pepper_key_id
+    record.secret_digest = _digest(
+        _pepper(peppers, pepper_key_id),
+        _pane_verifier_input(record.id, record.generation, secret),
+    )
+    record.revoked_ts = None
+    record.revoke_reason = ""
+    record.expires_ts = None
+    record.last_used_ts = _utcnow_naive()
+    await session.flush()
+    return IssuedPaneCredential(
+        record=record,
+        bearer=f"{record.id}.{record.generation}.{_encode_secret(secret)}",
+    )
+
+
 async def revoke_pane_credential(
     session: AsyncSession,
     credential_id: str,
