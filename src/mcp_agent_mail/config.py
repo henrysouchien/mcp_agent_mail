@@ -91,6 +91,7 @@ class StorageSettings:
     """Filesystem/Git storage configuration."""
 
     root: str
+    blob_root: str
     git_author_name: str
     git_author_email: str
     inline_image_max_bytes: int
@@ -443,6 +444,8 @@ def _build_settings() -> Settings:
     storage_settings = StorageSettings(
         # Default to a global, user-scoped archive directory outside the source tree
         root=decouple_config("STORAGE_ROOT", default="~/.mcp_agent_mail_git_mailbox_repo"),
+        # Git-independent objects must not live under the legacy archive's .git worktree.
+        blob_root=decouple_config("BLOB_STORAGE_ROOT", default="~/.mcp_agent_mail/blobs"),
         git_author_name=decouple_config("GIT_AUTHOR_NAME", default="mcp-agent"),
         git_author_email=decouple_config("GIT_AUTHOR_EMAIL", default="mcp-agent@example.com"),
         inline_image_max_bytes=_i("INLINE_IMAGE_MAX_BYTES", default=64 * 1024),
