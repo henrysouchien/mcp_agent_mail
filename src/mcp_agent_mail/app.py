@@ -5765,6 +5765,13 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         action: str,
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
+        if agent.retired_at is not None and action != "unretire_agent":
+            raise ToolExecutionError(
+                "AGENT_RETIRED",
+                f"Agent '{agent.name}' is retired and cannot authenticate for {action}.",
+                recoverable=True,
+                data={"agent_name": agent.name, "retired_at": _iso(agent.retired_at)},
+            )
         provided_token = provided_token or effective_request_pane_credential() or None
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
@@ -7415,6 +7422,78 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             token_param="registration_token",
             action="deregister_agent",
         )
+
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must be persisted before deregistration.")
+        async with get_session() as route_session:
+            route = await resolve_storage_route(
+                route_session,
+                project_id=project.id,
+                runtime_profile=get_settings().runtime_profile,
+                for_mutation=True,
+            )
+        if route.state == GIT_INDEPENDENT:
+            retired_at = _naive_utc()
+            async with get_immediate_session() as session:
+                transaction_route = await resolve_storage_route(
+                    session,
+                    project_id=project.id,
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+                db_agent = await session.get(Agent, agent.id)
+                if db_agent is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Agent '{agent_name}' not found.")
+                db_agent.contact_policy = "block_all"
+                db_agent.retired_at = retired_at
+                db_agent.task_description = (
+                    f"[DEREGISTERED at {_iso(retired_at)}] {db_agent.task_description}"
+                )
+                credentials = await session.execute(
+                    select(PaneCredential).where(
+                        cast(Any, PaneCredential.project_id) == project.id,
+                        cast(Any, PaneCredential.agent_id) == agent.id,
+                        cast(Any, PaneCredential.revoked_ts).is_(None),
+                    )
+                )
+                revoked_ids: list[str] = []
+                for credential in credentials.scalars().all():
+                    await revoke_pane_credential_record(
+                        session,
+                        credential.id,
+                        reason="agent_deregistered",
+                        now=retired_at,
+                    )
+                    revoked_ids.append(credential.id)
+                event = await append_audit_event(
+                    session,
+                    project_id=project.id,
+                    actor_kind="agent",
+                    actor_scope_id=f"agent/{project.id}:{agent.id}",
+                    actor_agent_id=agent.id,
+                    operation_kind="agent_deregistered_v1",
+                    entity_type="agent",
+                    entity_id=str(agent.id),
+                    payload_version="agent-retirement-v1",
+                    payload={"revoked_pane_credential_ids": revoked_ids},
+                )
+                await assert_route_generation(
+                    session,
+                    project_id=project.id,
+                    expected_state=transaction_route.state,
+                    expected_generation=transaction_route.generation,
+                )
+                await session.commit()
+            await ctx.info(
+                f"Deregistered agent '{agent_name}' and revoked {len(revoked_ids)} pane credential(s)."
+            )
+            return {
+                "status": "deregistered",
+                "agent_name": agent_name,
+                "project_key": project_key,
+                "revoked_pane_credentials": len(revoked_ids),
+                "audit_event_id": event.id,
+            }
 
         async with get_session() as session:
             db_agent = await session.get(Agent, agent.id)

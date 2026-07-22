@@ -208,12 +208,36 @@ async def test_owner_can_rotate_revoke_and_reissue_pane_credentials(
             },
         )
         retired = await client.call_tool(
-            "retire_agent",
+            "deregister_agent",
             {
                 "project_key": "/credential-lifecycle",
                 "agent_name": "credential-1",
             },
         )
+        with pytest.raises(Exception, match="retired"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/credential-lifecycle",
+                    "sender_name": "credential-1",
+                    "sender_token": registered.data["registration_token"],
+                    "to": ["credential-1"],
+                    "subject": "must fail",
+                    "body_md": "deregistered identities cannot send",
+                },
+            )
+        with pytest.raises(Exception, match="retired"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/credential-lifecycle",
+                    "sender_name": "credential-1",
+                    "sender_token": reissued.data["pane_credential"],
+                    "to": ["credential-1"],
+                    "subject": "must also fail",
+                    "body_md": "revoked pane identities cannot send",
+                },
+            )
 
     assert reissued.data["credential_id"] == credential_id
     assert reissued.data["generation"] == 3
