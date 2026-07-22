@@ -281,6 +281,37 @@ class BlobReference(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class IdempotencyRecord(SQLModel, table=True):
+    """Immutable terminal receipt for one authenticated mutation identity."""
+
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "scope_kind",
+            "scope_id",
+            "operation_kind",
+            "idempotency_key",
+            name="uq_idempotency_scope_operation_key",
+        ),
+        Index("idx_idempotency_project_created", "project_id", "created_ts"),
+        Index("idx_idempotency_expires", "expires_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    scope_kind: str = Field(max_length=32)
+    scope_id: str = Field(max_length=255)
+    project_id: Optional[int] = Field(default=None, foreign_key="projects.id", index=True)
+    operation_kind: str = Field(max_length=128)
+    idempotency_key: str = Field(max_length=255)
+    fingerprint_version: str = Field(max_length=64)
+    request_fingerprint: str = Field(min_length=64, max_length=64)
+    response_json: str
+    entity_type: str = Field(max_length=64)
+    entity_id: str = Field(max_length=255)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    expires_ts: datetime = Field(index=True)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
