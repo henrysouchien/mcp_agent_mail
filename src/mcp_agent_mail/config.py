@@ -561,7 +561,7 @@ def _build_settings() -> Settings:
         ack_escalation_claim_ttl_seconds=_i("ACK_ESCALATION_CLAIM_TTL_SECONDS", default=3600),
         ack_escalation_claim_exclusive=_b("ACK_ESCALATION_CLAIM_EXCLUSIVE", default=False),
         ack_escalation_claim_holder_name=decouple_config("ACK_ESCALATION_CLAIM_HOLDER_NAME", default=""),
-        tools_log_enabled=_b("TOOLS_LOG_ENABLED", default=True),
+        tools_log_enabled=_b("TOOLS_LOG_ENABLED", default=False),
         instrumentation_enabled=_b("INSTRUMENTATION_ENABLED", default=False),
         instrumentation_slow_query_ms=_i("INSTRUMENTATION_SLOW_QUERY_MS", default=250),
         log_rich_enabled=_b("LOG_RICH_ENABLED", default=True),

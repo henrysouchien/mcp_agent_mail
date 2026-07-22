@@ -11,9 +11,12 @@ caller-configurable threshold so the contact-wall stops piling up.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any, cast
 
 import pytest
 from fastmcp import Client
+from sqlalchemy import update
+from sqlmodel import select
 
 from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
@@ -61,17 +64,17 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         async with get_session() as session:
             stale_agent = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == stale_name)
+                    select(Agent).where(cast(Any, Agent.name == stale_name))
                 )
-            ).first()
+            ).scalars().first()
             assert stale_agent is not None
             stale_id = stale_agent.id
             two_days_ago = _naive_utc(
                 datetime.now(timezone.utc) - timedelta(hours=48)
             )
             await session.execute(
-                Agent.__table__.update()
-                .where(Agent.id == stale_id)
+                update(Agent)
+                .where(cast(Any, Agent.id == stale_id))
                 .values(last_active_ts=two_days_ago, retired_at=None)
             )
             await session.commit()
@@ -83,14 +86,14 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         async with get_session() as session:
             stale_after = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == stale_name)
+                    select(Agent).where(cast(Any, Agent.name == stale_name))
                 )
-            ).first()
+            ).scalars().first()
             active_after = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == active_name)
+                    select(Agent).where(cast(Any, Agent.name == active_name))
                 )
-            ).first()
+            ).scalars().first()
             assert stale_after is not None
             assert active_after is not None
             assert stale_after.retired_at is not None
@@ -116,21 +119,19 @@ async def test_sweep_is_idempotent(isolated_env):
         target_name = result.data["name"]
 
         async with get_session() as session:
-            target_id = (
-                (
-                    await session.execute(
-                        Agent.__table__.select().where(Agent.name == target_name)
-                    )
+            target = (
+                await session.execute(
+                    select(Agent).where(cast(Any, Agent.name == target_name))
                 )
-                .first()
-                .id
-            )
+            ).scalars().first()
+            assert target is not None
+            target_id = target.id
             two_days_ago = _naive_utc(
                 datetime.now(timezone.utc) - timedelta(hours=48)
             )
             await session.execute(
-                Agent.__table__.update()
-                .where(Agent.id == target_id)
+                update(Agent)
+                .where(cast(Any, Agent.id == target_id))
                 .values(last_active_ts=two_days_ago, retired_at=None)
             )
             await session.commit()

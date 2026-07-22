@@ -33,6 +33,39 @@ from rich.tree import Tree
 # and exec'd foreground runs; enable soft wrap for wide panels.
 console = Console(stderr=True, force_terminal=True, color_system="truecolor", soft_wrap=True)
 
+_REDACTED = "[REDACTED]"
+_SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "authorization",
+    "bearer_token",
+    "client_secret",
+    "oauth_code",
+    "password",
+    "private_key",
+    "refresh_token",
+    "registration_token",
+    "sender_token",
+)
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+
+
+def _redact_sensitive(data: Any) -> Any:
+    """Return a log-safe copy with credential-bearing mapping values removed."""
+    if isinstance(data, dict):
+        return {
+            key: _REDACTED if _is_sensitive_key(key) else _redact_sensitive(value)
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_redact_sensitive(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_redact_sensitive(value) for value in data)
+    return data
+
 
 @dataclass
 class ToolCallContext:
@@ -66,7 +99,7 @@ class ToolCallContext:
 
 def _safe_json_format(data: Any, max_length: int = 2000) -> str:
     """Format data as JSON with truncation."""
-    json_str = json.dumps(data, indent=2, default=str, ensure_ascii=False)
+    json_str = json.dumps(_redact_sensitive(data), indent=2, default=str, ensure_ascii=False)
     if len(json_str) > max_length:
         json_str = json_str[:max_length] + "\n... (truncated)"
     return json_str

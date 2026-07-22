@@ -13,6 +13,76 @@ from mcp_agent_mail.utils import slugify
 
 
 @pytest.mark.asyncio
+async def test_same_project_auto_allows_direct_message_without_contact_link(isolated_env, monkeypatch):
+    monkeypatch.setenv("CONTACT_ENFORCEMENT_ENABLED", "true")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        for name in ("GreenCastle", "BlueLake"):
+            await client.call_tool(
+                "register_agent",
+                {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": name},
+            )
+
+        sent = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "GreenCastle",
+                "to": ["BlueLake"],
+                "subject": "Same project auto",
+                "body_md": "same project auto agents share context",
+            },
+        )
+        deliveries = sent.data.get("deliveries") or []
+        assert deliveries and deliveries[0]["payload"]["subject"] == "Same project auto"
+
+
+@pytest.mark.asyncio
+async def test_same_project_auto_allows_new_reply_recipient(isolated_env, monkeypatch):
+    monkeypatch.setenv("CONTACT_ENFORCEMENT_ENABLED", "true")
+    with contextlib.suppress(Exception):
+        _config.clear_settings_cache()
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        for name in ("GreenCastle", "BlueLake", "PurpleBear"):
+            await client.call_tool(
+                "register_agent",
+                {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": name},
+            )
+
+        original = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Backend",
+                "sender_name": "GreenCastle",
+                "to": ["BlueLake"],
+                "subject": "Reply fanout",
+                "body_md": "initial",
+            },
+        )
+        message_id = (original.data.get("deliveries") or [])[0]["payload"]["id"]
+
+        reply = await client.call_tool(
+            "reply_message",
+            {
+                "project_key": "Backend",
+                "message_id": message_id,
+                "sender_name": "BlueLake",
+                "to": ["PurpleBear"],
+                "body_md": "adding same-project auto recipient",
+            },
+        )
+        deliveries = reply.data.get("deliveries") or []
+        assert deliveries and deliveries[0]["payload"]["subject"] == "Re: Reply fanout"
+
+
+@pytest.mark.asyncio
 async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
     # Ensure contact enforcement is enabled (it is by default, but be explicit)
     monkeypatch.setenv("CONTACT_ENFORCEMENT_ENABLED", "true")

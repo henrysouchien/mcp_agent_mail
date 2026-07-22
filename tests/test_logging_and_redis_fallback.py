@@ -8,6 +8,43 @@ from httpx import ASGITransport, AsyncClient
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.http import build_http_app
+from mcp_agent_mail.rich_logger import ToolCallContext, _safe_json_format, render_tool_call_panel
+
+
+def test_rich_tool_logging_redacts_nested_credentials() -> None:
+    secrets = {
+        "registration_token": "registration-secret",
+        "nested": {
+            "sender-token": "sender-secret",
+            "Authorization": "Bearer transport-secret",
+            "safe": "visible-value",
+        },
+        "requester_registration_token": "requester-secret",
+    }
+    ctx = ToolCallContext(
+        tool_name="send_message",
+        args=[],
+        kwargs=secrets,
+        result={"registration_token": "result-secret", "status": "ok"},
+    )
+    ctx.end_time = ctx.start_time + 0.01
+
+    rendered = render_tool_call_panel(ctx)
+    serialized_params = _safe_json_format(secrets)
+
+    for secret in (
+        "registration-secret",
+        "sender-secret",
+        "transport-secret",
+        "requester-secret",
+        "result-secret",
+    ):
+        assert secret not in rendered
+        assert secret not in serialized_params
+    assert rendered.count("[REDACTED]") >= 1
+    assert serialized_params.count("[REDACTED]") >= 4
+    assert "visible-value" in serialized_params
+    assert '"status": "ok"' in rendered
 
 
 @pytest.mark.asyncio

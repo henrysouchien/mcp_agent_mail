@@ -193,6 +193,36 @@ def _git_repo(path: str | Path, search_parent_directories: bool = True) -> Any:
             with suppress(Exception):
                 repo.close()
 
+
+def _run_git_context_command(path: str | Path, *args: str) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+            check=True,
+        )
+    except Exception:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def _read_git_context_metadata(path: str | Path) -> tuple[Optional[str], Optional[str]]:
+    branch = _run_git_context_command(path, "rev-parse", "--abbrev-ref", "HEAD")
+    root = _run_git_context_command(path, "rev-parse", "--show-toplevel")
+    worktree = Path(root).name if root else None
+    return branch, worktree
+
+
+async def _git_context_metadata(path: str | Path) -> tuple[Optional[str], Optional[str]]:
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_read_git_context_metadata, path), timeout=5.0)
+    except Exception:
+        return None, None
+
 TOOL_METRICS: defaultdict[str, dict[str, int]] = defaultdict(lambda: {"calls": 0, "errors": 0})
 TOOL_CLUSTER_MAP: dict[str, str] = {}
 TOOL_METADATA: dict[str, dict[str, Any]] = {}
@@ -1312,6 +1342,7 @@ class FileReservationStatus:
 
 
 _GLOB_MARKERS: tuple[str, ...] = ("*", "?", "[")
+_GIT_ACTIVITY_TIMEOUT_SECONDS = 2.0
 
 # Virtual namespace prefixes for non-filesystem reservations (bd-14z)
 _VIRTUAL_NS_PREFIXES: tuple[str, ...] = ("tool://", "resource://", "service://")
@@ -1415,12 +1446,29 @@ def _latest_git_activity(repo: Optional[Repo], pathspec: Optional[str]) -> Optio
     if repo is None or not pathspec:
         return None
     try:
-        commit = next(repo.iter_commits(paths=pathspec, max_count=1))
-    except StopIteration:
+        repo_root = Path(repo.working_tree_dir or "").resolve()
+        completed = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "-C",
+                str(repo_root),
+                "log",
+                "-1",
+                "--format=%ct",
+                "--",
+                pathspec,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=_GIT_ACTIVITY_TIMEOUT_SECONDS,
+            check=True,
+        )
+        committed_ts = int(completed.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError, OverflowError):
         return None
-    except Exception:
-        return None
-    return datetime.fromtimestamp(commit.committed_date, tz=timezone.utc)
+    return datetime.fromtimestamp(committed_ts, tz=timezone.utc)
 
 
 def _compute_reservation_activity(
@@ -1446,6 +1494,23 @@ def _compute_reservation_activity(
     git_pathspec = _reservation_repo_pathspec(repo, workspace, pattern) if repo is not None else None
     git_activity = _latest_git_activity(repo, git_pathspec)
     return True, fs_activity, git_activity
+
+
+async def _compute_reservation_activity_async(
+    workspace: Optional[Path],
+    repo: Optional[Repo],
+    pattern: str,
+    *,
+    recent_after: Optional[datetime],
+) -> tuple[bool, Optional[datetime], Optional[datetime]]:
+    """Run the complete filesystem and Git activity probe off the event loop."""
+    return await asyncio.to_thread(
+        _compute_reservation_activity,
+        workspace,
+        repo,
+        pattern,
+        recent_after=recent_after,
+    )
 
 
 def _project_workspace_path(project: Project) -> Optional[Path]:
@@ -1904,7 +1969,7 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
 
 def _message_receipt(message: Message) -> dict[str, Any]:
     """Return the compact durable-delivery facts needed after a write."""
-    return {
+    receipt = {
         "id": message.id,
         "project_id": message.project_id,
         "thread_id": message.thread_id,
@@ -1914,6 +1979,9 @@ def _message_receipt(message: Message) -> dict[str, Any]:
         "ack_required": message.ack_required,
         "created_ts": _iso(message.created_ts),
     }
+    if message.reply_to is not None:
+        receipt["reply_to"] = message.reply_to
+    return receipt
 
 
 def _format_cross_project_agent_address(project_slug: str, agent_name: str) -> str:
@@ -4007,6 +4075,7 @@ async def _collect_file_reservation_statuses(
     *,
     include_released: bool = False,
     now: Optional[datetime] = None,
+    include_git_activity: bool = True,
 ) -> list[FileReservationStatus]:
     if project.id is None:
         return []
@@ -4071,11 +4140,13 @@ async def _collect_file_reservation_statuses(
             read_map = {row[0]: _ensure_utc(row[1]) for row in read_result}
 
     workspace = _project_workspace_path(project)
-    repo = _open_repo_if_available(workspace) if workspace is not None else None
+    repo = _open_repo_if_available(workspace) if include_git_activity and workspace is not None else None
 
     statuses: list[FileReservationStatus] = []
     try:
-        for reservation, agent in rows:
+        for row_index, (reservation, agent) in enumerate(rows):
+            if row_index and row_index % 256 == 0:
+                await asyncio.sleep(0)
             # Orphaned reservation: agent row is gone (or never existed).
             # Treat as perpetually inactive with no mail signal so the sweeper
             # auto-releases it; tag the reasons so callers can distinguish
@@ -4097,14 +4168,13 @@ async def _collect_file_reservation_statuses(
             fs_activity: Optional[datetime] = None
             git_activity: Optional[datetime] = None
 
-            if workspace is not None:
+            if workspace is not None and reservation.released_ts is None:
                 # Offload the blocking filesystem+git probe to a thread so a
                 # broad glob reservation can never starve the event loop, and
                 # use a single glob-pathspec rev walk instead of one git fork
                 # per matched file (#240).
                 recent_after = moment - timedelta(seconds=activity_grace)
-                matched, fs_activity, git_activity = await asyncio.to_thread(
-                    _compute_reservation_activity,
+                matched, fs_activity, git_activity = await _compute_reservation_activity_async(
                     workspace,
                     repo,
                     reservation.path_pattern,
@@ -4250,7 +4320,7 @@ async def _expire_stale_file_reservations(
     if project is None:
         return []
 
-    expired_pairs: list[tuple[FileReservation, Agent]] = []
+    expired_pairs: list[tuple[FileReservation, Optional[Agent]]] = []
     # Release any entries whose TTL has already elapsed.
     # Use BEGIN IMMEDIATE so the release is immediately visible to
     # subsequent reserve calls on other connections (#130).
@@ -4278,7 +4348,12 @@ async def _expire_stale_file_reservations(
                 .values(released_ts=naive_now)  # Use naive UTC for SQLite compatibility
             )
             await session.commit()
-    statuses = await _collect_file_reservation_statuses(project, include_released=False, now=now)
+    statuses = await _collect_file_reservation_statuses(
+        project,
+        include_released=False,
+        now=now,
+        include_git_activity=False,
+    )
     stale_statuses = [status for status in statuses if status.stale and status.reservation.id is not None]
     stale_ids = [cast(int, status.reservation.id) for status in stale_statuses]
     if stale_ids:
@@ -5034,10 +5109,10 @@ async def _update_recipient_timestamp(
             .where(
                 MessageRecipient.message_id == message_id,
                 MessageRecipient.agent_id == agent.id,
-                cast(Any, field_col).is_(None),
+                field_col.is_(None),
             )
             .values({field: naive_now})
-            .returning(cast(Any, field_col))
+            .returning(field_col)
         )
         result = await session.execute(stmt)
         applied = result.first()
@@ -5130,7 +5205,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         # ctx refuses attribute assignment; multi-lookup consistency
         # degrades to "best effort" but a single lookup still works.
         with suppress(Exception):
-            ctx._mcp_agent_mail_orphan_key = orphan_key  # type: ignore[attr-defined]
+            cast(Any, ctx)._mcp_agent_mail_orphan_key = orphan_key
         return orphan_key
 
     def _prune_expired_session_bindings(now: float) -> None:
@@ -7617,9 +7692,12 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             "Recipient is not accepting messages.",
                             recoverable=True,
                         )
-                    # contacts_only or auto -> must have approved link or prior contact within TTL
+                    # Same-project "auto" agents share context; stricter contacts_only still requires a link.
+                    if rec_policy == "auto":
+                        continue
+                    # contacts_only -> must have approved link or prior contact within TTL
                     recent_ok = rec.name in recent_ok_names
-                    if rec_policy == "auto" and recent_ok:
+                    if recent_ok:
                         continue
                     # check approved AgentLink (local project)
                     if rec.id is not None and rec.id in approved_link_ids:
@@ -8854,7 +8932,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             "Recipient is not accepting messages.",
                             recoverable=True,
                         )
-                    if rec_policy == "auto" and rec.name in recent_ok_names:
+                    # Same-project "auto" agents share context; stricter contacts_only still requires a link.
+                    if rec_policy == "auto":
+                        continue
+                    if rec.name in recent_ok_names:
                         continue
                     if rec.id is not None and rec.id in approved_link_ids:
                         continue
@@ -9872,6 +9953,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 if since_dt:
                     stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
             if unread_only:
+                if viewer is None:
+                    raise RuntimeError("Authenticated viewer missing for unread topic query")
                 # Narrow to recipient rows the viewer has not marked read.
                 # The JOIN on MessageRecipient already restricts to messages
                 # where the viewer has a recipient row, so no additional
@@ -9883,7 +9966,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         cast(Any, viewer_recipient.message_id) == Message.id,
                     )
                     .where(
-                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),  # type: ignore[union-attr]
+                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),
                         cast(Any, viewer_recipient.read_ts).is_(None),
                     )
                 )
@@ -11606,23 +11689,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         granted: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
         archive = await ensure_archive(settings, project.slug)
-        ctx_branch: Optional[str] = None
-        ctx_worktree: Optional[str] = None
-        try:
-            with _git_repo(project.human_key) as repo:
-                try:
-                    ctx_branch = repo.active_branch.name
-                except Exception:
-                    try:
-                        ctx_branch = repo.git.rev_parse("--abbrev-ref", "HEAD").strip()
-                    except Exception:
-                        ctx_branch = None
-                try:
-                    ctx_worktree = Path(repo.working_tree_dir or "").name or None
-                except Exception:
-                    ctx_worktree = None
-        except Exception:
-            pass
+        ctx_branch, ctx_worktree = await _git_context_metadata(project.human_key)
         async with _archive_write_lock(archive):
             # Use BEGIN IMMEDIATE to acquire a fresh WAL snapshot, preventing
             # stale reads that cause duplicate exclusive holders (#129) and
@@ -13900,10 +13967,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             raise ValueError("Project must have an id before listing file_reservations.")
 
         await _expire_stale_file_reservations(project.id)
-        statuses = await _collect_file_reservation_statuses(project, include_released=not active_only)
+        statuses = await _collect_file_reservation_statuses(
+            project,
+            include_released=not active_only,
+            include_git_activity=False,
+        )
 
         payload: list[dict[str, Any]] = []
-        for status in statuses:
+        for status_index, status in enumerate(statuses):
+            if status_index and status_index % 256 == 0:
+                await asyncio.sleep(0)
             reservation = status.reservation
             if active_only and reservation.released_ts is not None:
                 continue

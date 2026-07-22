@@ -902,7 +902,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         if value is None:
             return default
         with contextlib.suppress(Exception):
-            return int(value)
+            return int(cast(Any, value))
         return default
 
     def _rate_limits_for(self, kind: str) -> tuple[int, int]:
@@ -1131,6 +1131,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # even when optional workers are disabled by feature flags.
 
         async def _worker_cleanup() -> None:
+            interval = max(1, int(settings.file_reservations_cleanup_interval_seconds))
+            await asyncio.sleep(interval)
             while True:
                 try:
                     await ensure_schema()
@@ -1164,11 +1166,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         )
                 except Exception:
                     pass
-                await asyncio.sleep(settings.file_reservations_cleanup_interval_seconds)
+                await asyncio.sleep(interval)
 
         async def _worker_ack_ttl() -> None:
             import datetime as _dt
 
+            interval = max(1, int(settings.ack_ttl_scan_interval_seconds))
+            await asyncio.sleep(interval)
             while True:
                 try:
                     await ensure_schema()
@@ -1310,10 +1314,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                         pass
                 except Exception:
                     pass
-                await asyncio.sleep(settings.ack_ttl_scan_interval_seconds)
+                await asyncio.sleep(interval)
 
         async def _worker_tool_metrics() -> None:
             log = structlog.get_logger("tool.metrics")
+            interval = max(5, int(settings.tool_metrics_emit_interval_seconds))
+            await asyncio.sleep(interval)
             while True:
                 try:
                     snapshot = _tool_metrics_snapshot()
@@ -1321,9 +1327,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         log.info("tool_metrics_snapshot", tools=snapshot)
                 except Exception:
                     pass
-                await asyncio.sleep(max(5, settings.tool_metrics_emit_interval_seconds))
+                await asyncio.sleep(interval)
 
         async def _worker_retention_quota() -> None:
+            interval = max(60, int(settings.retention_report_interval_seconds))
+            await asyncio.sleep(interval)
             while True:
                 with contextlib.suppress(Exception):
                     report = await _collect_retention_quota_report(settings)
@@ -1346,7 +1354,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 structlog.get_logger("maintenance").warning(
                                     "quota_inbox_exceeded", project=proj, inbox_count=cnt, limit=inbox_limit
                                 )
-                await asyncio.sleep(max(60, settings.retention_report_interval_seconds))
+                await asyncio.sleep(interval)
 
         async def _worker_fd_health() -> None:
             """Periodic file descriptor health monitor.
@@ -1424,6 +1432,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def _worker_auto_retire_stale_agents() -> None:
             log = structlog.get_logger("maintenance.auto_retire")
             interval = max(60, int(settings.auto_retire_stale_agents_interval_seconds))
+            await asyncio.sleep(interval)
             threshold = max(60, int(settings.auto_retire_stale_agents_threshold_seconds))
             while True:
                 with contextlib.suppress(Exception):

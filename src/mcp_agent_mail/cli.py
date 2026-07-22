@@ -1211,6 +1211,12 @@ def serve_http(
     ),
 ) -> None:
     """Run the MCP server over the Streamable HTTP transport."""
+    with suppress(Exception):
+        import faulthandler
+        import signal
+
+        faulthandler.register(signal.SIGUSR2, all_threads=True)
+
     settings = get_settings()
 
     # Enforce single-server ownership of the storage root (issue #123)

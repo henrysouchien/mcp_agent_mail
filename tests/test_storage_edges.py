@@ -13,9 +13,11 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastmcp import Client
+from git import Repo
 from PIL import Image
 
 from mcp_agent_mail import config as _config
@@ -756,6 +758,36 @@ async def test_commit_queue_start_restarts_done_task():
 
 
 @pytest.mark.asyncio
+async def test_commit_direct_ignores_unrelated_worktree_changes(isolated_env, tmp_path: Path) -> None:
+    """Archive commits are decided from staged target paths, not a repo-wide scan."""
+    from git import Actor, Repo
+
+    import mcp_agent_mail.storage as storage_module
+
+    settings = get_settings()
+    repo_root = tmp_path / "archive"
+    repo = Repo.init(repo_root)
+    actor = Actor(settings.storage.git_author_name, settings.storage.git_author_email)
+    target = repo_root / "target.txt"
+    unrelated = repo_root / "unrelated.txt"
+    target.write_text("original\n")
+    unrelated.write_text("original\n")
+    repo.index.add(["target.txt", "unrelated.txt"])
+    repo.index.commit("initial", author=actor, committer=actor)
+
+    target.write_text("updated\n")
+    await storage_module._commit_direct(repo_root, settings, "target update", ["target.txt"])
+    first_commit = repo.head.commit.hexsha
+    assert repo.head.commit.message == "target update"
+
+    unrelated.write_text("not staged\n")
+    await storage_module._commit_direct(repo_root, settings, "must not commit", ["target.txt"])
+
+    assert repo.head.commit.hexsha == first_commit
+    assert unrelated.read_text() == "not staged\n"
+
+
+@pytest.mark.asyncio
 async def test_commit_queue_stop_drains_pending_requests(isolated_env, monkeypatch):
     import mcp_agent_mail.storage as storage_module
 
@@ -1004,7 +1036,7 @@ async def test_archive_write_lock_releases_on_body_exception(tmp_path: Path, mon
         settings=get_settings(),
         slug="t",
         root=tmp_path,
-        repo=None,  # type: ignore[arg-type]
+        repo=Repo.init(tmp_path),
         lock_path=lock_path,
         repo_root=tmp_path,
     )
@@ -1023,15 +1055,8 @@ async def test_archive_write_lock_releases_on_body_exception(tmp_path: Path, mon
 
 
 @pytest.mark.asyncio
-async def test_doctor_check_and_repair_agree_on_aged_live_lock(tmp_path: Path, monkeypatch) -> None:
-    """doctor check (collect_lock_status) and doctor repair (heal_archive_locks) must agree (#166).
-
-    An aged lock whose owner process is still alive (the wedged-server case) was
-    flagged stale by ``collect_lock_status`` but skipped by ``heal_archive_locks``
-    ("No stale locks to heal") because repair forced ``stale_timeout=0`` whenever
-    the ``.owner.json`` sidecar was present. After reconciliation both apply the
-    same age threshold.
-    """
+async def test_doctor_check_and_repair_preserve_aged_live_lock(tmp_path: Path, monkeypatch) -> None:
+    """Doctor diagnostics must not unlink a lock owned by a live process."""
     settings = get_settings()
     root = Path(settings.storage.root).expanduser().resolve()
     proj_dir = root / "projects" / "wedged-proj"
@@ -1046,20 +1071,17 @@ async def test_doctor_check_and_repair_agree_on_aged_live_lock(tmp_path: Path, m
     # ...but owned by THIS still-alive process (the wedged-server shape).
     metadata_path.write_text(json.dumps({"pid": os.getpid(), "created_ts": aged}))
 
-    # doctor check: must flag it as stale (age-based).
+    # A slow but live archive writer must remain active rather than stale.
     status = collect_lock_status(settings, project_slug="wedged-proj")
-    flagged = [
-        lock_info for lock_info in status["locks"]
-        if lock_info.get("stale_suspected") and lock_info.get("path") == str(lock_path)
-    ]
-    assert flagged, "doctor check should flag an aged lock as stale even with a live owner"
+    matching = [lock_info for lock_info in status["locks"] if lock_info.get("path") == str(lock_path)]
+    assert len(matching) == 1
+    assert matching[0]["owner_alive"] is True
+    assert matching[0]["stale_suspected"] is False
 
-    # doctor repair: must actually heal the very same lock.
+    # Repair agrees with check and leaves the live owner's lock untouched.
     result = await heal_archive_locks(settings, project_slug="wedged-proj")
-    assert str(lock_path) in result["locks_removed"], (
-        "doctor repair must heal the aged lock that doctor check flagged (#166)"
-    )
-    assert not lock_path.exists()
+    assert str(lock_path) not in result["locks_removed"]
+    assert lock_path.exists()
 
 
 # ============================================================================
@@ -1110,6 +1132,7 @@ async def test_store_image_writes_sha256_path(isolated_env):
         )
 
         # rel_path must reference the SHA256 filename
+        assert rel_path is not None
         assert digest in rel_path, (
             f"rel_path {rel_path!r} must contain the SHA256 digest"
         )
@@ -1170,7 +1193,7 @@ async def test_legacy_sha1_blob_readable_alongside_sha256(isolated_env):
     blue_file.write_bytes(blue_bytes)
     try:
         meta, _rel_path = await _store_image(archive, blue_file, embed_policy="file")
-        new_digest = meta["sha1"]
+        new_digest = cast(str, meta["sha1"])
 
         assert len(new_digest) == 64, "fresh write must use 64-char SHA256 digest"
 

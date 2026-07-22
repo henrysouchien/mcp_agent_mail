@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import mcp_agent_mail.storage as storage_module
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.storage import (
     AsyncFileLock,
@@ -239,6 +240,76 @@ class TestConcurrentArchiveWrites:
         # All locks should have been acquired (order may vary due to asyncio scheduling)
         assert len(acquired_order) == 3
         assert set(acquired_order) == {1, 2, 3}
+
+    @pytest.mark.asyncio
+    async def test_archive_write_lock_keeps_one_mutex_while_waiters_resume(self, isolated_env):
+        """A new arrival cannot bypass waiters through a replacement mutex."""
+        settings = get_settings()
+        archive = await ensure_archive(settings, "lock-waiter-registry")
+        events: list[str] = []
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def first() -> None:
+            async with archive_write_lock(archive, timeout_seconds=10):
+                events.append("first_start")
+                first_entered.set()
+                await release_first.wait()
+                events.append("first_end")
+
+        async def follower(name: str) -> None:
+            async with archive_write_lock(archive, timeout_seconds=10):
+                events.append(f"{name}_start")
+                await asyncio.sleep(0)
+                events.append(f"{name}_end")
+
+        task1 = asyncio.create_task(first())
+        await first_entered.wait()
+        task2 = asyncio.create_task(follower("second"))
+        await asyncio.sleep(0)
+        release_first.set()
+        task3 = asyncio.create_task(follower("third"))
+        await asyncio.gather(task1, task2, task3)
+
+        assert events == [
+            "first_start",
+            "first_end",
+            "second_start",
+            "second_end",
+            "third_start",
+            "third_end",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_archive_waiter_releases_registry_reference(self, isolated_env):
+        """Cancelling a queued waiter must not leak its process-lock user count."""
+        settings = get_settings()
+        archive = await ensure_archive(settings, "lock-cancelled-waiter")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def holder() -> None:
+            async with archive_write_lock(archive, timeout_seconds=10):
+                entered.set()
+                await release.wait()
+
+        async def waiter() -> None:
+            async with archive_write_lock(archive, timeout_seconds=10):
+                pass
+
+        holder_task = asyncio.create_task(holder())
+        await entered.wait()
+        waiter_task = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        waiter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_task
+        release.set()
+        await holder_task
+
+        key = (id(asyncio.get_running_loop()), str(archive.lock_path.resolve()))
+        assert key not in storage_module._PROCESS_LOCK_USERS
+        assert key not in storage_module._PROCESS_LOCKS
 
     @pytest.mark.asyncio
     async def test_archive_write_lock_released_on_exception(self, isolated_env):
@@ -489,6 +560,22 @@ class TestAsyncFileLock:
 
         assert lock._cleanup_if_stale() is True
         assert not lock_path.exists()
+
+    def test_file_lock_does_not_clean_aged_lock_owned_by_live_process(self, tmp_path):
+        """Age alone must not unlink a lock whose owner PID is still alive."""
+        import json
+
+        lock_path = tmp_path / "live.lock"
+        lock_path.touch()
+        stale_time = time.time() - 120
+        os.utime(lock_path, (stale_time, stale_time))
+        metadata_path = tmp_path / "live.lock.owner.json"
+        metadata_path.write_text(json.dumps({"pid": os.getpid(), "created_ts": stale_time}))
+
+        lock = AsyncFileLock(lock_path, stale_timeout_seconds=1.0)
+
+        assert lock._cleanup_if_stale() is False
+        assert lock_path.exists()
 
     @pytest.mark.asyncio
     async def test_file_lock_detects_stale_lock(self, isolated_env):

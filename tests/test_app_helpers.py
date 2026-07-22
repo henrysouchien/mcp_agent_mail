@@ -92,6 +92,7 @@ def test_latest_filesystem_activity_early_exits_on_recent(tmp_path) -> None:
     )
 
     # Returned the first (recent) mtime, NOT the larger second one -> stopped early.
+    assert latest is not None
     assert latest == datetime.fromtimestamp(first_ts, tz=timezone.utc)
     assert latest < datetime.fromtimestamp(second_ts, tz=timezone.utc)
 
@@ -162,4 +163,3 @@ async def test_tool_metrics_resource_populates_after_calls(isolated_env):
         assert metrics_blocks and metrics_blocks[0].text
         # the text is JSON; ensure tools list contains health_check
         assert "health_check" in metrics_blocks[0].text
-

@@ -398,6 +398,7 @@ class ProjectArchive:
 
 _PROCESS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 _PROCESS_LOCK_OWNERS: dict[tuple[int, str], int] = {}
+_PROCESS_LOCK_USERS: dict[tuple[int, str], int] = {}
 
 # ---------------------------------------------------------------------------
 # Lock-FD telemetry: track active AsyncFileLock instances for leak detection
@@ -857,6 +858,8 @@ class AsyncFileLock:
         self._loop_key: tuple[int, str] | None = None
         self._process_lock: asyncio.Lock | None = None
         self._process_lock_held = False
+        self._process_lock_registered = False
+        self._process_lock_owner_id: int | None = None
         # Register for telemetry
         with _LOCK_INSTANCES_GUARD:
             _ACTIVE_LOCK_INSTANCES[id(self)] = self
@@ -953,8 +956,16 @@ class AsyncFileLock:
         if owner_id == current_task_id:
             raise RuntimeError(f"Re-entrant AsyncFileLock acquisition detected for {self._path}")
         self._process_lock = process_lock
-        await self._process_lock.acquire()
+        _PROCESS_LOCK_USERS[self._loop_key] = _PROCESS_LOCK_USERS.get(self._loop_key, 0) + 1
+        self._process_lock_registered = True
+        try:
+            await self._process_lock.acquire()
+        except BaseException:
+            self._unregister_process_lock()
+            self._process_lock = None
+            raise
         self._process_lock_held = True
+        self._process_lock_owner_id = current_task_id
         _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
         try:
             total_timeout = self._timeout if self._timeout > 0 else 60.0
@@ -1067,17 +1078,15 @@ class AsyncFileLock:
                         with contextlib.suppress(Exception):
                             await task
 
-            if self._loop_key is not None:
+            if (
+                self._loop_key is not None
+                and _PROCESS_LOCK_OWNERS.get(self._loop_key) == self._process_lock_owner_id
+            ):
                 _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
             if self._process_lock_held and self._process_lock:
                 self._process_lock.release()
                 self._process_lock_held = False
-            if (
-                self._loop_key is not None
-                and self._process_lock
-                and not self._process_lock.locked()
-            ):
-                _PROCESS_LOCKS.pop(self._loop_key, None)
+            self._unregister_process_lock()
             self._process_lock = None
             raise
 
@@ -1117,11 +1126,17 @@ class AsyncFileLock:
             with contextlib.suppress(Exception):
                 age = now - self._path.stat().st_mtime
 
-        # Lock is stale if owner metadata proves the owner is gone OR if the
-        # lock file itself has aged beyond the configured stale timeout.
-        is_stale = False
-        if owner_alive is False or (self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout):
-            is_stale = True
+        # Never unlink a lock owned by a live process. Long archive commits can
+        # legitimately exceed the age threshold under load; deleting their
+        # SoftFileLock path creates a new inode that a second writer can acquire,
+        # defeating mutual exclusion. Age is a fallback only when no owner PID
+        # is available; a provably dead owner remains immediately recoverable.
+        is_stale = owner_alive is False or (
+            owner_alive is None
+            and self._stale_timeout > 0
+            and isinstance(age, (int, float))
+            and age >= self._stale_timeout
+        )
 
         if not is_stale:
             return False
@@ -1140,6 +1155,19 @@ class AsyncFileLock:
         }
         self._metadata_path.write_text(json.dumps(payload), encoding="utf-8")
         return None
+
+    def _unregister_process_lock(self) -> None:
+        """Drop this user's registry reference without stranding queued waiters."""
+        if not self._process_lock_registered or self._loop_key is None:
+            return
+        users = _PROCESS_LOCK_USERS.get(self._loop_key, 0) - 1
+        if users <= 0:
+            _PROCESS_LOCK_USERS.pop(self._loop_key, None)
+            if _PROCESS_LOCKS.get(self._loop_key) is self._process_lock:
+                _PROCESS_LOCKS.pop(self._loop_key, None)
+        else:
+            _PROCESS_LOCK_USERS[self._loop_key] = users
+        self._process_lock_registered = False
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
         if self._held:
@@ -1176,18 +1204,17 @@ class AsyncFileLock:
             self._held = False
 
         # Clean up process-level locks
-        if self._loop_key is not None:
+        if (
+            self._loop_key is not None
+            and _PROCESS_LOCK_OWNERS.get(self._loop_key) == self._process_lock_owner_id
+        ):
             _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
         if self._process_lock_held and self._process_lock:
             self._process_lock.release()
             self._process_lock_held = False
-        if (
-            self._loop_key is not None
-            and self._process_lock
-            and not self._process_lock.locked()
-        ):
-            _PROCESS_LOCKS.pop(self._loop_key, None)
+        self._unregister_process_lock()
         self._process_lock = None
+        self._process_lock_owner_id = None
         self._loop_key = None
         return None
 
@@ -1393,11 +1420,14 @@ def collect_lock_status(settings: Settings, project_slug: str | None = None) -> 
             stale_threshold = AsyncFileLock(lock_path)._stale_timeout
             info["stale_timeout_seconds"] = stale_threshold
             age_val = info.get("age_seconds")
-            # Lock is stale if owner metadata proves the owner is gone OR if the
-            # lock file age exceeds the configured stale timeout.
-            is_stale = False
-            if owner_alive is False or (stale_threshold > 0 and isinstance(age_val, (int, float)) and age_val >= stale_threshold):
-                is_stale = True
+            # A live owner is authoritative. Age is only a fallback for locks
+            # whose owner cannot be identified.
+            is_stale = owner_alive is False or (
+                owner_alive is None
+                and stale_threshold > 0
+                and isinstance(age_val, (int, float))
+                and age_val >= stale_threshold
+            )
             info["stale_suspected"] = is_stale
 
             summary["total"] += 1
@@ -2144,7 +2174,18 @@ async def _commit_direct(
 
     def _perform_commit(target_repo: Repo) -> None:
         target_repo.index.add(rel_paths)
-        if target_repo.is_dirty(index=True, working_tree=True):
+        # Only the explicitly staged archive paths can make this commit
+        # necessary. ``Repo.is_dirty(working_tree=True)`` scans the entire
+        # shared archive (tens of thousands of files in a busy fleet) and also
+        # treats unrelated working-tree changes as a reason to create a commit.
+        # Comparing the index to HEAD with a pathspec preserves the audit
+        # semantics while avoiding that global worktree walk.
+        has_staged_changes = (
+            bool(target_repo.index.diff("HEAD", paths=list(rel_paths)))
+            if target_repo.head.is_valid()
+            else bool(target_repo.index.entries)
+        )
+        if has_staged_changes:
             # Append commit trailers with Agent and optional Thread if present in message text
             trailers: list[str] = []
             # Extract simple Agent/Thread heuristics from the message subject line
@@ -2801,7 +2842,9 @@ async def get_file_content(
             try:
                 return str(stream.read().decode("utf-8", errors="replace"))
             finally:
-                stream.close()
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    close_stream()
         except KeyError:
             return None
 
