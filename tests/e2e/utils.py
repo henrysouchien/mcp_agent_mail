@@ -125,12 +125,13 @@ def diff_payload(expected: Any, actual: Any, *, path: str = "") -> list[str]:
     if isinstance(expected, dict):
         expected_keys = set(expected.keys())
         actual_keys = set(actual.keys())
-        for key in sorted(expected_keys - actual_keys):
+        for key in sorted(expected_keys - actual_keys, key=str):
             diffs.append(f"{path}.{key}: missing in actual")
-        for key in sorted(actual_keys - expected_keys):
+        for key in sorted(actual_keys - expected_keys, key=str):
             diffs.append(f"{path}.{key}: unexpected in actual")
-        for key in sorted(expected_keys & actual_keys):
-            diffs.extend(diff_payload(expected[key], actual[key], path=f"{path}.{key}" if path else key))
+        for key in sorted(expected_keys & actual_keys, key=str):
+            key_path = f"{path}.{key}" if path else str(key)
+            diffs.extend(diff_payload(expected[key], actual[key], path=key_path))
         return diffs
     if isinstance(expected, list):
         if len(expected) != len(actual):

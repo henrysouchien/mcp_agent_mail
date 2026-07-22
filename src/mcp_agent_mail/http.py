@@ -2721,11 +2721,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     item.update(sender_meta)
                     messages.append(item)
 
+            total_agents = sum(
+                value
+                for project_data in projects_data
+                if isinstance((value := project_data.get("agent_count")), int)
+            )
             return await _render(
                 "mail_unified_inbox.html",
                 projects=projects_data,
                 messages=messages,
-                total_agents=sum(p["agent_count"] for p in projects_data),
+                total_agents=total_agents,
                 total_messages=len(messages),
                 filter_importance=filter_importance or "",
             )
