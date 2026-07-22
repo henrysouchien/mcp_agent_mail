@@ -938,7 +938,9 @@ def _setup_fts(connection: Any) -> None:
     for migration_sql in [
         "ALTER TABLE agents ADD COLUMN retired_at DATETIME DEFAULT NULL",
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
+        "ALTER TABLE projects ADD COLUMN namespace_kind VARCHAR(32) DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE window_identities ADD COLUMN agent_id INTEGER DEFAULT NULL REFERENCES agents(id)",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
         # #188: persist the direct parent→child reply edge so replies survive a
         # round-trip through the DB (previously reply_to lived only in the
@@ -952,6 +954,12 @@ def _setup_fts(connection: Any) -> None:
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
+        "CREATE INDEX IF NOT EXISTS ix_projects_namespace_kind ON projects (namespace_kind)",
+        "CREATE INDEX IF NOT EXISTS ix_window_identities_agent_id ON window_identities (agent_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_bindings_active_authority "
+        "ON runtime_bindings (authority_kind, authority_id) WHERE state != 'ended'",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_bindings_active_route "
+        "ON runtime_bindings (host_id, tmux_server_id, pane_id) WHERE state != 'ended'",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
     ]:

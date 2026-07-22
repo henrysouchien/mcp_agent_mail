@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import mimetypes
+import ntpath
 import os
 import re
 import secrets
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, AsyncContextManager, Callable, Optional, Protocol, cast
 from urllib.parse import parse_qsl
 import uuid
@@ -95,6 +96,7 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    RuntimeBinding,
     WindowIdentity,
 )
 from .routing import (
@@ -197,12 +199,12 @@ def effective_request_pane_credential() -> str:
     return (_request_pane_credential.get("") or "").strip()
 
 
-def _require_core_owner(settings: Settings, provided_token: str | None) -> None:
+def _require_owner(settings: Settings, provided_token: str | None) -> None:
     expected = settings.credentials.owner_token
     if not expected:
         raise ToolExecutionError(
             "CORE_OWNER_AUTHORITY_UNCONFIGURED",
-            "Core owner authority is not configured; set CORE_OWNER_TOKEN before managing core projects.",
+            "Owner authority is not configured; set CORE_OWNER_TOKEN before performing owner-managed operations.",
             recoverable=False,
         )
     if not provided_token or not hmac.compare_digest(provided_token, expected):
@@ -211,6 +213,10 @@ def _require_core_owner(settings: Settings, provided_token: str | None) -> None:
             "A valid owner_token is required for this core management operation.",
             recoverable=True,
         )
+
+
+def _require_core_owner(settings: Settings, provided_token: str | None) -> None:
+    _require_owner(settings, provided_token)
 
 
 class _FastMCPToolGetter(Protocol):
@@ -2168,7 +2174,10 @@ def _project_to_dict(project: Project) -> dict[str, Any]:
         "slug": project.slug,
         "human_key": project.human_key,
         "created_at": _iso(project.created_at),
+        "namespace_kind": project.namespace_kind or "legacy_unclassified",
     }
+    if project.namespace_kind is None:
+        d["hygiene_warnings"] = ["legacy_unclassified_project_namespace"]
     if getattr(project, "archived_at", None) is not None:
         d["archived_at"] = _iso(project.archived_at)
     return d
@@ -2901,17 +2910,94 @@ def _resolve_project_identity(
 
 def _normalize_project_human_key(human_key: str) -> str:
     # Collapse redundant separators and ".." segments without following symlinks.
+    if PureWindowsPath(human_key).is_absolute():
+        return ntpath.normpath(human_key)
     return os.path.normpath(human_key)
 
 
-async def _ensure_project(human_key: str) -> Project:
+_PROJECT_NAMESPACE_KINDS = frozenset({"workspace", "child", "opaque"})
+_EMAIL_SHAPED_PROJECT_KEY = re.compile(r"^[^/@\s]+@[^/@\s]+\.[^/@\s]+$")
+
+
+def _validate_new_project_key(human_key: str, namespace_kind: str) -> tuple[str, str]:
+    raw_key = human_key.strip()
+    normalized_kind = namespace_kind.strip().lower()
+    if normalized_kind not in _PROJECT_NAMESPACE_KINDS:
+        raise ValueError(
+            f"namespace_kind must be one of {sorted(_PROJECT_NAMESPACE_KINDS)}, got {namespace_kind!r}."
+        )
+    if not raw_key:
+        raise ValueError("human_key must not be blank.")
+    if _EMAIL_SHAPED_PROJECT_KEY.fullmatch(raw_key):
+        raise ValueError("human_key must not be an email-shaped identifier.")
+    if normalized_kind == "opaque":
+        if "/" in raw_key or "\\" in raw_key:
+            raise ValueError("opaque project namespaces must not masquerade as filesystem paths.")
+        return raw_key, normalized_kind
+    if not (Path(raw_key).is_absolute() or PureWindowsPath(raw_key).is_absolute()):
+        raise ValueError(
+            "human_key must be an absolute path-like project key for workspace or child namespaces."
+        )
+    return _normalize_project_human_key(raw_key), normalized_kind
+
+
+async def _find_existing_project_for_creation(human_key: str) -> Project | None:
+    """Resolve existing exact legacy keys/slugs before strict creation validation."""
     await ensure_schema()
+    raw_key = human_key.strip()
+    if not raw_key:
+        return None
+    normalized_key = _normalize_project_human_key(raw_key)
+    async with get_session() as session:
+        result = await session.execute(
+            select(Project).where(
+                or_(
+                    Project.human_key == raw_key,
+                    Project.human_key == normalized_key,
+                    Project.slug == raw_key,
+                )
+            )
+        )
+        return result.scalars().first()
+
+
+async def _append_project_creation_event(
+    session: Any,
+    project: Project,
+    *,
+    namespace_kind: str,
+) -> None:
+    if project.id is None:
+        raise RuntimeError("Project id was not allocated")
+    await append_audit_event(
+        session,
+        project_id=project.id,
+        actor_kind="owner" if namespace_kind == "opaque" else "system",
+        actor_scope_id=f"project-namespace/{namespace_kind}",
+        actor_agent_id=None,
+        operation_kind="project_created_v2",
+        entity_type="project",
+        entity_id=str(project.id),
+        payload_version="project-created-v2",
+        payload={
+            "human_key": project.human_key,
+            "slug": project.slug,
+            "namespace_kind": namespace_kind,
+        },
+    )
+
+
+async def _ensure_project(human_key: str, *, namespace_kind: str = "workspace") -> Project:
+    await ensure_schema()
+    existing = await _find_existing_project_for_creation(human_key)
+    if existing is not None:
+        return existing
     # Normalize the path (collapse //, .., trailing slashes) WITHOUT following
     # symlinks so that distinct user-visible paths keep distinct project identities.
     # Using os.path.normpath instead of Path.resolve() — the latter calls
     # realpath() which follows symlinks and can collapse unrelated projects
     # onto the same DB row (see GitHub issue #126).
-    human_key = _normalize_project_human_key(human_key)
+    human_key, namespace_kind = _validate_new_project_key(human_key, namespace_kind)
     slug = _compute_project_slug(human_key)
     if get_settings().runtime_profile == "database":
         # Serialize the read/create pair once.  The former retry loop could
@@ -2921,8 +3007,14 @@ async def _ensure_project(human_key: str) -> Project:
             project = result.scalars().first()
             if project is not None:
                 return project
-            project = Project(slug=slug, human_key=human_key)
+            project = Project(slug=slug, human_key=human_key, namespace_kind=namespace_kind)
             session.add(project)
+            await session.flush()
+            await _append_project_creation_event(
+                session,
+                project,
+                namespace_kind=namespace_kind,
+            )
             await session.commit()
             await session.refresh(project)
             return project
@@ -2933,9 +3025,15 @@ async def _ensure_project(human_key: str) -> Project:
                 project = result.scalars().first()
                 if project:
                     return project
-                project = Project(slug=slug, human_key=human_key)
+                project = Project(slug=slug, human_key=human_key, namespace_kind=namespace_kind)
                 session.add(project)
                 try:
+                    await session.flush()
+                    await _append_project_creation_event(
+                        session,
+                        project,
+                        namespace_kind=namespace_kind,
+                    )
                     await session.commit()
                 except IntegrityError:
                     # Concurrent ensure_project: another caller created the row. Treat as idempotent.
@@ -2957,10 +3055,26 @@ async def _ensure_project(human_key: str) -> Project:
     raise RuntimeError("ensure_project retry loop exited unexpectedly")
 
 
-async def _ensure_git_independent_project(human_key: str) -> Project:
+async def _ensure_git_independent_project(
+    human_key: str,
+    *,
+    namespace_kind: str = "workspace",
+) -> Project:
     """Create a core project with its baseline and route in one transaction."""
     await ensure_schema()
-    normalized_key = _normalize_project_human_key(human_key)
+    existing = await _find_existing_project_for_creation(human_key)
+    if existing is not None:
+        if existing.id is None:
+            raise RuntimeError("Existing project has no durable identity")
+        async with get_immediate_session() as session:
+            await resolve_storage_route(
+                session,
+                project_id=existing.id,
+                runtime_profile="core",
+                for_mutation=False,
+            )
+        return existing
+    normalized_key, namespace_kind = _validate_new_project_key(human_key, namespace_kind)
     slug = _compute_project_slug(normalized_key)
     async with get_immediate_session() as session:
         result = await session.execute(select(Project).where(Project.slug == slug))
@@ -2976,7 +3090,11 @@ async def _ensure_git_independent_project(human_key: str) -> Project:
             )
             return project
 
-        project = Project(slug=slug, human_key=normalized_key)
+        project = Project(
+            slug=slug,
+            human_key=normalized_key,
+            namespace_kind=namespace_kind,
+        )
         session.add(project)
         await session.flush()
         if project.id is None:
@@ -2987,11 +3105,15 @@ async def _ensure_git_independent_project(human_key: str) -> Project:
             actor_kind="system",
             actor_scope_id="system/core-project-bootstrap",
             actor_agent_id=None,
-            operation_kind="project_created_v1",
+            operation_kind="project_created_v2",
             entity_type="project",
             entity_id=str(project.id),
-            payload_version="project-created-v1",
-            payload={"human_key": normalized_key, "slug": slug},
+            payload_version="project-created-v2",
+            payload={
+                "human_key": normalized_key,
+                "slug": slug,
+                "namespace_kind": namespace_kind,
+            },
         )
         await session.flush()
         if baseline.id is None:
@@ -3751,7 +3873,7 @@ async def _get_window_identity(
 async def _create_window_identity(
     project: Project,
     window_uuid: str,
-    display_name: str,
+    agent: Agent,
     ttl_days: int = 30,
 ) -> WindowIdentity:
     """Create a new window identity record.
@@ -3760,16 +3882,19 @@ async def _create_window_identity(
     (project_id, window_uuid) first, we catch the IntegrityError and return
     the existing record instead of crashing.
     """
-    if project.id is None:
-        raise ValueError("Project must have an id before creating window identities.")
+    if project.id is None or agent.id is None:
+        raise ValueError("Project and agent must have ids before creating window identities.")
+    if agent.project_id != project.id:
+        raise ValueError("Window identity agent must belong to the same project.")
     await ensure_schema()
     now = _naive_utc()
     expires = now + timedelta(days=ttl_days)
     async with get_session() as session:
         identity = WindowIdentity(
             project_id=project.id,
+            agent_id=agent.id,
             window_uuid=window_uuid,
-            display_name=display_name,
+            display_name=agent.name,
             created_ts=now,
             last_active_ts=now,
             expires_ts=expires,
@@ -3790,6 +3915,46 @@ async def _create_window_identity(
             if existing is not None:
                 return existing
             raise  # Should not happen, but don't swallow unexpected errors
+
+
+async def _resolve_window_identity_agent(
+    project: Project,
+    identity: WindowIdentity,
+) -> Agent | None:
+    """Resolve a window authority to one immutable same-project principal.
+
+    Pre-upgrade rows are enrolled lazily when their exact same-project display
+    name still exists.  A missing or cross-project target is an authority
+    orphan; callers must fail closed and require authenticated repair.
+    """
+    if project.id is None or identity.project_id != project.id:
+        return None
+    if identity.agent_id is not None:
+        try:
+            agent = await _get_agent_by_id(project, identity.agent_id)
+        except NoResultFound:
+            return None
+        return agent if agent.project_id == project.id else None
+
+    try:
+        legacy_agent = await _get_agent(project, identity.display_name)
+    except NoResultFound:
+        return None
+    if legacy_agent.id is None:
+        return None
+
+    async with get_immediate_session() as session:
+        db_identity = await session.get(WindowIdentity, identity.id)
+        if db_identity is None or db_identity.project_id != project.id:
+            return None
+        if db_identity.agent_id is None:
+            db_identity.agent_id = legacy_agent.id
+            session.add(db_identity)
+            await session.commit()
+            identity.agent_id = legacy_agent.id
+        elif db_identity.agent_id != legacy_agent.id:
+            return None
+    return legacy_agent
 
 
 async def _touch_window_identity(
@@ -4008,8 +4173,16 @@ async def _get_or_create_agent(
         else:
             window_identity = await _get_window_identity(project, window_uuid)
             if window_identity:
-                # Priority 2: existing window identity -> reuse its display_name
-                desired_name = window_identity.display_name
+                # Priority 2: existing authority -> reuse its immutable agent.
+                bound_agent = await _resolve_window_identity_agent(project, window_identity)
+                if bound_agent is None:
+                    raise ToolExecutionError(
+                        "AUTHORITY_ORPHANED",
+                        "The persisted window authority no longer resolves to an agent in this project; authenticated repair is required.",
+                        recoverable=True,
+                        data={"project_key": project.human_key, "window_uuid": window_uuid},
+                    )
+                desired_name = bound_agent.name
                 explicit_name_used = True  # treat as explicit to avoid collision retries
                 if not database_authoritative:
                     await _touch_window_identity(window_identity, ttl_days)
@@ -4020,10 +4193,6 @@ async def _get_or_create_agent(
                 desired_name = await _generate_unique_agent_name(
                     project, settings, None, use_archive=not database_authoritative
                 )
-                if not database_authoritative:
-                    window_identity = await _create_window_identity(
-                        project, window_uuid, desired_name, ttl_days,
-                    )
     else:
         # Priority 4: no name, no window ID -> auto-generate
         desired_name = await _generate_unique_agent_name(
@@ -4075,6 +4244,15 @@ async def _get_or_create_agent(
                         },
                     )
                 desired_name = transaction_window_identity.display_name
+                if transaction_window_identity.agent_id is not None:
+                    bound_agent = await session.get(Agent, transaction_window_identity.agent_id)
+                    if bound_agent is None or bound_agent.project_id != project.id:
+                        raise ToolExecutionError(
+                            "AUTHORITY_ORPHANED",
+                            "The persisted window authority no longer resolves to an agent in this project; authenticated repair is required.",
+                            recoverable=True,
+                        )
+                    desired_name = bound_agent.name
                 explicit_name_used = True
                 transaction_window_identity.last_active_ts = now
                 minimum_expiry = now + timedelta(days=ttl_days)
@@ -4109,6 +4287,7 @@ async def _get_or_create_agent(
                     now = _naive_utc()
                     transaction_window_identity = WindowIdentity(
                         project_id=project.id,
+                        agent_id=agent.id,
                         window_uuid=window_uuid,
                         display_name=agent.name,
                         created_ts=now,
@@ -4153,10 +4332,12 @@ async def _get_or_create_agent(
             session.add(candidate)
             try:
                 if database_authoritative:
+                    await session.flush()
                     if valid_window_uuid and transaction_window_identity is None:
                         now = _naive_utc()
                         transaction_window_identity = WindowIdentity(
                             project_id=project.id,
+                            agent_id=candidate.id,
                             window_uuid=window_uuid,
                             display_name=candidate.name,
                             created_ts=now,
@@ -4165,7 +4346,6 @@ async def _get_or_create_agent(
                         )
                         session.add(transaction_window_identity)
                         window_identity = transaction_window_identity
-                    await session.flush()
                     await append_audit_event(
                         session,
                         project_id=project.id,
@@ -4249,9 +4429,10 @@ async def _get_or_create_agent(
         and window_uuid
         and _validate_window_uuid(window_uuid)
         and window_identity is None
-        and explicit_name_used
     ):
-        # Explicit name was used with a window UUID — look up / create association
+        # Persist the UUID only after the immutable agent row exists.  This
+        # covers both explicit and generated names without a name-only authority
+        # interval.
         window_identity = await _get_window_identity(
             project,
             window_uuid,
@@ -4259,7 +4440,7 @@ async def _get_or_create_agent(
         )
         if window_identity is None:
             window_identity = await _create_window_identity(
-                project, window_uuid, agent.name, ttl_days,
+                project, window_uuid, agent, ttl_days,
             )
         else:
             await _touch_window_identity(window_identity, ttl_days)
@@ -6022,9 +6203,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             include_expired=True,
         )
         if window_identity is None:
-            window_identity = await _create_window_identity(project, window_uuid, agent.name, ttl_days)
+            window_identity = await _create_window_identity(project, window_uuid, agent, ttl_days)
 
-        if window_identity.display_name != agent.name:
+        bound_agent = await _resolve_window_identity_agent(project, window_identity)
+        if bound_agent is not None and bound_agent.id != agent.id:
             await _ctx_info_safe(
                 ctx,
                 (
@@ -6033,6 +6215,20 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 ),
             )
             return False
+
+        if bound_agent is None:
+            if window_identity.id is None or agent.id is None:
+                return False
+            async with get_immediate_session() as session:
+                db_identity = await session.get(WindowIdentity, window_identity.id)
+                if db_identity is None:
+                    return False
+                db_identity.agent_id = agent.id
+                db_identity.display_name = agent.name
+                session.add(db_identity)
+                await session.commit()
+            window_identity.agent_id = agent.id
+            window_identity.display_name = agent.name
 
         await _touch_window_identity(window_identity, ttl_days)
         await _ctx_info_safe(
@@ -6110,11 +6306,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         identity = await _get_window_identity(project, window_uuid)
         if identity is None:
             return None
-        if expected_name is not None and identity.display_name.casefold() != expected_name.casefold():
+        agent = await _resolve_window_identity_agent(project, identity)
+        if agent is None:
             return None
-        try:
-            agent = await _get_agent(project, identity.display_name)
-        except NoResultFound:
+        if expected_name is not None and agent.name.casefold() != expected_name.casefold():
             return None
         if agent.retired_at is None:
             return agent
@@ -6164,7 +6359,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             if (
                 live_binding is None
                 or db_agent is None
-                or live_binding.display_name.casefold() != agent.name.casefold()
+                or live_binding.agent_id != agent.id
             ):
                 return _require_active_agent(agent, action)
             explicit_retirement = await recovery_session.scalar(
@@ -7187,6 +7382,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
     async def ensure_project(
         ctx: Context,
         human_key: str,
+        namespace_kind: str = "workspace",
         identity_mode: Optional[str] = None,
         owner_token: Optional[str] = None,
         format: Optional[str] = None,
@@ -7260,26 +7456,26 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         - Safe to call multiple times. If the project already exists, the existing
           record is returned and the archive is ensured on disk (no destructive changes).
         """
-        # Validate that human_key is an absolute path-like project key (cross-platform).
-        # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
-        if not Path(human_key).is_absolute():
-            raise ValueError(
-                f"human_key must be an absolute path-like project key, got: '{human_key}'. "
-                "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
-                "or 'C:\\projects\\backend' on Windows)."
-            )
-
         await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
+        normalized_namespace_kind = namespace_kind.strip().lower()
+        if normalized_namespace_kind == "opaque":
+            _require_owner(settings, owner_token)
         if settings.runtime_profile == "core":
             _require_core_owner(settings, owner_token)
-            project = await _ensure_git_independent_project(human_key)
+            project = await _ensure_git_independent_project(
+                human_key,
+                namespace_kind=normalized_namespace_kind,
+            )
         else:
-            project = await _ensure_project(human_key)
+            project = await _ensure_project(
+                human_key,
+                namespace_kind=normalized_namespace_kind,
+            )
             if settings.runtime_profile in {"legacy", "migration"}:
                 await ensure_archive(settings, project.slug)
         payload = _project_to_dict(project)
         # Worktree identity metadata is opt-in to keep default calls lightweight and stable.
-        if settings.worktrees_enabled:
+        if settings.worktrees_enabled and project.namespace_kind != "opaque":
             identity_payload = _resolve_project_identity(human_key, identity_mode=identity_mode)
             payload["identity"] = identity_payload
             for key in (
@@ -8932,6 +9128,470 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             # follow-up calls can authenticate without ever surfacing it.
             result["registration_token_returned"] = False
         return result
+
+    async def _runtime_authority_for_agent(
+        project: Project,
+        agent: Agent,
+    ) -> tuple[str, str] | None:
+        """Return the active profile authority surrogate, never its bearer."""
+        if project.id is None or agent.id is None:
+            return None
+        if settings.runtime_profile != "core":
+            window_uuid = effective_window_identity_uuid(settings)
+            if not window_uuid or not _validate_window_uuid(window_uuid):
+                return None
+            identity = await _get_window_identity(project, window_uuid)
+            if identity is None or identity.id is None:
+                return None
+            bound_agent = await _resolve_window_identity_agent(project, identity)
+            if bound_agent is None or bound_agent.id != agent.id:
+                return None
+            return "window_identity", str(identity.id)
+
+        window_uuid = effective_window_identity_uuid(settings)
+        if not window_uuid:
+            return None
+        now = _naive_utc()
+        async with get_session() as session:
+            result = await session.execute(
+                select(PaneCredential).where(
+                    cast(Any, PaneCredential.project_id) == project.id,
+                    cast(Any, PaneCredential.agent_id) == agent.id,
+                    cast(Any, PaneCredential.window_uuid) == window_uuid,
+                    cast(Any, PaneCredential.revoked_ts).is_(None),
+                    _sa_or(
+                        cast(Any, PaneCredential.expires_ts).is_(None),
+                        cast(Any, PaneCredential.expires_ts) > now,
+                    ),
+                )
+            )
+            pane = result.scalar_one_or_none()
+        return ("pane_credential", pane.id) if pane is not None else None
+
+    async def _active_runtime_binding(
+        authority_kind: str,
+        authority_id: str,
+    ) -> RuntimeBinding | None:
+        async with get_session() as session:
+            result = await session.execute(
+                select(RuntimeBinding)
+                .where(
+                    cast(Any, RuntimeBinding.authority_kind) == authority_kind,
+                    cast(Any, RuntimeBinding.authority_id) == authority_id,
+                    cast(Any, RuntimeBinding.state) != "ended",
+                )
+                .order_by(cast(Any, RuntimeBinding.generation).desc())
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
+    def _runtime_binding_payload(binding: RuntimeBinding) -> dict[str, Any]:
+        return {
+            "runtime_session_id": binding.runtime_session_id,
+            "pane_incarnation_id": binding.pane_incarnation_id,
+            "program": binding.program,
+            "model": binding.model,
+            "process_started_ts": _iso(binding.process_started_ts),
+            "state": binding.state,
+            "last_heartbeat_ts": _iso(binding.last_heartbeat_ts),
+            "generation": binding.generation,
+        }
+
+    @mcp.tool(name="identity_status")
+    @_instrument_tool(
+        "identity_status",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity"},
+        project_arg="project_key",
+        complexity="low",
+    )
+    async def identity_status(
+        ctx: Context,
+        project_key: str,
+        agent_name: Optional[str] = None,
+        registration_token: Optional[str] = None,
+        host_id: Optional[str] = None,
+        tmux_server_id: Optional[str] = None,
+        pane_id: Optional[str] = None,
+        route_generation: Optional[int] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Report coherent server authority, runtime incarnation, and route state.
+
+        Route fields are caller-observed metadata used only for exact read-back
+        comparison.  No bearer, token, secret, authorization header, or raw
+        environment value is returned.
+        """
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ValueError("Project must be persisted before checking identity status.")
+
+        agent: Agent | None = None
+        authority_status = "missing"
+        authority: tuple[str, str] | None = None
+        if agent_name is not None:
+            agent = await _authenticate_agent(
+                ctx,
+                project,
+                agent_name,
+                registration_token,
+                token_param="registration_token",
+                action="identity_status",
+            )
+            authority = await _runtime_authority_for_agent(project, agent)
+            authority_status = "verified" if authority is not None else "missing"
+        elif settings.runtime_profile != "core":
+            window_uuid = effective_window_identity_uuid(settings)
+            identity = (
+                await _get_window_identity(project, window_uuid)
+                if window_uuid and _validate_window_uuid(window_uuid)
+                else None
+            )
+            if identity is not None:
+                agent = await _resolve_window_identity_agent(project, identity)
+                if agent is None:
+                    authority_status = "orphaned"
+                elif identity.id is not None:
+                    authority = ("window_identity", str(identity.id))
+                    authority_status = "verified"
+
+        overall = "authority_missing"
+        runtime_payload: dict[str, Any] | None = None
+        route_payload: dict[str, Any] = {"status": "missing"}
+        generation: int | None = None
+        if authority_status == "orphaned":
+            overall = "authority_orphaned"
+        elif authority is not None and agent is not None:
+            binding = await _active_runtime_binding(*authority)
+            if binding is None:
+                overall = "runtime_missing"
+            else:
+                generation = binding.generation
+                runtime_payload = _runtime_binding_payload(binding)
+                route_payload = {
+                    "host_id": binding.host_id,
+                    "tmux_server_id": binding.tmux_server_id,
+                    "pane_id": binding.pane_id,
+                    "generation": binding.generation,
+                    "status": "unverified",
+                }
+                supplied_route = all(
+                    value is not None
+                    for value in (host_id, tmux_server_id, pane_id, route_generation)
+                )
+                route_matches = supplied_route and (
+                    host_id == binding.host_id
+                    and tmux_server_id == binding.tmux_server_id
+                    and pane_id == binding.pane_id
+                    and route_generation == binding.generation
+                )
+                if route_matches:
+                    route_payload["status"] = "verified"
+                    overall = "ready" if binding.state == "healthy" else "stale"
+                elif supplied_route:
+                    route_payload["status"] = "conflict"
+                    overall = "conflict"
+                else:
+                    overall = "route_missing"
+
+        return {
+            "project_id": project.id,
+            "agent_id": agent.id if agent is not None else None,
+            "agent_name": agent.name if agent is not None else None,
+            "runtime_profile": settings.runtime_profile,
+            "server_authority": {
+                "kind": authority[0] if authority is not None else (
+                    "pane_credential" if settings.runtime_profile == "core" else "window_identity"
+                ),
+                "status": authority_status,
+                "generation": generation,
+            },
+            "runtime": runtime_payload,
+            "route": route_payload,
+            "overall": overall,
+        }
+
+    @mcp.tool(name="reconcile_runtime_binding")
+    @_instrument_tool(
+        "reconcile_runtime_binding",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def reconcile_runtime_binding(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        registration_token: str,
+        owner_token: str,
+        runtime_session_id: str,
+        pane_incarnation_id: str,
+        host_id: str,
+        tmux_server_id: str,
+        pane_id: str,
+        program: str,
+        model: str,
+        process_started_ts: str,
+        expected_generation: int = 0,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Enroll or compare-and-swap one authenticated runtime route."""
+        _require_owner(settings, owner_token)
+        for label, value in {
+            "runtime_session_id": runtime_session_id,
+            "pane_incarnation_id": pane_incarnation_id,
+            "host_id": host_id,
+            "tmux_server_id": tmux_server_id,
+            "pane_id": pane_id,
+            "program": program,
+            "model": model,
+        }.items():
+            if not value.strip():
+                raise ToolExecutionError("INVALID_RUNTIME_BINDING", f"{label} must not be blank.")
+        started = _parse_iso(process_started_ts)
+        if started is None:
+            raise ToolExecutionError(
+                "INVALID_RUNTIME_BINDING",
+                "process_started_ts must be an ISO-8601 timestamp.",
+            )
+        started = _naive_utc(started)
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="reconcile_runtime_binding",
+        )
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must be persisted before reconciliation.")
+        authority = await _runtime_authority_for_agent(project, agent)
+        if authority is None:
+            raise ToolExecutionError(
+                "AUTHORITY_MISSING",
+                "No active profile authority is bound to this project and agent.",
+                recoverable=True,
+            )
+
+        now = _naive_utc()
+        async with get_immediate_session() as session:
+            active_result = await session.execute(
+                select(RuntimeBinding)
+                .where(
+                    cast(Any, RuntimeBinding.authority_kind) == authority[0],
+                    cast(Any, RuntimeBinding.authority_id) == authority[1],
+                    cast(Any, RuntimeBinding.state) != "ended",
+                )
+                .order_by(cast(Any, RuntimeBinding.generation).desc())
+                .limit(1)
+            )
+            active = active_result.scalar_one_or_none()
+            if active is None:
+                if expected_generation != 0:
+                    raise ToolExecutionError(
+                        "STALE_GENERATION",
+                        "No runtime binding exists; expected_generation must be 0 for enrollment.",
+                        recoverable=True,
+                    )
+                generation = 1
+            else:
+                same_incarnation = (
+                    active.runtime_session_id == runtime_session_id
+                    and active.pane_incarnation_id == pane_incarnation_id
+                )
+                if not same_incarnation:
+                    raise ToolExecutionError(
+                        "RUNTIME_CONFLICT",
+                        "The authority is owned by another active runtime incarnation.",
+                        recoverable=True,
+                        data={"current_generation": active.generation},
+                    )
+                exact_route = (
+                    active.host_id == host_id
+                    and active.tmux_server_id == tmux_server_id
+                    and active.pane_id == pane_id
+                    and active.program == program
+                    and active.model == model
+                    and active.process_started_ts == started
+                )
+                if exact_route and expected_generation in {active.generation - 1, active.generation}:
+                    active.last_heartbeat_ts = now
+                    active.state = "healthy"
+                    session.add(active)
+                    await session.commit()
+                    return {
+                        "project_id": project.id,
+                        "agent_id": agent.id,
+                        "generation": active.generation,
+                        "overall": "route_missing",
+                        "idempotent": True,
+                    }
+                if expected_generation != active.generation:
+                    raise ToolExecutionError(
+                        "STALE_GENERATION",
+                        "Runtime generation changed before reconciliation.",
+                        recoverable=True,
+                        data={"current_generation": active.generation},
+                    )
+                active.state = "ended"
+                active.ended_ts = now
+                session.add(active)
+                generation = active.generation + 1
+
+            occupied_result = await session.execute(
+                select(RuntimeBinding.id).where(
+                    cast(Any, RuntimeBinding.host_id) == host_id,
+                    cast(Any, RuntimeBinding.tmux_server_id) == tmux_server_id,
+                    cast(Any, RuntimeBinding.pane_id) == pane_id,
+                    cast(Any, RuntimeBinding.state) != "ended",
+                    _sa_or(
+                        cast(Any, RuntimeBinding.project_id) != project.id,
+                        cast(Any, RuntimeBinding.agent_id) != agent.id,
+                    ),
+                )
+            )
+            if occupied_result.first() is not None:
+                raise ToolExecutionError(
+                    "ROUTE_CONFLICT",
+                    "The requested local route is owned by another active principal.",
+                    recoverable=True,
+                )
+
+            binding = RuntimeBinding(
+                project_id=project.id,
+                agent_id=agent.id,
+                authority_kind=authority[0],
+                authority_id=authority[1],
+                runtime_session_id=runtime_session_id,
+                pane_incarnation_id=pane_incarnation_id,
+                generation=generation,
+                host_id=host_id,
+                tmux_server_id=tmux_server_id,
+                pane_id=pane_id,
+                program=program,
+                model=model,
+                process_started_ts=started,
+                state="healthy",
+                last_heartbeat_ts=now,
+                created_ts=now,
+            )
+            session.add(binding)
+            await session.flush()
+            await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id=f"runtime-controller/{host_id}",
+                actor_agent_id=agent.id,
+                operation_kind="runtime_binding_reconciled_v1",
+                entity_type="runtime_binding",
+                entity_id=str(binding.id),
+                payload_version="runtime-binding-v1",
+                payload={
+                    "agent_id": agent.id,
+                    "authority_kind": authority[0],
+                    "authority_id": authority[1],
+                    "runtime_session_id": runtime_session_id,
+                    "pane_incarnation_id": pane_incarnation_id,
+                    "generation": generation,
+                    "host_id": host_id,
+                    "tmux_server_id": tmux_server_id,
+                    "pane_id": pane_id,
+                    "program": program,
+                    "model": model,
+                },
+            )
+            await session.commit()
+        return {
+            "project_id": project.id,
+            "agent_id": agent.id,
+            "generation": generation,
+            "overall": "route_missing",
+            "idempotent": False,
+        }
+
+    @mcp.tool(name="end_runtime_binding")
+    @_instrument_tool(
+        "end_runtime_binding",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def end_runtime_binding(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        registration_token: str,
+        owner_token: str,
+        expected_generation: int,
+        reason: str = "controller_end",
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """End the exact active runtime generation with dual authority."""
+        _require_owner(settings, owner_token)
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="end_runtime_binding",
+        )
+        if project.id is None or agent.id is None:
+            raise ValueError("Project and agent must be persisted before ending a runtime.")
+        authority = await _runtime_authority_for_agent(project, agent)
+        if authority is None:
+            raise ToolExecutionError("AUTHORITY_MISSING", "No active profile authority is bound.")
+        now = _naive_utc()
+        async with get_immediate_session() as session:
+            result = await session.execute(
+                select(RuntimeBinding).where(
+                    cast(Any, RuntimeBinding.authority_kind) == authority[0],
+                    cast(Any, RuntimeBinding.authority_id) == authority[1],
+                    cast(Any, RuntimeBinding.state) != "ended",
+                )
+            )
+            binding = result.scalar_one_or_none()
+            if binding is None:
+                return {
+                    "project_id": project.id,
+                    "agent_id": agent.id,
+                    "generation": expected_generation,
+                    "overall": "ended",
+                    "idempotent": True,
+                }
+            if binding.generation != expected_generation:
+                raise ToolExecutionError(
+                    "STALE_GENERATION",
+                    "Runtime generation changed before end.",
+                    recoverable=True,
+                    data={"current_generation": binding.generation},
+                )
+            binding.state = "ended"
+            binding.ended_ts = now
+            session.add(binding)
+            await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id="runtime-controller/end",
+                actor_agent_id=agent.id,
+                operation_kind="runtime_binding_ended_v1",
+                entity_type="runtime_binding",
+                entity_id=str(binding.id),
+                payload_version="runtime-binding-v1",
+                payload={"generation": binding.generation, "reason": reason[:256]},
+            )
+            await session.commit()
+        return {
+            "project_id": project.id,
+            "agent_id": agent.id,
+            "generation": expected_generation,
+            "overall": "ended",
+            "idempotent": False,
+        }
 
     @mcp.tool(name="list_window_identities")
     @_instrument_tool(

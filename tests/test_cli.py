@@ -109,6 +109,42 @@ def test_cli_typecheck(monkeypatch):
     assert captured == [["uvx", "ty", "check"]]
 
 
+def test_release_sentinel_requires_quiescence_and_detects_state_change(
+    isolated_env: object,
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    manifest = tmp_path / "release-sentinel.json"
+
+    refused = runner.invoke(app, ["release", "sentinel-capture", str(manifest)])
+    assert refused.exit_code != 0
+    assert "--daemon-quiesced" in refused.stderr
+
+    captured = runner.invoke(
+        app,
+        ["release", "sentinel-capture", str(manifest), "--daemon-quiesced"],
+    )
+    assert captured.exit_code == 0, captured.stdout
+
+    verified = runner.invoke(
+        app,
+        ["release", "sentinel-verify", str(manifest), "--daemon-quiesced"],
+    )
+    assert verified.exit_code == 0, verified.stdout
+
+    settings = get_settings()
+    changed = Path(settings.notifications.signals_dir) / "unexpected.signal"
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("changed\n", encoding="utf-8")
+
+    detected = runner.invoke(
+        app,
+        ["release", "sentinel-verify", str(manifest), "--daemon-quiesced"],
+    )
+    assert detected.exit_code != 0
+    assert "Production state changed" in detected.stderr
+
+
 def test_projects_adopt_apply_moves_archive_state_and_keeps_archive_git_clean(isolated_env, tmp_path):
     runner = CliRunner()
     source_worktree, target_worktree = _init_projects_adopt_repo(tmp_path)
@@ -549,8 +585,9 @@ def test_doctor_repair_scopes_project_specific_repairs(isolated_env, monkeypatch
     assert frontend_lock.exists() is True
 
 
-def test_doctor_restore_creates_pre_restore_backup(tmp_path, monkeypatch):
+def test_doctor_restore_creates_pre_restore_backup(isolated_env, tmp_path, monkeypatch):
     runner = CliRunner()
+    asyncio.run(ensure_schema())
     backup_path = tmp_path / "restore-backup"
     backup_path.mkdir()
     (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")

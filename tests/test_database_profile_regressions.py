@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
@@ -24,6 +25,7 @@ from mcp_agent_mail.models import (
     IdempotencyRecord,
     Message,
     MessageRecipient,
+    RuntimeBinding,
     WindowIdentity,
 )
 
@@ -267,7 +269,95 @@ async def test_database_concurrent_first_registration_claims_one_window_once(
     assert len(agents) == 1
     assert len(bindings) == 1
     assert bindings[0].window_uuid == window_uuid
+    assert bindings[0].agent_id == agents[0].id
     assert bindings[0].display_name == agents[0].name == first.data["name"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route_readback(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_database_profile(monkeypatch)
+    owner_token = "test-runtime-controller-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
+    window_uuid = str(uuid.uuid4())
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
+    _config.clear_settings_cache()
+    project_key = "/regression/runtime-binding-generation"
+    runtime_session_id = str(uuid.uuid4())
+    pane_incarnation_id = str(uuid.uuid4())
+    started = "2026-07-22T15:00:00Z"
+
+    async with Client(build_mcp_server()) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_agent(client, project_key=project_key, name="BlueLake")
+        before = await client.call_tool(
+            "identity_status",
+            {"project_key": project_key, "agent_name": agent["name"]},
+        )
+        assert before.data["overall"] == "runtime_missing"
+
+        reconcile_args = {
+            "project_key": project_key,
+            "agent_name": agent["name"],
+            "registration_token": agent["registration_token"],
+            "owner_token": owner_token,
+            "runtime_session_id": runtime_session_id,
+            "pane_incarnation_id": pane_incarnation_id,
+            "host_id": "host-a",
+            "tmux_server_id": "server-a",
+            "pane_id": "%24",
+            "program": "codex",
+            "model": "gpt-5.6",
+            "process_started_ts": started,
+            "expected_generation": 0,
+        }
+        enrolled = await client.call_tool("reconcile_runtime_binding", reconcile_args)
+        assert enrolled.data["generation"] == 1
+        assert enrolled.data["overall"] == "route_missing"
+
+        ready = await client.call_tool(
+            "identity_status",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "host_id": "host-a",
+                "tmux_server_id": "server-a",
+                "pane_id": "%24",
+                "route_generation": 1,
+            },
+        )
+        assert ready.data["overall"] == "ready"
+        assert ready.data["route"]["status"] == "verified"
+
+        moved_args = dict(reconcile_args)
+        moved_args.update({"pane_id": "%31", "expected_generation": 1})
+        moved = await client.call_tool("reconcile_runtime_binding", moved_args)
+        assert moved.data["generation"] == 2
+
+        stale_args = dict(moved_args)
+        stale_args["pane_id"] = "%32"
+        with pytest.raises(ToolError, match="generation changed"):
+            await client.call_tool("reconcile_runtime_binding", stale_args)
+
+        conflict_args = dict(moved_args)
+        conflict_args.update(
+            {
+                "pane_incarnation_id": str(uuid.uuid4()),
+                "expected_generation": 2,
+            }
+        )
+        with pytest.raises(ToolError, match="another active runtime incarnation"):
+            await client.call_tool("reconcile_runtime_binding", conflict_args)
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(RuntimeBinding).order_by(cast(Any, RuntimeBinding.generation))
+            )
+        ).scalars().all()
+    assert [(row.generation, row.state) for row in rows] == [(1, "ended"), (2, "healthy")]
 
 
 @pytest.mark.asyncio

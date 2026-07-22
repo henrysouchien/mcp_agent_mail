@@ -30,7 +30,8 @@ from sqlalchemy import text
 from sqlmodel import select
 
 from mcp_agent_mail.app import ToolExecutionError, _get_agent, _get_agents_batch, build_mcp_server
-from mcp_agent_mail.db import get_session
+from mcp_agent_mail.config import clear_settings_cache
+from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Project
 
 # ============================================================================
@@ -145,7 +146,67 @@ async def test_ensure_project_is_idempotent(isolated_env):
         # Verify only one project exists
         db_project = await get_project_from_db("/test/setup/idem")
         assert db_project is not None, "Project should exist"
-        assert db_project["id"] == first_id
+    assert db_project["id"] == first_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("human_key", ["", "   ", "relative/project", "bare-slug", "agent@example.com"])
+async def test_all_project_creation_paths_reject_malformed_new_keys(isolated_env, human_key):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        with pytest.raises(ToolError):
+            await client.call_tool("ensure_project", {"human_key": human_key})
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "macro_start_session",
+                {
+                    "human_key": human_key,
+                    "program": "codex",
+                    "model": "test-model",
+                },
+            )
+
+
+@pytest.mark.asyncio
+async def test_existing_legacy_bare_key_remains_lookup_only(isolated_env):
+    await ensure_schema()
+    async with get_session() as session:
+        legacy = Project(slug="legacy-bare", human_key="legacy-bare")
+        session.add(legacy)
+        await session.commit()
+        await session.refresh(legacy)
+        legacy_id = legacy.id
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        result = await client.call_tool("ensure_project", {"human_key": "legacy-bare"})
+
+    assert result.data["id"] == legacy_id
+    assert result.data["namespace_kind"] == "legacy_unclassified"
+    assert result.data["hygiene_warnings"] == ["legacy_unclassified_project_namespace"]
+
+
+@pytest.mark.asyncio
+async def test_opaque_namespace_requires_owner_and_is_classified(isolated_env, monkeypatch):
+    monkeypatch.setenv("CORE_OWNER_TOKEN", "owner-secret")
+    clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "ensure_project",
+                {"human_key": "deliberate-namespace", "namespace_kind": "opaque"},
+            )
+        result = await client.call_tool(
+            "ensure_project",
+            {
+                "human_key": "deliberate-namespace",
+                "namespace_kind": "opaque",
+                "owner_token": "owner-secret",
+            },
+        )
+
+    assert result.data["namespace_kind"] == "opaque"
 
 
 @pytest.mark.asyncio

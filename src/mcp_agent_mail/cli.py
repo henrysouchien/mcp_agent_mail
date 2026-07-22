@@ -57,6 +57,7 @@ from .app import (
 from .config import clear_settings_cache, get_settings
 from .db import (
     ensure_schema,
+    get_database_path,
     get_session,
     get_sqlite_sidecar_paths,
     reset_database_state,
@@ -410,6 +411,118 @@ docs_app = typer.Typer(help="Documentation helpers for agent onboarding")
 app.add_typer(docs_app, name="docs")
 doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
+release_app = typer.Typer(help="Release safety checks for production state")
+app.add_typer(release_app, name="release")
+
+
+def _release_state_paths() -> dict[str, Path]:
+    settings = get_settings()
+    paths = {
+        "storage": Path(settings.storage.root).expanduser().resolve(),
+        "blobs": Path(settings.storage.blob_root).expanduser().resolve(),
+        "notifications": Path(settings.notifications.signals_dir).expanduser().resolve(),
+    }
+    database = get_database_path(settings)
+    if database is not None:
+        database = database.expanduser().resolve()
+        wal, shm = get_sqlite_sidecar_paths(database)
+        paths.update({"database": database, "database_wal": wal, "database_shm": shm})
+    return paths
+
+
+def _release_path_manifest(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"exists": False, "kind": "missing"}
+    if path.is_file():
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        stat = path.stat()
+        return {
+            "exists": True,
+            "kind": "file",
+            "size": stat.st_size,
+            "sha256": digest.hexdigest(),
+        }
+
+    entries: list[dict[str, Any]] = []
+    for entry in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+        relative = entry.relative_to(path).as_posix()
+        if entry.is_symlink():
+            entries.append(
+                {"path": relative, "kind": "symlink", "target": str(entry.readlink())}
+            )
+        elif entry.is_file():
+            item = _release_path_manifest(entry)
+            entries.append({"path": relative, **item})
+        elif entry.is_dir():
+            entries.append({"path": relative, "kind": "directory"})
+    return {"exists": True, "kind": "directory", "entries": entries}
+
+
+def _release_state_manifest() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "paths": {
+            label: {
+                "path": str(path),
+                "manifest": _release_path_manifest(path),
+            }
+            for label, path in _release_state_paths().items()
+        },
+    }
+
+
+def _require_quiesced_release_ack(daemon_quiesced: bool) -> None:
+    if not daemon_quiesced:
+        raise click.ClickException(
+            "Stop the Agent Mail daemon, then rerun with --daemon-quiesced."
+        )
+
+
+@release_app.command("sentinel-capture")
+def release_sentinel_capture(
+    manifest_path: Annotated[Path, typer.Argument(help="Path for the sentinel JSON")],
+    daemon_quiesced: Annotated[
+        bool,
+        typer.Option("--daemon-quiesced", help="Confirm the Agent Mail daemon is stopped"),
+    ] = False,
+) -> None:
+    """Capture an immutable manifest of every configured production state tree."""
+    _require_quiesced_release_ack(daemon_quiesced)
+    resolved = manifest_path.expanduser().resolve()
+    monitored = _release_state_paths().values()
+    if any(resolved == root or resolved.is_relative_to(root) for root in monitored):
+        raise click.ClickException("The sentinel manifest must be outside monitored state paths.")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    payload = _release_state_manifest()
+    payload["captured_at"] = datetime.now(timezone.utc).isoformat()
+    resolved.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    typer.echo(f"Captured release sentinel: {resolved}")
+
+
+@release_app.command("sentinel-verify")
+def release_sentinel_verify(
+    manifest_path: Annotated[Path, typer.Argument(help="Previously captured sentinel JSON")],
+    daemon_quiesced: Annotated[
+        bool,
+        typer.Option("--daemon-quiesced", help="Confirm the Agent Mail daemon is stopped"),
+    ] = False,
+) -> None:
+    """Fail unless database, sidecars, storage, blobs, and signals are unchanged."""
+    _require_quiesced_release_ack(daemon_quiesced)
+    resolved = manifest_path.expanduser().resolve()
+    try:
+        expected = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"Unable to read release sentinel: {exc}") from exc
+    actual = _release_state_manifest()
+    if expected.get("schema_version") != actual["schema_version"]:
+        raise click.ClickException("Release sentinel schema version does not match.")
+    if expected.get("paths") != actual["paths"]:
+        raise click.ClickException("Production state changed during the release test window.")
+    typer.echo("Release sentinel verified: production state is unchanged.")
 
 
 def _canonical_project_path(path: Path) -> Path:

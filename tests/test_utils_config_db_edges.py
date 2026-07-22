@@ -205,3 +205,11 @@ def test_sqlite_sidecar_paths_preserve_database_filename():
     assert wal_path == Path("/tmp/mail.db-wal")
     assert shm_path == Path("/tmp/mail.db-shm")
     assert get_sqlite_pre_restore_path(Path("/tmp/mail.db")) == Path("/tmp/mail.db.pre-restore")
+
+
+def test_marked_test_process_refuses_state_outside_test_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("MCP_AGENT_MAIL_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:////Users/henrychien/.local/share/mcp_agent_mail/storage.sqlite3")
+    clear_settings_cache()
+    with pytest.raises(ConfigError, match="refused state outside"):
+        get_settings()

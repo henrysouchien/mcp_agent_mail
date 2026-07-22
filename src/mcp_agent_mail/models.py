@@ -26,6 +26,7 @@ class Project(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     slug: str = Field(index=True, unique=True, max_length=255)
     human_key: str = Field(max_length=255, index=True)
+    namespace_kind: Optional[str] = Field(default=None, max_length=32, index=True)
     created_at: datetime = Field(default_factory=_utcnow_naive)
     archived_at: Optional[datetime] = Field(default=None)
 
@@ -174,11 +175,56 @@ class WindowIdentity(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="projects.id", index=True)
+    # Immutable authority target.  ``display_name`` remains presentation and
+    # legacy-migration metadata; it must never select a principal once this ID
+    # has been established.
+    agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
     window_uuid: str = Field(max_length=64, index=True)
     display_name: str = Field(max_length=128)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     last_active_ts: datetime = Field(default_factory=_utcnow_naive)
     expires_ts: Optional[datetime] = Field(default=None)
+
+
+class RuntimeBinding(SQLModel, table=True):
+    """Generation-fenced runtime incarnation and local fleet route."""
+
+    __tablename__ = "runtime_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "authority_kind",
+            "authority_id",
+            "generation",
+            name="uq_runtime_binding_authority_generation",
+        ),
+        Index("idx_runtime_bindings_principal_state", "project_id", "agent_id", "state"),
+        Index(
+            "idx_runtime_bindings_route_state",
+            "host_id",
+            "tmux_server_id",
+            "pane_id",
+            "state",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    authority_kind: str = Field(max_length=32)
+    authority_id: str = Field(max_length=64, index=True)
+    runtime_session_id: str = Field(max_length=128, index=True)
+    pane_incarnation_id: str = Field(max_length=128, index=True)
+    generation: int = Field(default=1, ge=1)
+    host_id: str = Field(max_length=255)
+    tmux_server_id: str = Field(max_length=255)
+    pane_id: str = Field(max_length=64)
+    program: str = Field(max_length=128)
+    model: str = Field(max_length=128)
+    process_started_ts: datetime
+    state: str = Field(default="starting", max_length=32)
+    last_heartbeat_ts: datetime = Field(default_factory=_utcnow_naive)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    ended_ts: Optional[datetime] = Field(default=None)
 
 
 class MessageSummary(SQLModel, table=True):

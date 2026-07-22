@@ -13,6 +13,7 @@ from decouple import (
     RepositoryEmpty,
     RepositoryEnv,
 )
+from sqlalchemy.engine import make_url
 
 _DOTENV_PATH: Final[Path] = Path(".env")
 
@@ -313,6 +314,49 @@ class ConfigError(ValueError):
     silently swallowed into the default. The error always names the offending
     key so the operator knows exactly which line of their ``.env`` to fix.
     """
+
+
+def _resolved_local_path(value: str) -> Path:
+    return Path(value).expanduser().resolve(strict=False)
+
+
+def _assert_test_settings_isolated(settings: Settings) -> None:
+    """Refuse production/default state paths inside a marked pytest process."""
+    decouple_config = _get_decouple_config()
+    run_id = str(decouple_config("MCP_AGENT_MAIL_TEST_RUN_ID", default="") or "").strip()
+    if not run_id:
+        return
+    root_raw = str(decouple_config("MCP_AGENT_MAIL_TEST_ROOT", default="") or "").strip()
+    if not root_raw:
+        raise ConfigError(
+            "MCP_AGENT_MAIL_TEST_RUN_ID is set but MCP_AGENT_MAIL_TEST_ROOT is missing; "
+            "refusing to construct state paths."
+        )
+    test_root = _resolved_local_path(root_raw)
+
+    candidates: dict[str, Path] = {
+        "STORAGE_ROOT": _resolved_local_path(settings.storage.root),
+        "BLOB_STORAGE_ROOT": _resolved_local_path(settings.storage.blob_root),
+        "NOTIFICATIONS_SIGNALS_DIR": _resolved_local_path(settings.notifications.signals_dir),
+    }
+    try:
+        database_url = make_url(settings.database.url)
+    except Exception as exc:
+        raise ConfigError("DATABASE_URL is invalid inside a marked test process") from exc
+    if database_url.get_backend_name() == "sqlite" and database_url.database not in {None, "", ":memory:"}:
+        candidates["DATABASE_URL"] = _resolved_local_path(str(database_url.database))
+
+    escaped = {
+        key: str(path)
+        for key, path in candidates.items()
+        if not path.is_relative_to(test_root)
+    }
+    if escaped:
+        labels = ", ".join(f"{key}={value}" for key, value in sorted(escaped.items()))
+        raise ConfigError(
+            "Marked Agent Mail test process refused state outside MCP_AGENT_MAIL_TEST_ROOT "
+            f"({test_root}): {labels}"
+        )
 
 
 _TRUE_TOKENS: Final[frozenset[str]] = frozenset({"1", "true", "t", "yes", "y"})
@@ -687,6 +731,7 @@ class _SettingsAccessor:
         cached = _settings_cache
         if cached is None:
             cached = _build_settings()
+            _assert_test_settings_isolated(cached)
             _settings_cache = cached
         return cached
 

@@ -1,14 +1,30 @@
 import asyncio
 import contextlib
 import gc
+import os
+import secrets
+import tempfile
 from pathlib import Path
 
 import psutil
 import pytest
 
-from mcp_agent_mail.config import clear_settings_cache
-from mcp_agent_mail.db import reset_database_state
-from mcp_agent_mail.storage import clear_repo_cache
+# Install the process-wide test isolation envelope before importing any Agent
+# Mail module. Child processes inherit these values, so a test that spawns the
+# real CLI cannot silently reopen the operator's production database or state
+# directories during collection or execution.
+_PYTEST_SESSION_ROOT = Path(tempfile.mkdtemp(prefix="mcp-agent-mail-pytest-"))
+os.environ["MCP_AGENT_MAIL_TEST_RUN_ID"] = secrets.token_hex(16)
+os.environ["MCP_AGENT_MAIL_TEST_ROOT"] = str(_PYTEST_SESSION_ROOT)
+os.environ["APP_ENVIRONMENT"] = "test"
+os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_PYTEST_SESSION_ROOT / 'storage.sqlite3'}"
+os.environ["STORAGE_ROOT"] = str(_PYTEST_SESSION_ROOT / "storage")
+os.environ["BLOB_STORAGE_ROOT"] = str(_PYTEST_SESSION_ROOT / "blobs")
+os.environ["NOTIFICATIONS_SIGNALS_DIR"] = str(_PYTEST_SESSION_ROOT / "signals")
+
+from mcp_agent_mail.config import clear_settings_cache  # noqa: E402
+from mcp_agent_mail.db import reset_database_state  # noqa: E402
+from mcp_agent_mail.storage import clear_repo_cache  # noqa: E402
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0
@@ -89,7 +105,7 @@ def event_loop():
         loop.close()
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def isolated_env(tmp_path, monkeypatch):
     """Provide isolated database settings for tests and reset caches."""
     db_path: Path = tmp_path / "test.sqlite3"
@@ -98,6 +114,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTP_PORT", "8765")
     monkeypatch.setenv("HTTP_PATH", "/mcp/")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
+    monkeypatch.setenv("MCP_AGENT_MAIL_TEST_ROOT", str(tmp_path))
     # Preserve the historical Git-archive contract for existing tests. Tests
     # of the production default remove this override explicitly.
     monkeypatch.setenv("RUNTIME_PROFILE", "legacy")
@@ -108,6 +125,8 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("TOOLS_FILTER_ENABLED", "false")
     storage_root = tmp_path / "storage"
     monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
+    monkeypatch.setenv("BLOB_STORAGE_ROOT", str(tmp_path / "blobs"))
+    monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", str(tmp_path / "signals"))
     monkeypatch.setenv("GIT_AUTHOR_NAME", "test-agent")
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "128")
@@ -118,56 +137,9 @@ def isolated_env(tmp_path, monkeypatch):
     try:
         yield
     finally:
-        # Close all cached Repo objects first (prevents file handle leaks)
         clear_repo_cache()
-        # Dispose database engine/pool state before forcing GC so SQLAlchemy
-        # returns pooled connections cleanly instead of warning during finalizers.
         reset_database_state()
-
-        # Suppress ResourceWarnings during cleanup since Python 3.14 warns about resources
-        # being cleaned up by GC, which is exactly what we want
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=ResourceWarning)
-            try:
-                import time
-
-                from git import Repo
-
-                # Multiple GC passes to ensure full cleanup of any non-cached repos
-                for _ in range(2):
-                    gc.collect()
-                    # Close any Repo instances that might still be open
-                    for obj in gc.get_objects():
-                        if isinstance(obj, Repo):
-                            with contextlib.suppress(Exception):
-                                obj.close()
-
-                # Give subprocesses time to terminate
-                time.sleep(0.05)
-
-                # Final GC pass
-                gc.collect()
-            except Exception:
-                pass
-
-            # Force another GC to clean up any remaining references
-            gc.collect()
-
         clear_settings_cache()
-
-        if db_path.exists():
-            db_path.unlink()
-        storage_root = tmp_path / "storage"
-        if storage_root.exists():
-            for path in storage_root.rglob("*"):
-                if path.is_file():
-                    path.unlink()
-            for path in sorted(storage_root.rglob("*"), reverse=True):
-                if path.is_dir():
-                    path.rmdir()
-            if storage_root.exists():
-                storage_root.rmdir()
 
 
 @pytest.fixture(autouse=True)
