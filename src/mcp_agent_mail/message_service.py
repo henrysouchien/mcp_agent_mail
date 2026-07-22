@@ -94,6 +94,7 @@ async def create_atomic_message(
     reply_to: int | None,
     attachments: Sequence[dict[str, Any]],
     idempotency_key: str | None,
+    idempotency_request_payload: Mapping[str, Any] | None = None,
     blob_attachments: Sequence[AtomicAttachment] = (),
     retry_horizon: timedelta = timedelta(days=30),
 ) -> AtomicMessageResult:
@@ -103,7 +104,7 @@ async def create_atomic_message(
     for item in blob_attachments:
         if item.metadata.get("digest") != item.installation.blob.digest:
             raise ValueError("blob attachment digest does not match its durable installation")
-    payload = _request_payload(
+    payload = dict(idempotency_request_payload) if idempotency_request_payload is not None else _request_payload(
         project_id=project_id,
         sender_id=sender_id,
         recipients=recipients,
@@ -189,6 +190,9 @@ async def create_atomic_message(
             "ack_required": ack_required,
             "reply_to": reply_to,
             "attachments": list(attachments),
+            "to": [recipient.name for recipient in recipients if recipient.kind == "to"],
+            "cc": [recipient.name for recipient in recipients if recipient.kind == "cc"],
+            "bcc": [recipient.name for recipient in recipients if recipient.kind == "bcc"],
             "created_ts": _iso(message.created_ts),
             "audit_event_id": event.id,
             "event_hash": event.event_hash,

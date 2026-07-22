@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,6 +23,7 @@ from mcp_agent_mail.models import (
     BootstrapCredential,
     IdempotencyRecord,
     Message,
+    MessageRecipient,
     PaneCredential,
     Project,
     ProjectStorageCutover,
@@ -551,6 +553,39 @@ async def test_live_send_uses_atomic_path_and_never_opens_archive(
     }
     async with Client(server) as client:
         first = await client.call_tool("send_message", arguments)
+        first_message_id = int(first.data["deliveries"][0]["payload"]["id"])
+        reply_arguments = {
+            "project_key": "/git-independent-live",
+            "message_id": first_message_id,
+            "sender_name": "AtomicRecipient",
+            "sender_token": "recipient-secret",
+            "to": ["AtomicSender"],
+            "body_md": "Reply committed before visibility changes",
+            "idempotency_key": "reply-live-route-key",
+        }
+        first_reply = await client.call_tool("reply_message", reply_arguments)
+        async with get_immediate_session() as session:
+            recipient = (
+                await session.execute(
+                    select(Agent).where(cast(Any, Agent.name) == "AtomicRecipient")
+                )
+            ).scalar_one()
+            original_delivery = await session.get(
+                MessageRecipient,
+                (first_message_id, recipient.id),
+            )
+            assert original_delivery is not None
+            await session.delete(original_delivery)
+            await session.commit()
+        reply_replay = await client.call_tool("reply_message", reply_arguments)
+        async with get_immediate_session() as session:
+            recipient = (
+                await session.execute(
+                    select(Agent).where(cast(Any, Agent.name) == "AtomicRecipient")
+                )
+            ).scalar_one()
+            recipient.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await session.commit()
         replay = await client.call_tool("send_message", arguments)
 
     first_payload = first.data["deliveries"][0]["payload"]
@@ -559,9 +594,11 @@ async def test_live_send_uses_atomic_path_and_never_opens_archive(
     assert replay_payload["replayed"] is True
     assert replay_payload["id"] == first_payload["id"]
     assert replay_payload["retry_safety"] == "safe_with_idempotency_key"
+    assert reply_replay.data["replayed"] is True
+    assert reply_replay.data["id"] == first_reply.data["id"]
     async with get_session() as session:
-        assert await session.scalar(select(func.count()).select_from(Message)) == 1
-        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 1
-        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
+        assert await session.scalar(select(func.count()).select_from(Message)) == 2
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 2
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 3
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True

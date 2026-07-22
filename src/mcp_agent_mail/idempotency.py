@@ -118,6 +118,42 @@ async def _find_record(
     return result.scalar_one_or_none()
 
 
+async def lookup_idempotent_replay(
+    session: AsyncSession,
+    *,
+    scope_kind: str,
+    scope_id: str,
+    operation_kind: str,
+    idempotency_key: str,
+    request_payload: Mapping[str, Any],
+    now: datetime | None = None,
+) -> IdempotencyResult | None:
+    """Return a validated immutable receipt without running creation preflight."""
+    existing = await _find_record(
+        session,
+        scope_kind=scope_kind,
+        scope_id=scope_id,
+        operation_kind=operation_kind,
+        idempotency_key=idempotency_key,
+    )
+    if existing is None:
+        return None
+    candidate = fingerprint_request(request_payload, version=existing.fingerprint_version)
+    if not hmac.compare_digest(candidate, existing.request_fingerprint):
+        raise IdempotencyKeyReuseMismatchError(
+            f"idempotency key was already used for a different {operation_kind} request"
+        )
+    timestamp = now or _utcnow_naive()
+    if existing.expires_ts < timestamp:
+        raise IdempotencyReceiptExpiredError(
+            "idempotency receipt has expired; the key remains reserved against reuse"
+        )
+    response = json.loads(existing.response_json)
+    if not isinstance(response, dict):
+        raise IdempotencyError("stored idempotency receipt is not a JSON object")
+    return IdempotencyResult(response=response, replayed=True, record=existing)
+
+
 async def run_idempotent_mutation(
     session: AsyncSession,
     *,
@@ -133,27 +169,17 @@ async def run_idempotent_mutation(
 ) -> IdempotencyResult:
     """Run or replay one mutation without committing the caller's transaction."""
     timestamp = now or _utcnow_naive()
-    existing = await _find_record(
+    replay = await lookup_idempotent_replay(
         session,
         scope_kind=scope_kind,
         scope_id=scope_id,
         operation_kind=operation_kind,
         idempotency_key=idempotency_key,
+        request_payload=request_payload,
+        now=timestamp,
     )
-    if existing is not None:
-        candidate = fingerprint_request(request_payload, version=existing.fingerprint_version)
-        if not hmac.compare_digest(candidate, existing.request_fingerprint):
-            raise IdempotencyKeyReuseMismatchError(
-                f"idempotency key was already used for a different {operation_kind} request"
-            )
-        if existing.expires_ts < timestamp:
-            raise IdempotencyReceiptExpiredError(
-                "idempotency receipt has expired; the key remains reserved against reuse"
-            )
-        response = json.loads(existing.response_json)
-        if not isinstance(response, dict):
-            raise IdempotencyError("stored idempotency receipt is not a JSON object")
-        return IdempotencyResult(response=response, replayed=True, record=existing)
+    if replay is not None:
+        return replay
 
     fingerprint = fingerprint_request(request_payload, version=fingerprint_version)
     mutation = await mutate(session)

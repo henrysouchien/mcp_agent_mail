@@ -74,6 +74,7 @@ from .idempotency import (
     IdempotencyReceiptExpiredError,
     IdempotencyVersionUnavailableError,
     MutationReceipt,
+    lookup_idempotent_replay,
     run_idempotent_mutation,
 )
 from .llm import complete_system_user
@@ -6047,6 +6048,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         topic: Optional[str] = None,
         reply_to: Optional[int] = None,
         idempotency_key: Optional[str] = None,
+        idempotency_request_payload: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -6071,13 +6073,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         _claimed.update(cc_names)
         bcc_names = [name for name in _unique(bcc_names) if name not in _claimed]
         combined_names = [*to_names, *cc_names, *bcc_names]
-        agent_map = await _get_agents_batch(project, combined_names)
-        to_agents = [agent_map[name] for name in to_names]
-        cc_agents = [agent_map[name] for name in cc_names]
-        bcc_agents = [agent_map[name] for name in bcc_names]
-        recipient_records: list[tuple[Agent, str]] = [(agent, "to") for agent in to_agents]
-        recipient_records.extend((agent, "cc") for agent in cc_agents)
-        recipient_records.extend((agent, "bcc") for agent in bcc_agents)
 
         sender_project = project if sender.project_id == project.id else await _get_project_by_id(sender.project_id)
         sender_is_local = sender_project.id == project.id
@@ -6091,6 +6086,44 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_profile=settings.runtime_profile,
                 for_mutation=True,
             )
+        operation_kind = "message_reply_v1" if reply_to is not None else "message_send_v1"
+        if route.state == GIT_INDEPENDENT and idempotency_key and idempotency_request_payload:
+            async with get_session() as replay_session:
+                replay = await lookup_idempotent_replay(
+                    replay_session,
+                    scope_kind="agent",
+                    scope_id=f"{sender_project.id}:{sender.id}",
+                    operation_kind=operation_kind,
+                    idempotency_key=idempotency_key,
+                    request_payload=idempotency_request_payload,
+                )
+            if replay is not None:
+                payload = dict(replay.response)
+                payload.update(
+                    {
+                        "replayed": True,
+                        "retry_safety": "safe_with_idempotency_key",
+                    }
+                )
+                _apply_sender_identity(
+                    payload,
+                    message_project_id=project.id,
+                    sender_name=sender.name,
+                    sender_project_id=sender_project.id,
+                    sender_project_human_key=sender_project.human_key,
+                    sender_project_slug=sender_project.slug,
+                )
+                await ctx.info(f"Replayed committed message {payload['id']} from its immutable receipt.")
+                return payload
+
+        agent_map = await _get_agents_batch(project, combined_names)
+        to_agents = [agent_map[name] for name in to_names]
+        cc_agents = [agent_map[name] for name in cc_names]
+        bcc_agents = [agent_map[name] for name in bcc_names]
+        recipient_records: list[tuple[Agent, str]] = [(agent, "to") for agent in to_agents]
+        recipient_records.extend((agent, "cc") for agent in cc_agents)
+        recipient_records.extend((agent, "bcc") for agent in bcc_agents)
+
         if route.state == GIT_INDEPENDENT:
             processed_body, attachments_meta, blob_attachments = (
                 await _prepare_git_independent_attachments(
@@ -6135,6 +6168,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         reply_to=reply_to,
                         attachments=attachments_meta,
                         idempotency_key=idempotency_key,
+                        idempotency_request_payload=idempotency_request_payload,
                         blob_attachments=blob_attachments,
                     )
                     await assert_route_generation(
@@ -8548,6 +8582,66 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             action="send_message",
         )
         sender_name = sender.name
+        send_idempotency_payload: dict[str, Any] = {
+            "ack_required": ack_required,
+            "attachment_paths": list(attachment_paths or []),
+            "auto_contact_if_blocked": auto_contact_if_blocked,
+            "bcc": list(bcc or []),
+            "body_md": body_md,
+            "broadcast": broadcast,
+            "cc": list(cc or []),
+            "convert_images": convert_images,
+            "importance": importance,
+            "project_id": project.id,
+            "sender_id": sender.id,
+            "subject": subject,
+            "thread_id": thread_id,
+            "to": list(to or []),
+            "topic": topic,
+        }
+        local_recipient_syntax = all(
+            "@" not in value and not value.startswith("project:")
+            for value in [*(to or []), *(cc or []), *(bcc or [])]
+        )
+        if idempotency_key and not broadcast and local_recipient_syntax:
+            async with get_session() as replay_route_session:
+                replay_route = await resolve_storage_route(
+                    replay_route_session,
+                    project_id=cast(int, project.id),
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+                if replay_route.state == GIT_INDEPENDENT:
+                    replay = await lookup_idempotent_replay(
+                        replay_route_session,
+                        scope_kind="agent",
+                        scope_id=f"{project.id}:{sender.id}",
+                        operation_kind="message_send_v1",
+                        idempotency_key=idempotency_key,
+                        request_payload=send_idempotency_payload,
+                    )
+                    if replay is not None:
+                        payload = dict(replay.response)
+                        payload.update(
+                            {
+                                "replayed": True,
+                                "retry_safety": "safe_with_idempotency_key",
+                            }
+                        )
+                        _apply_sender_identity(
+                            payload,
+                            message_project_id=cast(int, project.id),
+                            sender_name=sender.name,
+                            sender_project_id=cast(int, project.id),
+                            sender_project_human_key=project.human_key,
+                            sender_project_slug=project.slug,
+                        )
+                        return {
+                            "deliveries": [{"project": project.human_key, "payload": payload}],
+                            "count": 1,
+                            "verified_sender": True,
+                            "attachments": payload.get("attachments", []),
+                        }
 
         # Validate topic format if provided.
         #
@@ -9597,6 +9691,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 thread_id,
                 topic=topic,
                 idempotency_key=idempotency_key,
+                idempotency_request_payload=send_idempotency_payload,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
         # External per-target project deliver using the original sender identity.
@@ -9624,6 +9719,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         if idempotency_key
                         else None
                     ),
+                    idempotency_request_payload=send_idempotency_payload,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, p, payload_ext)
             except Exception as exc:
@@ -9836,6 +9932,55 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             token_param="sender_token",
             action="reply_message",
         )
+        reply_idempotency_payload: dict[str, Any] = {
+            "bcc": list(bcc or []),
+            "body_md": body_md,
+            "cc": list(cc or []),
+            "message_id": message_id,
+            "project_id": project.id,
+            "sender_id": sender.id,
+            "subject_prefix": subject_prefix,
+            "to": None if to is None else list(to),
+        }
+        if idempotency_key:
+            async with get_session() as replay_session:
+                replay_route = await resolve_storage_route(
+                    replay_session,
+                    project_id=cast(int, project.id),
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+                if replay_route.state == GIT_INDEPENDENT:
+                    replay = await lookup_idempotent_replay(
+                        replay_session,
+                        scope_kind="agent",
+                        scope_id=f"{project.id}:{sender.id}",
+                        operation_kind="message_reply_v1",
+                        idempotency_key=idempotency_key,
+                        request_payload=reply_idempotency_payload,
+                    )
+                    if replay is not None:
+                        primary_payload = dict(replay.response)
+                        primary_payload.update(
+                            {
+                                "replayed": True,
+                                "retry_safety": "safe_with_idempotency_key",
+                                "reply_to": message_id,
+                            }
+                        )
+                        _apply_sender_identity(
+                            primary_payload,
+                            message_project_id=cast(int, project.id),
+                            sender_name=sender.name,
+                            sender_project_id=cast(int, project.id),
+                            sender_project_human_key=project.human_key,
+                            sender_project_slug=project.slug,
+                        )
+                        primary_payload["deliveries"] = [
+                            {"project": project.human_key, "payload": dict(primary_payload)}
+                        ]
+                        primary_payload["count"] = 1
+                        return primary_payload
         settings_local = get_settings()
         original = await _get_visible_message(project, sender, message_id)
         original_sender = await _get_agent_any_project_by_id(original.sender_id)
@@ -10259,6 +10404,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 topic=original.topic,
                 reply_to=original.id,
                 idempotency_key=idempotency_key,
+                idempotency_request_payload=reply_idempotency_payload,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
 
@@ -10287,6 +10433,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         if idempotency_key
                         else None
                     ),
+                    idempotency_request_payload=reply_idempotency_payload,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, target_project, payload_ext)
             except Exception as exc:
