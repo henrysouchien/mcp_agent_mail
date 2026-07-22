@@ -8477,13 +8477,15 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         ctx: Context,
         project_key: str,
         message_id: int,
-        sender_name: str,
         body_md: str,
+        sender_name: Optional[str] = None,
         to: Optional[list[str]] = None,
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
         subject_prefix: str = "Re:",
         sender_token: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -8504,12 +8506,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             The id of the message you are replying to.
         sender_name : str
             Your agent name (must be registered in the project).
+            The legacy compatibility alias `agent_name` is also accepted.
         body_md : str
             Reply body in Markdown.
         to, cc, bcc : Optional[list[str]]
             Recipients by agent name. If omitted, `to` defaults to original sender.
         subject_prefix : str
             Prefix to apply (default "Re:"). Case-insensitive idempotent.
+        sender_token : Optional[str]
+            Registration bearer. The compatibility alias `registration_token`
+            is also accepted; if both are supplied they must match.
 
         Do / Don't
         ----------
@@ -8551,12 +8557,39 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         }}}
         ```
         """
+        if sender_name and agent_name and sender_name.strip() != agent_name.strip():
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "sender_name and compatibility alias agent_name must identify the same agent.",
+                recoverable=True,
+                data={"arguments": ["sender_name", "agent_name"]},
+            )
+        effective_sender_name = (sender_name or agent_name or "").strip()
+        if not effective_sender_name:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "reply_message requires sender_name (or compatibility alias agent_name).",
+                recoverable=True,
+                data={"argument": "sender_name", "accepted_alias": "agent_name"},
+            )
+        if sender_token and registration_token and not hmac.compare_digest(
+            sender_token,
+            registration_token,
+        ):
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "sender_token and compatibility alias registration_token must match.",
+                recoverable=True,
+                data={"arguments": ["sender_token", "registration_token"]},
+            )
+        effective_sender_token = sender_token or registration_token
+
         project = await _get_project_by_identifier(project_key)
         sender = await _authenticate_agent(
             ctx,
             project,
-            sender_name,
-            sender_token,
+            effective_sender_name,
+            effective_sender_token,
             token_param="sender_token",
             action="reply_message",
         )

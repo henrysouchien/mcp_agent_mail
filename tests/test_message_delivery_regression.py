@@ -831,6 +831,62 @@ async def test_reply_message_prefixes_subject(isolated_env):
         assert subject.lower().startswith("re:")
 
 
+@pytest.mark.asyncio
+async def test_reply_message_accepts_identity_compatibility_aliases(isolated_env):
+    """Legacy agent_name/registration_token calls must pass tool validation."""
+    server = build_mcp_server()
+    tool = await server.get_tool("reply_message")
+    assert "sender_name" not in tool.parameters["required"]
+    assert "agent_name" in tool.parameters["properties"]
+    assert "registration_token" in tool.parameters["properties"]
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/test/reply-alias"})
+        registrations = []
+        for _ in range(2):
+            registration = await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": "/test/reply-alias",
+                    "program": "test",
+                    "model": "test",
+                },
+            )
+            registrations.append(registration.data)
+            await client.call_tool(
+                "set_contact_policy",
+                {
+                    "project_key": "/test/reply-alias",
+                    "agent_name": registration.data["name"],
+                    "policy": "open",
+                },
+            )
+
+        sender, recipient = registrations
+        original = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/test/reply-alias",
+                "sender_name": sender["name"],
+                "to": [recipient["name"]],
+                "subject": "Alias compatibility",
+                "body_md": "Original",
+            },
+        )
+        original_id = original.data["deliveries"][0]["payload"]["id"]
+        reply = await client.call_tool(
+            "reply_message",
+            {
+                "project_key": "/test/reply-alias",
+                "message_id": original_id,
+                "agent_name": recipient["name"],
+                "registration_token": recipient["registration_token"],
+                "body_md": "Reply through compatibility aliases",
+            },
+        )
+    assert reply.data["reply_to"] == original_id
+
+
 # ============================================================================
 # Read and Acknowledgment Tests
 # ============================================================================
