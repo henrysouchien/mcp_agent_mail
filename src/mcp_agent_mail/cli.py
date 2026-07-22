@@ -343,7 +343,7 @@ app = typer.Typer(help="Developer utilities for the MCP Agent Mail service.", in
 def _app_callback(ctx: typer.Context) -> None:
     """Default to ``serve-http`` when no subcommand is given."""
     if ctx.invoked_subcommand is None:
-        serve_http(host=None, port=None, path=None)
+        serve_http(host=None, port=None, path=None, tool_profile=None)
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -1204,6 +1204,11 @@ def serve_http(
     host: Optional[str] = typer.Option(None, help="Host interface for HTTP transport. Defaults to HTTP_HOST setting."),
     port: Optional[int] = typer.Option(None, help="Port for HTTP transport. Defaults to HTTP_PORT setting."),
     path: Optional[str] = typer.Option(None, help="HTTP path where the MCP endpoint is exposed."),
+    tool_profile: Optional[str] = typer.Option(
+        None,
+        "--tool-profile",
+        help="Tool exposure profile for this process: agent, minimal, messaging, core, or full.",
+    ),
 ) -> None:
     """Run the MCP server over the Streamable HTTP transport."""
     settings = get_settings()
@@ -1218,6 +1223,20 @@ def serve_http(
         settings,
         http=replace(settings.http, host=resolved_host, port=resolved_port, path=resolved_path),
     )
+    if tool_profile is not None:
+        normalized_profile = tool_profile.strip().lower()
+        valid_profiles = {"agent", "minimal", "messaging", "core", "full"}
+        if normalized_profile not in valid_profiles:
+            choices = ", ".join(sorted(valid_profiles))
+            raise typer.BadParameter(f"tool profile must be one of: {choices}", param_hint="--tool-profile")
+        effective_settings = replace(
+            effective_settings,
+            tool_filter=replace(
+                effective_settings.tool_filter,
+                enabled=normalized_profile != "full",
+                profile=normalized_profile,
+            ),
+        )
 
     # Display awesome startup banner with database stats
     from . import rich_logger
@@ -1230,7 +1249,7 @@ def serve_http(
     # here ensures fresh connections are created on the main event loop.
     reset_database_state()
 
-    server = build_mcp_server()
+    server = build_mcp_server(effective_settings) if tool_profile is not None else build_mcp_server()
     app = build_http_app(effective_settings, server)
     # Disable WebSockets: HTTP-only MCP transport. Stay compatible with tests that
     # monkeypatch uvicorn.run without the 'ws' parameter.

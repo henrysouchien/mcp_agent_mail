@@ -256,14 +256,25 @@ def test_cli_list_projects_and_serve_http_overrides(isolated_env, monkeypatch):
         calls["path"] = settings.http.path
         return object()
 
+    def fake_build_mcp_server(settings=None):
+        if settings is not None:
+            calls["tool_profile"] = settings.tool_filter.profile
+            calls["tool_filter_enabled"] = settings.tool_filter.enabled
+        return object()
+
     monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
     monkeypatch.setattr("mcp_agent_mail.cli.build_http_app", fake_build_http_app)
-    monkeypatch.setattr("mcp_agent_mail.cli.build_mcp_server", lambda: object())
+    monkeypatch.setattr("mcp_agent_mail.cli.build_mcp_server", fake_build_mcp_server)
     res2 = runner.invoke(app, ["serve-http", "--host", "0.0.0.0", "--port", "9999", "--path", "/m"])
     assert res2.exit_code == 0
     assert calls.get("path") == "/m"
     assert calls.get("host") == "0.0.0.0"
     assert calls.get("port") == 9999
+
+    res3 = runner.invoke(app, ["serve-http", "--tool-profile", "agent"])
+    assert res3.exit_code == 0
+    assert calls.get("tool_profile") == "agent"
+    assert calls.get("tool_filter_enabled") is True
 
 
 def test_cli_products_search_disambiguates_cross_project_sender(isolated_env, monkeypatch):

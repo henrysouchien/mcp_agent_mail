@@ -667,6 +667,93 @@ async def test_fetch_inbox_include_bodies(isolated_env):
         assert "full message body" in msg_dict["body_md"]
 
 
+@pytest.mark.asyncio
+async def test_compact_receipts_cursor_sync_and_batch_updates(isolated_env):
+    """The token-efficient flow should preserve full communication without replaying bodies."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        agents = await setup_project_with_agents(client, "/test/compact-sync", count=2)
+        sender, receiver = agents[0], agents[1]
+
+        sent_ids: list[int] = []
+        for index in range(3):
+            sent = await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/test/compact-sync",
+                    "sender_name": sender,
+                    "to": [receiver],
+                    "subject": f"Compact {index}",
+                    "body_md": f"Full body {index}",
+                    "ack_required": index == 0,
+                },
+            )
+            receipt = sent.data["deliveries"][0]["payload"]
+            assert "body_md" not in receipt
+            sent_ids.append(receipt["id"])
+
+        first_sync = await client.call_tool(
+            "sync_inbox",
+            {
+                "project_key": "/test/compact-sync",
+                "agent_name": receiver,
+                "cursor": 0,
+                "limit": 2,
+            },
+        )
+        first_messages = first_sync.data["messages"]
+        assert [message["id"] for message in first_messages] == sent_ids[:2]
+        assert all("body_md" not in message for message in first_messages)
+        assert first_sync.data["has_more"] is True
+
+        second_sync = await client.call_tool(
+            "sync_inbox",
+            {
+                "project_key": "/test/compact-sync",
+                "agent_name": receiver,
+                "cursor": first_sync.data["next_cursor"],
+                "limit": 2,
+            },
+        )
+        assert [message["id"] for message in second_sync.data["messages"]] == sent_ids[2:]
+        assert second_sync.data["has_more"] is False
+
+        selected = await client.call_tool(
+            "read_messages",
+            {
+                "project_key": "/test/compact-sync",
+                "agent_name": receiver,
+                "message_ids": [sent_ids[0], sent_ids[2]],
+            },
+        )
+        assert [message["body_md"] for message in selected.data["messages"]] == ["Full body 0", "Full body 2"]
+
+        updated = await client.call_tool(
+            "update_messages",
+            {
+                "project_key": "/test/compact-sync",
+                "agent_name": receiver,
+                "read_ids": [sent_ids[1], sent_ids[2]],
+                "acknowledge_ids": [sent_ids[0]],
+            },
+        )
+        assert updated.data == {
+            "read_ids": sent_ids,
+            "acknowledged_ids": [sent_ids[0]],
+            "not_in_inbox_ids": [],
+        }
+
+        unread = await client.call_tool(
+            "fetch_inbox",
+            {
+                "project_key": "/test/compact-sync",
+                "agent_name": receiver,
+                "unread_only": True,
+            },
+        )
+        assert get_inbox_items(unread) == []
+
+
 # ============================================================================
 # Reply Message Tests
 # ============================================================================

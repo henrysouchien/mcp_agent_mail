@@ -123,6 +123,42 @@ class TestToolFilter:
         assert _should_expose_tool("file_reservation_paths", "file_reservations", settings) is False
         assert _should_expose_tool("acquire_build_slot", "build_slots", settings) is False
 
+    @pytest.mark.asyncio
+    async def test_agent_profile_keeps_coordination_tools_with_small_schema(self, isolated_env, monkeypatch):
+        """The agent profile preserves communication and reservations while shrinking context."""
+        from fastmcp import Client
+
+        from mcp_agent_mail.app import build_mcp_server
+        from mcp_agent_mail.config import clear_settings_cache
+
+        clear_settings_cache()
+        async with Client(build_mcp_server()) as client:
+            full_tools = await client.list_tools()
+        full_schema_chars = len(json.dumps([tool.model_dump(mode="json") for tool in full_tools]))
+
+        monkeypatch.setenv("TOOLS_FILTER_ENABLED", "true")
+        monkeypatch.setenv("TOOLS_FILTER_PROFILE", "agent")
+        clear_settings_cache()
+        async with Client(build_mcp_server()) as client:
+            agent_tools = await client.list_tools()
+
+        names = {tool.name for tool in agent_tools}
+        assert names == {
+            "macro_start_session",
+            "sync_inbox",
+            "read_messages",
+            "update_messages",
+            "send_message",
+            "reply_message",
+            "request_contact",
+            "respond_contact",
+            "list_contacts",
+            "file_reservation_paths",
+            "release_file_reservations",
+        }
+        agent_schema_chars = len(json.dumps([tool.model_dump(mode="json") for tool in agent_tools]))
+        assert agent_schema_chars < full_schema_chars * 0.5
+
 
 class TestNotifications:
     """Tests for NOTIFICATIONS_ENABLED feature."""
