@@ -39,6 +39,7 @@ import uuid
 from fastmcp import Context, FastMCP
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import aliased
 
 from . import rich_logger
@@ -6605,7 +6606,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
               "environment": str,
               "http_host": str,
               "http_port": int,
-              "database_url": str
+              "database_url": str  # password-redacted
             }
 
         Examples
@@ -6625,7 +6626,9 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "environment": settings.environment,
             "http_host": settings.http.host,
             "http_port": settings.http.port,
-            "database_url": settings.database.url,
+            "database_url": make_url(settings.database.url).render_as_string(
+                hide_password=True
+            ),
         }
 
     @mcp.tool(name="ensure_project")

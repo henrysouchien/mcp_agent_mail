@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -19,6 +20,7 @@ from mcp_agent_mail.app import (
     _reservation_repo_pathspec,
     build_mcp_server,
 )
+from mcp_agent_mail.config import get_settings
 
 
 def test_iso_and_parse_helpers():
@@ -37,6 +39,32 @@ def test_iso_and_parse_helpers():
     assert _parse_json_safely(fenced) == {"x": 2}
     noisy = "xxx {\n \"y\": 3\n} yyy"
     assert _parse_json_safely(noisy) == {"y": 3}
+
+
+@pytest.mark.asyncio
+async def test_health_check_redacts_database_password(isolated_env, monkeypatch) -> None:
+    settings = get_settings()
+    settings_with_password = replace(
+        settings,
+        database=replace(
+            settings.database,
+            url="postgresql+asyncpg://mail_user:database-secret@db.example.test/agent_mail",
+        ),
+    )
+    # The test exercises response rendering with a future credential-bearing
+    # backend URL while retaining the isolated SQLite engine for lifespan.
+    async def keep_isolated_schema(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr("mcp_agent_mail.app.init_engine", lambda _settings: None)
+    monkeypatch.setattr("mcp_agent_mail.app.ensure_schema", keep_isolated_schema)
+    async with Client(build_mcp_server(settings_override=settings_with_password)) as client:
+        result = await client.call_tool("health_check", {})
+
+    database_url = result.data["database_url"]
+    assert "database-secret" not in database_url
+    assert "***" in database_url
+    assert database_url.startswith("postgresql+asyncpg://mail_user:")
 
 
 def test_enforce_capabilities_denied():

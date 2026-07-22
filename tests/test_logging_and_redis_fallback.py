@@ -14,9 +14,13 @@ from mcp_agent_mail.rich_logger import ToolCallContext, _safe_json_format, rende
 def test_rich_tool_logging_redacts_nested_credentials() -> None:
     secrets = {
         "registration_token": "registration-secret",
+        "owner_token": "owner-secret",
+        "bootstrap_credential": "bootstrap-secret",
         "nested": {
             "sender-token": "sender-secret",
             "Authorization": "Bearer transport-secret",
+            "pane_credential": "pane-input-secret",
+            "credential_pepper": "pepper-secret",
             "safe": "visible-value",
         },
         "requester_registration_token": "requester-secret",
@@ -25,7 +29,12 @@ def test_rich_tool_logging_redacts_nested_credentials() -> None:
         tool_name="send_message",
         args=[],
         kwargs=secrets,
-        result={"registration_token": "result-secret", "status": "ok"},
+        result={
+            "registration_token": "result-secret",
+            "pane_credential": "pane-result-secret",
+            "bootstrap_credential": "bootstrap-result-secret",
+            "status": "ok",
+        },
     )
     ctx.end_time = ctx.start_time + 0.01
 
@@ -34,10 +43,16 @@ def test_rich_tool_logging_redacts_nested_credentials() -> None:
 
     for secret in (
         "registration-secret",
+        "owner-secret",
+        "bootstrap-secret",
         "sender-secret",
         "transport-secret",
+        "pane-input-secret",
+        "pepper-secret",
         "requester-secret",
         "result-secret",
+        "pane-result-secret",
+        "bootstrap-result-secret",
     ):
         assert secret not in rendered
         assert secret not in serialized_params
