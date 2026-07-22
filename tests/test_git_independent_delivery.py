@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 import pytest
 from fastmcp import Client
 from sqlalchemy import func, select
@@ -11,6 +14,8 @@ from mcp_agent_mail.db import ensure_schema, get_immediate_session, get_session
 from mcp_agent_mail.models import (
     Agent,
     AuditEvent,
+    Blob,
+    BlobReference,
     IdempotencyRecord,
     Message,
     Project,
@@ -83,6 +88,106 @@ async def test_live_registration_never_opens_archive_for_git_independent_project
         assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True
+
+
+@pytest.mark.asyncio
+async def test_live_send_installs_blob_attachments_before_atomic_references(
+    isolated_env: object,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "migration")
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    monkeypatch.setenv("BLOB_STORAGE_ROOT", str(tmp_path / "blobs"))
+    clear_settings_cache()
+    await ensure_schema()
+    async with get_immediate_session() as session:
+        project = Project(slug="blob-live", human_key=str(tmp_path))
+        session.add(project)
+        await session.flush()
+        assert project.id is not None
+        sender = Agent(
+            project_id=project.id,
+            name="BlobSender",
+            program="test",
+            model="test",
+            registration_token="sender-secret",
+            contact_policy="open",
+        )
+        recipient = Agent(
+            project_id=project.id,
+            name="BlobRecipient",
+            program="test",
+            model="test",
+            registration_token="recipient-secret",
+            contact_policy="open",
+        )
+        session.add_all([sender, recipient])
+        await session.flush()
+        baseline = await append_audit_event(
+            session,
+            project_id=project.id,
+            actor_kind="system",
+            actor_scope_id="system/new-project",
+            actor_agent_id=None,
+            operation_kind="project_created_v1",
+            entity_type="project",
+            entity_id=str(project.id),
+            payload_version="project-created-v1",
+            payload={"slug": project.slug},
+        )
+        await session.flush()
+        assert baseline.id is not None
+        session.add(
+            ProjectStorageCutover(
+                project_id=project.id,
+                state="git_independent",
+                generation=1,
+                baseline_event_id=baseline.id,
+            )
+        )
+        await session.commit()
+
+    file_bytes = b"durable attachment bytes"
+    attachment_path = tmp_path / "evidence.txt"
+    attachment_path.write_bytes(file_bytes)
+    inline_bytes = b"inline image bytes"
+    inline_uri = base64.b64encode(inline_bytes).decode("ascii")
+    arguments = {
+        "project_key": str(tmp_path),
+        "sender_name": "BlobSender",
+        "sender_token": "sender-secret",
+        "to": ["BlobRecipient"],
+        "subject": "Blob-backed",
+        "body_md": f"proof ![image](data:image/png;base64,{inline_uri})",
+        "attachment_paths": [str(attachment_path)],
+        "idempotency_key": "blob-live-key",
+    }
+    async with Client(build_mcp_server()) as client:
+        first = await client.call_tool("send_message", arguments)
+        replay = await client.call_tool("send_message", arguments)
+
+    first_payload = first.data["deliveries"][0]["payload"]
+    replay_payload = replay.data["deliveries"][0]["payload"]
+    assert first_payload["replayed"] is False
+    assert replay_payload["replayed"] is True
+    assert replay_payload["id"] == first_payload["id"]
+    assert len(first_payload["attachments"]) == 2
+    assert "data:image" not in first_payload["body_md"]
+    assert first_payload["body_md"].count("blob:sha256:") == 1
+
+    async with get_session() as session:
+        message = (await session.execute(select(Message))).scalar_one()
+        blobs = (await session.execute(select(Blob))).scalars().all()
+        references = (await session.execute(select(BlobReference))).scalars().all()
+    assert "data:image" not in message.body_md
+    assert len(blobs) == 2
+    assert len(references) == 2
+    for blob in blobs:
+        object_path = tmp_path / "blobs" / blob.storage_key
+        assert object_path.is_file()
+        assert object_path.read_bytes() in {file_bytes, inline_bytes}
+    assert list((tmp_path / "blobs" / "leases" / "install").glob("*.lease")) == []
 
 
 @pytest.mark.asyncio

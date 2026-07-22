@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .audit import append_audit_event
+from .blob_store import BlobInstallation, add_blob_reference
 from .idempotency import IdempotencyResult, MutationReceipt, run_idempotent_mutation
 from .models import Agent, Message, MessageRecipient
 
@@ -25,6 +26,15 @@ class AtomicMessageResult:
     response: Mapping[str, Any]
     replayed: bool
     message_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicAttachment:
+    installation: BlobInstallation
+    metadata: Mapping[str, Any]
+    role: str
+    media_type: str
+    display_name: str
 
 
 def _utcnow_naive() -> datetime:
@@ -84,9 +94,15 @@ async def create_atomic_message(
     reply_to: int | None,
     attachments: Sequence[dict[str, Any]],
     idempotency_key: str | None,
+    blob_attachments: Sequence[AtomicAttachment] = (),
     retry_horizon: timedelta = timedelta(days=30),
 ) -> AtomicMessageResult:
     """Create a message, recipients, audit event, and optional receipt atomically."""
+    if blob_attachments and [dict(item.metadata) for item in blob_attachments] != list(attachments):
+        raise ValueError("blob attachment metadata must match the persisted attachment list")
+    for item in blob_attachments:
+        if item.metadata.get("digest") != item.installation.blob.digest:
+            raise ValueError("blob attachment digest does not match its durable installation")
     payload = _request_payload(
         project_id=project_id,
         sender_id=sender_id,
@@ -121,6 +137,16 @@ async def create_atomic_message(
         await transaction.flush()
         if message.id is None:
             raise RuntimeError("message id was not allocated")
+        for attachment in blob_attachments:
+            await add_blob_reference(
+                transaction,
+                attachment.installation,
+                entity_type="message",
+                entity_id=str(message.id),
+                role=attachment.role,
+                media_type=attachment.media_type,
+                display_name=attachment.display_name,
+            )
         for recipient in recipients:
             transaction.add(
                 MessageRecipient(
@@ -154,17 +180,19 @@ async def create_atomic_message(
         response: dict[str, Any] = {
             "id": message.id,
             "project_id": project_id,
+            "sender_id": sender_id,
             "thread_id": thread_id,
             "topic": topic,
             "subject": subject,
+            "body_md": body_md,
             "importance": importance,
             "ack_required": ack_required,
+            "reply_to": reply_to,
+            "attachments": list(attachments),
             "created_ts": _iso(message.created_ts),
             "audit_event_id": event.id,
             "event_hash": event.event_hash,
         }
-        if reply_to is not None:
-            response["reply_to"] = reply_to
         return MutationReceipt(
             response=response,
             entity_type="message",

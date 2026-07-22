@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import fnmatch
 import functools
@@ -12,6 +14,7 @@ import hmac
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -60,7 +63,8 @@ from .db import (
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .llm import complete_system_user
-from .message_service import RecipientIdentity, create_atomic_message
+from .blob_store import BlobStore
+from .message_service import AtomicAttachment, RecipientIdentity, create_atomic_message
 from .models import (
     Agent,
     AgentLink,
@@ -1991,6 +1995,121 @@ def _message_receipt(message: Message) -> dict[str, Any]:
     if message.reply_to is not None:
         receipt["reply_to"] = message.reply_to
     return receipt
+
+
+_INLINE_IMAGE_DATA_URI = re.compile(
+    r"data:(?P<media_type>image/[a-zA-Z0-9.+-]+);base64,(?P<payload>[a-zA-Z0-9+/=\r\n]+)",
+    re.IGNORECASE,
+)
+
+
+async def _prepare_git_independent_attachments(
+    settings: Settings,
+    project: Project,
+    body_md: str,
+    attachment_paths: Sequence[str] | None,
+) -> tuple[str, list[dict[str, Any]], list[AtomicAttachment]]:
+    """Install message attachments before their database references are committed."""
+    store = BlobStore(settings.storage.blob_root)
+    metadata: list[dict[str, Any]] = []
+    attachments: list[AtomicAttachment] = []
+    max_bytes = (
+        settings.quota_attachments_limit_bytes
+        if settings.quota_enabled and settings.quota_attachments_limit_bytes > 0
+        else None
+    )
+
+    async def install_bytes(data: bytes, media_type: str, display_name: str) -> str:
+        installation = await store.install_bytes(data, max_bytes=max_bytes)
+        digest = installation.blob.digest
+        item = {
+            "type": "blob",
+            "digest": digest,
+            "sha256": digest,
+            "bytes": installation.blob.byte_length,
+            "media_type": media_type,
+            "display_name": display_name,
+            "uri": f"blob:sha256:{digest}",
+        }
+        index = len(metadata)
+        metadata.append(item)
+        attachments.append(
+            AtomicAttachment(
+                installation=installation,
+                metadata=item,
+                role=f"attachment:{index}",
+                media_type=media_type,
+                display_name=display_name,
+            )
+        )
+        return item["uri"]
+
+    try:
+        body_parts: list[str] = []
+        cursor = 0
+        for inline_index, match in enumerate(_INLINE_IMAGE_DATA_URI.finditer(body_md), start=1):
+            body_parts.append(body_md[cursor : match.start()])
+            try:
+                encoded = re.sub(r"\s+", "", match.group("payload"))
+                data = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("Inline image contains invalid base64 data") from exc
+            uri = await install_bytes(
+                data,
+                match.group("media_type").lower(),
+                f"inline-image-{inline_index}",
+            )
+            body_parts.append(uri)
+            cursor = match.end()
+        body_parts.append(body_md[cursor:])
+        processed_body = "".join(body_parts)
+
+        for raw_path in attachment_paths or ():
+            source = Path(raw_path).expanduser()
+            if source.is_absolute():
+                if not settings.storage.allow_absolute_attachment_paths:
+                    raise ValueError(
+                        "Absolute attachment paths are disabled. Set "
+                        "ALLOW_ABSOLUTE_ATTACHMENT_PATHS=true to enable."
+                    )
+                resolved = source.resolve(strict=True)
+            else:
+                project_root = Path(project.human_key).expanduser().resolve(strict=True)
+                resolved = (project_root / source).resolve(strict=True)
+                try:
+                    resolved.relative_to(project_root)
+                except ValueError as exc:
+                    raise ValueError("Attachment path escapes the project root") from exc
+            if not resolved.is_file():
+                raise ValueError(f"Attachment path is not a file: {raw_path}")
+            media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            installation = await store.install_file(resolved, max_bytes=max_bytes)
+            digest = installation.blob.digest
+            item = {
+                "type": "blob",
+                "digest": digest,
+                "sha256": digest,
+                "bytes": installation.blob.byte_length,
+                "media_type": media_type,
+                "display_name": resolved.name,
+                "uri": f"blob:sha256:{digest}",
+            }
+            index = len(metadata)
+            metadata.append(item)
+            attachments.append(
+                AtomicAttachment(
+                    installation=installation,
+                    metadata=item,
+                    role=f"attachment:{index}",
+                    media_type=media_type,
+                    display_name=resolved.name,
+                )
+            )
+        return processed_body, metadata, attachments
+    except BaseException:
+        for attachment in attachments:
+            await attachment.installation.release()
+        raise
 
 
 def _format_cross_project_agent_address(project_slug: str, agent_name: str) -> str:
@@ -5727,93 +5846,112 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         if project.id is None or sender.id is None or sender_project.id is None:
             raise ValueError("Project and sender identities must be persisted before delivery.")
 
-        async with get_immediate_session() as route_session:
+        async with get_session() as route_read_session:
             route = await resolve_storage_route(
-                route_session,
+                route_read_session,
                 project_id=project.id,
                 runtime_profile=settings.runtime_profile,
                 for_mutation=True,
             )
-            if route.state == GIT_INDEPENDENT:
-                if attachment_paths or "data:image" in body_md:
-                    raise ToolExecutionError(
-                        "GIT_INDEPENDENT_ATTACHMENT_MIGRATION_REQUIRED",
-                        "This project requires blob-backed attachment ingestion for this message.",
-                        recoverable=True,
+        if route.state == GIT_INDEPENDENT:
+            processed_body, attachments_meta, blob_attachments = (
+                await _prepare_git_independent_attachments(
+                    settings,
+                    project,
+                    body_md,
+                    attachment_paths,
+                )
+            )
+            try:
+                async with get_immediate_session() as route_session:
+                    transaction_route = await resolve_storage_route(
+                        route_session,
+                        project_id=project.id,
+                        runtime_profile=settings.runtime_profile,
+                        for_mutation=True,
                     )
-                atomic_result = await create_atomic_message(
-                    route_session,
-                    project_id=project.id,
-                    sender_id=sender.id,
-                    actor_scope_id=f"{sender_project.id}:{sender.id}",
-                    recipients=[
-                        RecipientIdentity(
-                            agent_id=cast(int, recipient.id),
-                            name=recipient.name,
-                            kind=kind,
-                        )
-                        for recipient, kind in recipient_records
-                    ],
-                    subject=subject,
-                    body_md=body_md,
-                    importance=importance,
-                    ack_required=ack_required,
-                    thread_id=thread_id,
-                    topic=topic,
-                    reply_to=reply_to,
-                    attachments=[],
-                    idempotency_key=idempotency_key,
-                )
-                await assert_route_generation(
-                    route_session,
-                    project_id=project.id,
-                    expected_state=route.state,
-                    expected_generation=route.generation,
-                )
-                await route_session.commit()
-
-                payload = dict(atomic_result.response)
-                payload.update(
-                    {
-                        "to": [agent.name for agent in to_agents],
-                        "cc": [agent.name for agent in cc_agents],
-                        "bcc": [agent.name for agent in bcc_agents],
-                        "attachments": [],
-                        "replayed": atomic_result.replayed,
-                        "retry_safety": (
-                            "safe_with_idempotency_key"
-                            if idempotency_key
-                            else "unsafe_without_key"
-                        ),
-                    }
-                )
-                _apply_sender_identity(
-                    payload,
-                    message_project_id=project.id,
-                    sender_name=sender.name,
-                    sender_project_id=sender_project.id,
-                    sender_project_human_key=sender_project.human_key,
-                    sender_project_slug=sender_project.slug,
-                )
-                if settings.notifications.enabled and not atomic_result.replayed:
-                    notification_meta = {
-                        "id": atomic_result.message_id,
-                        "from": sender.name,
-                        "subject": subject,
-                        "importance": importance,
-                    }
-                    for target in to_agents + cc_agents:
-                        with suppress(Exception):
-                            await emit_notification_signal(
-                                settings,
-                                project.slug,
-                                target.name,
-                                notification_meta,
+                    if (
+                        transaction_route.state != route.state
+                        or transaction_route.generation != route.generation
+                    ):
+                        raise RuntimeError("Project storage route changed before message mutation")
+                    atomic_result = await create_atomic_message(
+                        route_session,
+                        project_id=project.id,
+                        sender_id=sender.id,
+                        actor_scope_id=f"{sender_project.id}:{sender.id}",
+                        recipients=[
+                            RecipientIdentity(
+                                agent_id=cast(int, recipient.id),
+                                name=recipient.name,
+                                kind=kind,
                             )
-                await ctx.info(
-                    f"Message {atomic_result.message_id} committed through Git-independent storage."
-                )
-                return payload
+                            for recipient, kind in recipient_records
+                        ],
+                        subject=subject,
+                        body_md=processed_body,
+                        importance=importance,
+                        ack_required=ack_required,
+                        thread_id=thread_id,
+                        topic=topic,
+                        reply_to=reply_to,
+                        attachments=attachments_meta,
+                        idempotency_key=idempotency_key,
+                        blob_attachments=blob_attachments,
+                    )
+                    await assert_route_generation(
+                        route_session,
+                        project_id=project.id,
+                        expected_state=route.state,
+                        expected_generation=route.generation,
+                    )
+                    await route_session.commit()
+            finally:
+                for attachment in blob_attachments:
+                    await attachment.installation.release()
+
+            payload = dict(atomic_result.response)
+            payload.update(
+                {
+                    "to": [agent.name for agent in to_agents],
+                    "cc": [agent.name for agent in cc_agents],
+                    "bcc": [agent.name for agent in bcc_agents],
+                    "attachments": attachments_meta,
+                    "replayed": atomic_result.replayed,
+                    "retry_safety": (
+                        "safe_with_idempotency_key"
+                        if idempotency_key
+                        else "unsafe_without_key"
+                    ),
+                }
+            )
+            _apply_sender_identity(
+                payload,
+                message_project_id=project.id,
+                sender_name=sender.name,
+                sender_project_id=sender_project.id,
+                sender_project_human_key=sender_project.human_key,
+                sender_project_slug=sender_project.slug,
+            )
+            if settings.notifications.enabled and not atomic_result.replayed:
+                notification_meta = {
+                    "id": atomic_result.message_id,
+                    "from": sender.name,
+                    "subject": subject,
+                    "importance": importance,
+                }
+                for target in to_agents + cc_agents:
+                    with suppress(Exception):
+                        await emit_notification_signal(
+                            settings,
+                            project.slug,
+                            target.name,
+                            notification_meta,
+                        )
+            await ctx.info(
+                f"Message {atomic_result.message_id} committed through Git-independent storage."
+            )
+            return payload
 
         archive = await ensure_archive(settings, project.slug)
         sender_archive_label = _sender_display_name(
