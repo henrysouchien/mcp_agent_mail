@@ -62,6 +62,7 @@ from .db import (
     stop_query_tracking,
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
+from .idempotency import MutationReceipt, run_idempotent_mutation
 from .llm import complete_system_user
 from .blob_store import BlobStore
 from .message_service import AtomicAttachment, RecipientIdentity, create_atomic_message
@@ -12009,6 +12010,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         exclusive: bool = True,
         reason: str = "",
         registration_token: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -12104,6 +12106,217 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         )
         if project.id is None:
             raise ValueError("Project must have an id before reserving file paths.")
+        project_id = project.id
+        # Validate path patterns and warn on suspicious patterns
+        for pattern in paths:
+            warning = _detect_suspicious_file_reservation(pattern)
+            if warning:
+                await ctx.info(f"[warn] {warning}")
+
+        async with get_session() as route_read_session:
+            route = await resolve_storage_route(
+                route_read_session,
+                project_id=project_id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+        if route.state == GIT_INDEPENDENT:
+            warnings_list: list[str] = []
+            advisory_only_paths = [p for p in paths if not _looks_like_archive_path(p)]
+            if advisory_only_paths:
+                warnings_list.append(
+                    "enforcement_off_for_code_paths: "
+                    f"{len(advisory_only_paths)} of {len(paths)} reserved paths are "
+                    "code-repo paths; server-side exclusivity is advisory only. "
+                    "Install the pre-commit guard via `install_precommit_guard` for "
+                    "the authoritative reservation gate."
+                )
+
+            request_payload = {
+                "exclusive": exclusive,
+                "paths": list(paths),
+                "reason": reason,
+                "ttl_seconds": ttl_seconds,
+            }
+
+            async def reserve_atomic(transaction: Any) -> MutationReceipt:
+                now = _naive_utc()
+                await transaction.execute(
+                    update(FileReservation)
+                    .where(
+                        cast(Any, FileReservation.project_id) == project_id,
+                        cast(Any, FileReservation.released_ts).is_(None),
+                        cast(Any, FileReservation.expires_ts) <= now,
+                    )
+                    .values(released_ts=now)
+                )
+                existing_rows = await transaction.execute(
+                    select(FileReservation, Agent.name)
+                    .join(Agent, cast(Any, FileReservation.agent_id) == Agent.id)
+                    .where(
+                        cast(Any, FileReservation.project_id) == project_id,
+                        cast(Any, FileReservation.released_ts).is_(None),
+                        cast(Any, FileReservation.expires_ts) > now,
+                    )
+                )
+                existing_reservations = [(row[0], row[1]) for row in existing_rows.all()]
+                granted_atomic: list[dict[str, Any]] = []
+                conflicts_atomic: list[dict[str, Any]] = []
+                union_spec = _build_reservation_union_spec(
+                    existing_reservations,
+                    agent.id,
+                    exclusive,
+                )
+                potentially_conflicting_paths: set[str]
+                if union_spec is None:
+                    potentially_conflicting_paths = set(paths)
+                else:
+                    normalized_paths = [_normalize_pathspec_pattern(path) for path in paths]
+                    matching = set(union_spec.match_files(normalized_paths))
+                    potentially_conflicting_paths = {
+                        original
+                        for original, normalized in zip(paths, normalized_paths, strict=True)
+                        if normalized in matching or _contains_glob(normalized)
+                    }
+
+                for path in paths:
+                    existing_self = next(
+                        (
+                            reservation
+                            for reservation, _holder in existing_reservations
+                            if reservation.agent_id == agent.id
+                            and reservation.path_pattern == path
+                        ),
+                        None,
+                    )
+                    holders: list[dict[str, Any]] = []
+                    if path in potentially_conflicting_paths:
+                        for reservation, holder_name in existing_reservations:
+                            if _file_reservations_conflict(reservation, path, exclusive, agent):
+                                holders.append(
+                                    {
+                                        "agent": holder_name,
+                                        "path_pattern": reservation.path_pattern,
+                                        "exclusive": reservation.exclusive,
+                                        "expires_ts": _iso(reservation.expires_ts),
+                                    }
+                                )
+                    if holders:
+                        conflicts_atomic.append({"path": path, "holders": holders})
+
+                    requested_expiry = now + timedelta(seconds=ttl_seconds)
+                    reused = existing_self is not None
+                    if existing_self is None:
+                        reservation = FileReservation(
+                            project_id=project_id,
+                            agent_id=agent.id,
+                            path_pattern=path,
+                            exclusive=exclusive,
+                            reason=reason,
+                            expires_ts=requested_expiry,
+                        )
+                        transaction.add(reservation)
+                        await transaction.flush()
+                    else:
+                        reservation = existing_self
+                        current_expiry = reservation.expires_ts
+                        if getattr(current_expiry, "tzinfo", None) is not None:
+                            current_expiry = _naive_utc(current_expiry)
+                        reservation.exclusive = exclusive
+                        if reason or not reservation.reason:
+                            reservation.reason = reason
+                        reservation.expires_ts = max(requested_expiry, current_expiry)
+                        transaction.add(reservation)
+                    granted_atomic.append(
+                        {
+                            "id": reservation.id,
+                            "path_pattern": reservation.path_pattern,
+                            "exclusive": reservation.exclusive,
+                            "reason": reservation.reason,
+                            "expires_ts": _iso(reservation.expires_ts),
+                            "reused": reused,
+                        }
+                    )
+                    existing_reservations.append((reservation, agent.name))
+
+                event = await append_audit_event(
+                    transaction,
+                    project_id=project_id,
+                    actor_kind="agent",
+                    actor_scope_id=f"{project_id}:{agent.id}",
+                    actor_agent_id=agent.id,
+                    operation_kind="file_reservations_acquire_v1",
+                    entity_type="file_reservation_batch",
+                    entity_id=idempotency_key or f"agent:{agent.id}",
+                    payload_version="file-reservation-batch-v1",
+                    payload={
+                        "conflict_count": len(conflicts_atomic),
+                        "exclusive": exclusive,
+                        "paths": list(paths),
+                        "reservation_ids": [item["id"] for item in granted_atomic],
+                        "ttl_seconds": ttl_seconds,
+                    },
+                )
+                response = {
+                    "granted": granted_atomic,
+                    "conflicts": conflicts_atomic,
+                    "warnings": warnings_list,
+                    "audit_event_id": event.id,
+                    "event_hash": event.event_hash,
+                }
+                return MutationReceipt(
+                    response=response,
+                    entity_type="file_reservation_batch",
+                    entity_id=idempotency_key or f"agent:{agent.id}",
+                    project_id=project_id,
+                )
+
+            async with get_immediate_session() as session:
+                transaction_route = await resolve_storage_route(
+                    session,
+                    project_id=project_id,
+                    runtime_profile=settings.runtime_profile,
+                    for_mutation=True,
+                )
+                if (
+                    transaction_route.state != route.state
+                    or transaction_route.generation != route.generation
+                ):
+                    raise RuntimeError("Project storage route changed before reservation mutation")
+                if idempotency_key:
+                    atomic_result = await run_idempotent_mutation(
+                        session,
+                        scope_kind="agent",
+                        scope_id=f"{project_id}:{agent.id}",
+                        operation_kind="file_reservations_acquire_v1",
+                        idempotency_key=idempotency_key,
+                        request_payload=request_payload,
+                        expires_ts=_naive_utc() + timedelta(days=30),
+                        mutate=reserve_atomic,
+                    )
+                    response = dict(atomic_result.response)
+                    replayed = atomic_result.replayed
+                else:
+                    receipt = await reserve_atomic(session)
+                    response = dict(receipt.response)
+                    replayed = False
+                await assert_route_generation(
+                    session,
+                    project_id=project_id,
+                    expected_state=route.state,
+                    expected_generation=route.generation,
+                )
+                await session.commit()
+            response["replayed"] = replayed
+            response["retry_safety"] = (
+                "safe_with_idempotency_key" if idempotency_key else "unsafe_without_key"
+            )
+            await ctx.info(
+                f"Issued {len(response['granted'])} Git-independent file_reservations "
+                f"for '{agent.name}'. Conflicts: {len(response['conflicts'])}"
+            )
+            return response
+
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
         if stale_auto_releases:
             summary = ", ".join(
@@ -12112,13 +12325,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             extra = f" ({summary})" if summary else ""
             await ctx.info(f"Auto-released {len(stale_auto_releases)} stale file_reservation(s){extra}.")
-        project_id = project.id
-        # Validate path patterns and warn on suspicious patterns
-        for pattern in paths:
-            warning = _detect_suspicious_file_reservation(pattern)
-            if warning:
-                await ctx.info(f"[warn] {warning}")
-
         granted: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
         archive = await ensure_archive(settings, project.slug)
@@ -12291,7 +12497,12 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 "Install the pre-commit guard via `install_precommit_guard` for "
                 "the authoritative reservation gate."
             )
-        return {"granted": granted, "conflicts": conflicts, "warnings": warnings_list}
+        return {
+            "granted": granted,
+            "conflicts": conflicts,
+            "warnings": warnings_list,
+            "retry_safety": "unsafe_legacy",
+        }
 
     @mcp.tool(
         name="release_file_reservations",
