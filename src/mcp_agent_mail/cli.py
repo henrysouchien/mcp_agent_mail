@@ -3227,6 +3227,10 @@ def archive_restore_state(
                 console.print(f"  • {op}")
             if not typer.confirm("Proceed with restore?", default=False):
                 raise typer.Exit(code=1)
+        # A restore replaces the SQLite file itself.  Dispose every pooled
+        # connection before moving sidecars or installing the snapshot so no
+        # caller can keep reading or writing the superseded inode.
+        reset_database_state()
         backup_paths: list[Path] = []
         db_backup: Optional[Path] = None
         sidecar_backups: list[tuple[Path, Path]] = []

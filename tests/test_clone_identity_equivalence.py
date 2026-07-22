@@ -10,7 +10,9 @@ def _git(cwd: Path, *args: str) -> str:
     return cp.stdout.strip()
 
 
-def test_clones_share_same_project_uid_via_remote(tmp_path: Path, monkeypatch) -> None:
+def test_local_remote_does_not_merge_distinct_workspace_namespaces(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
     get_settings.cache_clear()
     # Create bare remote
@@ -24,5 +26,5 @@ def test_clones_share_same_project_uid_via_remote(tmp_path: Path, monkeypatch) -
     id1 = _resolve_project_identity(str(c1))
     id2 = _resolve_project_identity(str(c2))
     assert id1["normalized_remote"] == id2["normalized_remote"]
-    assert id1["project_uid"] == id2["project_uid"]
-
+    assert id1["normalized_remote"] is None
+    assert id1["project_uid"] != id2["project_uid"]

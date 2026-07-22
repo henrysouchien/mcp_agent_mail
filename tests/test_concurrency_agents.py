@@ -685,12 +685,12 @@ class TestNoDeadlocks:
         assert all(call["held_depth"] == 0 for call in notification_calls)
 
     @pytest.mark.asyncio
-    async def test_file_reservation_git_probe_happens_before_archive_lock(
+    async def test_database_reservation_skips_legacy_git_probe(
         self,
         isolated_env,
         monkeypatch,
     ):
-        """Git metadata collection must not run while the archive lock is held."""
+        """The canonical database path does not enter legacy Git/archive code."""
         await ensure_schema()
         project_key = f"/test/concurrent/file-reservation-git/{random_id()}"
         server = build_mcp_server()
@@ -743,7 +743,7 @@ class TestNoDeadlocks:
             )
 
         assert result.data["granted"][0]["path_pattern"] == "src/lock-scope.py"
-        assert git_probe_states == [0]
+        assert git_probe_states == []
 
     @pytest.mark.asyncio
     async def test_mixed_operations_no_deadlock(self, isolated_env):

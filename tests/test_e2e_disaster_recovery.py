@@ -225,6 +225,7 @@ class TestDisasterRecoveryE2E:
                 },
             )
             agent2_name = agent2.data["name"]
+            agent2_token = agent2.data["registration_token"]
 
             agent3 = await client.call_tool(
                 "create_agent_identity",
@@ -433,6 +434,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "agent_name": agent2_name,
+                    "registration_token": agent2_token,
                     "include_bodies": True,
                 },
             )
@@ -556,11 +558,13 @@ class TestPartialRecovery:
                 },
             )
             agent_name = agent.data["name"]
+            agent_token = agent.data["registration_token"]
             await client.call_tool(
                 "send_message",
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
+                    "sender_token": agent_token,
                     "to": [agent_name],
                     "subject": "Pre-wipe message",
                     "body_md": "This should survive the restore.",
@@ -613,6 +617,7 @@ class TestMultipleArchives:
 
         server = build_mcp_server()
         project_key = "/multi-archive-test"
+        agent_token: str
 
         # Create initial state with 2 messages
         async with Client(server) as client:
@@ -626,6 +631,7 @@ class TestMultipleArchives:
                 },
             )
             agent_name = agent.data["name"]
+            agent_token = agent.data["registration_token"]
 
             await client.call_tool(
                 "send_message",
@@ -660,6 +666,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
+                    "sender_token": agent_token,
                     "to": [agent_name],
                     "subject": "Third message",
                     "body_md": "Second archive state.",
