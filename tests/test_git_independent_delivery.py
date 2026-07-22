@@ -9,12 +9,14 @@ from typing import Any, cast
 
 import pytest
 from fastmcp import Client
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.audit import append_audit_event, verify_audit_chain
-from mcp_agent_mail.config import clear_settings_cache
+from mcp_agent_mail.config import clear_settings_cache, get_settings
 from mcp_agent_mail.db import ensure_schema, get_immediate_session, get_session
+from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.models import (
     Agent,
     AuditEvent,
@@ -71,6 +73,60 @@ async def _create_git_independent_project(human_key: str, slug: str) -> int:
         )
         await session.commit()
         return project.id
+
+
+@pytest.mark.asyncio
+async def test_core_overseer_send_rejects_before_any_mutation(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    _configure_managed_registration(monkeypatch)
+    clear_settings_cache()
+    await ensure_schema()
+    project_id = await _create_git_independent_project(
+        "/core-overseer-rejection",
+        "core-overseer-rejection",
+    )
+    async with get_session() as session:
+        session.add(
+            Agent(
+                project_id=project_id,
+                name="BlueLake",
+                program="test",
+                model="test",
+                task_description="recipient",
+                registration_token="recipient-token",
+            )
+        )
+        await session.commit()
+
+    settings = get_settings()
+    app = build_http_app(settings, build_mcp_server())
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/mail/core-overseer-rejection/overseer/send",
+            json={
+                "recipients": ["BlueLake"],
+                "subject": "Must not commit",
+                "body_md": "This legacy path must fail before mutation.",
+            },
+        )
+
+    assert response.status_code == 409
+    async with get_session() as session:
+        message_count = await session.scalar(
+            select(func.count()).select_from(Message).where(Message.project_id == project_id)
+        )
+        overseer_count = await session.scalar(
+            select(func.count()).select_from(Agent).where(
+                Agent.project_id == project_id,
+                Agent.name == "HumanOverseer",
+            )
+        )
+    assert message_count == 0
+    assert overseer_count == 0
 
 
 @pytest.mark.asyncio

@@ -3722,6 +3722,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         @fastapi_app.post("/mail/{project}/overseer/send")
         async def overseer_send(project: str, request: Request) -> JSONResponse:
             """Send message from Human Overseer to selected agents."""
+            settings = get_settings()
+            if settings.runtime_profile == "core":
+                # Fail before schema initialization, agent creation, message
+                # insertion, or any other mutation. The legacy overseer path
+                # has no core idempotency/audit contract.
+                raise _core_legacy_http_error("overseer_send")
             await ensure_schema()
 
             try:
@@ -3934,9 +3940,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
                     await session.commit()
 
-                settings = get_settings()
-                if settings.runtime_profile == "core":
-                    raise _core_legacy_http_error("overseer_send")
                 archive = await ensure_archive(settings, project_slug)
                 message_dict = {
                     "id": message_id,
