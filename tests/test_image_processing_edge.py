@@ -25,6 +25,13 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 
+
+@pytest.fixture(autouse=True)
+def _allow_test_attachment_paths(isolated_env, monkeypatch):
+    """These tests intentionally attach files outside their synthetic project root."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+    _config.clear_settings_cache()
+
 # =============================================================================
 # Malformed Image Tests
 # =============================================================================

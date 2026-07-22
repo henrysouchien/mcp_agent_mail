@@ -12,6 +12,7 @@ import functools
 import hashlib
 import hmac
 import inspect
+import io
 import json
 import logging
 import mimetypes
@@ -38,6 +39,7 @@ from urllib.parse import parse_qsl
 import uuid
 
 from fastmcp import Context, FastMCP
+from PIL import Image
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.engine import make_url
@@ -2262,6 +2264,8 @@ async def _prepare_git_independent_attachments(
     project: Project,
     body_md: str,
     attachment_paths: Sequence[str] | None,
+    *,
+    convert_images: bool,
 ) -> tuple[str, list[dict[str, Any]], list[AtomicAttachment]]:
     """Install message attachments before their database references are committed."""
     store = BlobStore(settings.storage.blob_root)
@@ -2273,7 +2277,13 @@ async def _prepare_git_independent_attachments(
         else None
     )
 
-    async def install_bytes(data: bytes, media_type: str, display_name: str) -> str:
+    async def install_bytes(
+        data: bytes,
+        media_type: str,
+        display_name: str,
+        *,
+        dimensions: tuple[int, int] | None = None,
+    ) -> str:
         installation = await store.install_bytes(data, max_bytes=max_bytes)
         digest = installation.blob.digest
         item = {
@@ -2285,6 +2295,8 @@ async def _prepare_git_independent_attachments(
             "display_name": display_name,
             "uri": f"blob:sha256:{digest}",
         }
+        if dimensions is not None:
+            item["width"], item["height"] = dimensions
         index = len(metadata)
         metadata.append(item)
         attachments.append(
@@ -2297,6 +2309,17 @@ async def _prepare_git_independent_attachments(
             )
         )
         return item["uri"]
+
+    def convert_image(path: Path) -> tuple[bytes, tuple[int, int]]:
+        with Image.open(path) as source:
+            source.load()
+            converted = source.convert("RGBA" if source.mode in {"LA", "RGBA"} else "RGB")
+        try:
+            output = io.BytesIO()
+            converted.save(output, format="WEBP", method=6, quality=80)
+            return output.getvalue(), converted.size
+        finally:
+            converted.close()
 
     def resolve_attachment_path(raw_path: str) -> Path:
         source = Path(raw_path).expanduser()
@@ -2337,6 +2360,34 @@ async def _prepare_git_independent_attachments(
             cursor = match.end()
         body_parts.append(body_md[cursor:])
         processed_body = "".join(body_parts)
+
+        if convert_images:
+            image_parts: list[str] = []
+            cursor = 0
+            for match in re.finditer(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)", processed_body):
+                raw_path = match.group("path")
+                normalized_path = raw_path.strip()
+                if normalized_path.startswith(("blob:", "data:")):
+                    continue
+                try:
+                    resolved = await asyncio.to_thread(resolve_attachment_path, normalized_path)
+                except (FileNotFoundError, ValueError):
+                    continue
+                webp_data, dimensions = await asyncio.to_thread(convert_image, resolved)
+                uri = await install_bytes(
+                    webp_data,
+                    "image/webp",
+                    resolved.name,
+                    dimensions=dimensions,
+                )
+                leading = raw_path[: len(raw_path) - len(raw_path.lstrip())]
+                trailing = raw_path[len(raw_path.rstrip()) :]
+                image_parts.append(processed_body[cursor : match.start("path")])
+                image_parts.append(f"{leading}{uri}{trailing}")
+                cursor = match.end("path")
+            if image_parts:
+                image_parts.append(processed_body[cursor:])
+                processed_body = "".join(image_parts)
 
         for raw_path in attachment_paths or ():
             resolved = await asyncio.to_thread(resolve_attachment_path, raw_path)
@@ -7000,6 +7051,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     project,
                     body_md,
                     attachment_paths,
+                    convert_images=(
+                        convert_images_override
+                        if convert_images_override is not None
+                        else settings.storage.convert_images
+                    ),
                 )
             )
             try:
@@ -11000,44 +11056,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             all_recipient_names = list(set(to + (cc or []) + (bcc or [])))
             recipient_agents = await _get_agents_batch_lenient(project, all_recipient_names)
             async with get_session() as s3:
-                recent_ok_names: set[str] = set()
-                ttl = timedelta(seconds=int(settings_local.contact_auto_ttl_seconds))
-                since_dt = now_utc - ttl
-                # Batch fetch recent contacts (sender -> recipients and recipients -> sender)
-                try:
-                    recipient_name_filter = list(all_recipient_names)
-                    if recipient_name_filter:
-                        sent_stmt = (
-                            select(Agent.name)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                            .join(Message, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, Message.sender_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, Agent.name).in_(recipient_name_filter),
-                            )
-                        )
-                        sent_rows = await s3.execute(sent_stmt)
-                        recent_ok_names.update({row[0] for row in sent_rows.all() if row[0]})
-
-                        sender_alias2 = aliased(Agent)
-                        recv_stmt = (
-                            select(sender_alias2.name)
-                            .join(Message, cast(Any, Message.sender_id) == sender_alias2.id)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, MessageRecipient.agent_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, sender_alias2.name).in_(recipient_name_filter),
-                            )
-                        )
-                        recv_rows = await s3.execute(recv_stmt)
-                        recent_ok_names.update({row[0] for row in recv_rows.all() if row[0]})
-                except Exception:
-                    logger.exception("Failed to batch fetch recent contacts for auto-allow heuristics")
-                    recent_ok_names = set()
                 # Batch fetch approved agent links for these recipients
                 approved_link_ids: set[int] = set()
                 try:
@@ -11127,10 +11145,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     # Same-project "auto" agents share context; stricter contacts_only still requires a link.
                     if rec_policy == "auto":
                         continue
-                    # contacts_only -> must have approved link or prior contact within TTL
-                    recent_ok = rec.name in recent_ok_names
-                    if recent_ok:
-                        continue
+                    # contacts_only -> must have an active approved link.
                     # check approved AgentLink (local project)
                     if rec.id is not None and rec.id in approved_link_ids:
                         continue
@@ -12374,44 +12389,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             all_local_names = list(dict.fromkeys(local_to + local_cc + local_bcc))
             recipient_agents = await _get_agents_batch_lenient(project, all_local_names)
             now_utc = datetime.now(timezone.utc)
-            ttl = timedelta(seconds=int(settings_local.contact_auto_ttl_seconds))
-            since_dt = now_utc - ttl
             async with get_session() as s_contact:
-                recent_ok_names: set[str] = set()
-                try:
-                    if all_local_names:
-                        sent_stmt = (
-                            select(Agent.name)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                            .join(Message, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, Message.sender_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, Agent.name).in_(all_local_names),
-                            )
-                        )
-                        sent_rows = await s_contact.execute(sent_stmt)
-                        recent_ok_names.update({row[0] for row in sent_rows.all() if row[0]})
-
-                        sender_alias2 = aliased(Agent)
-                        recv_stmt = (
-                            select(sender_alias2.name)
-                            .join(Message, cast(Any, Message.sender_id) == sender_alias2.id)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.message_id) == Message.id)
-                            .where(
-                                cast(Any, Message.project_id) == project.id,
-                                cast(Any, MessageRecipient.agent_id) == sender.id,
-                                cast(Any, Message.created_ts) > _naive_utc(since_dt),
-                                cast(Any, sender_alias2.name).in_(all_local_names),
-                            )
-                        )
-                        recv_rows = await s_contact.execute(recv_stmt)
-                        recent_ok_names.update({row[0] for row in recv_rows.all() if row[0]})
-                except Exception:
-                    logger.exception("Failed to batch fetch recent contacts for reply auto-allow heuristics")
-                    recent_ok_names = set()
-
                 approved_link_ids: set[int] = set()
                 try:
                     recipient_ids = [rec.id for rec in recipient_agents.values() if rec is not None and rec.id is not None]
@@ -12455,8 +12433,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         )
                     # Same-project "auto" agents share context; stricter contacts_only still requires a link.
                     if rec_policy == "auto":
-                        continue
-                    if rec.name in recent_ok_names:
                         continue
                     if rec.id is not None and rec.id in approved_link_ids:
                         continue

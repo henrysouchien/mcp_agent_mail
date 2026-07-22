@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 from fastmcp import Client
 from httpx import ASGITransport, AsyncClient
+from PIL import Image
 from sqlalchemy import func, select
 
 from mcp_agent_mail.app import build_mcp_server
@@ -770,13 +771,18 @@ async def test_live_send_installs_blob_attachments_before_atomic_references(
     attachment_path.write_bytes(file_bytes)
     inline_bytes = b"inline image bytes"
     inline_uri = base64.b64encode(inline_bytes).decode("ascii")
+    markdown_image = tmp_path / "diagram.png"
+    Image.new("RGBA", (4, 3), color=(25, 50, 75, 128)).save(markdown_image, "PNG")
     arguments = {
         "project_key": str(tmp_path),
         "sender_name": "BlobSender",
         "sender_token": "sender-secret",
         "to": ["BlobRecipient"],
         "subject": "Blob-backed",
-        "body_md": f"proof ![image](data:image/png;base64,{inline_uri})",
+        "body_md": (
+            f"proof ![inline](data:image/png;base64,{inline_uri}) "
+            f"and ![diagram]({markdown_image})"
+        ),
         "attachment_paths": [str(attachment_path)],
         "idempotency_key": "blob-live-key",
     }
@@ -789,7 +795,11 @@ async def test_live_send_installs_blob_attachments_before_atomic_references(
     assert first_payload["replayed"] is False
     assert replay_payload["replayed"] is True
     assert replay_payload["id"] == first_payload["id"]
-    assert len(first_payload["attachments"]) == 2
+    assert len(first_payload["attachments"]) == 3
+    converted = [
+        item for item in first_payload["attachments"] if item["media_type"] == "image/webp"
+    ]
+    assert [(item["width"], item["height"]) for item in converted] == [(4, 3)]
     assert "body_md" not in first_payload
 
     async with get_session() as session:
@@ -797,13 +807,18 @@ async def test_live_send_installs_blob_attachments_before_atomic_references(
         blobs = (await session.execute(select(Blob))).scalars().all()
         references = (await session.execute(select(BlobReference))).scalars().all()
     assert "data:image" not in message.body_md
-    assert message.body_md.count("blob:sha256:") == 1
-    assert len(blobs) == 2
-    assert len(references) == 2
+    assert message.body_md.count("blob:sha256:") == 2
+    assert len(blobs) == 3
+    assert len(references) == 3
     for blob in blobs:
         object_path = tmp_path / "blobs" / blob.storage_key
         assert object_path.is_file()
-        assert object_path.read_bytes() in {file_bytes, inline_bytes}
+        assert object_path.stat().st_size > 0
+    stored_payloads = {
+        (tmp_path / "blobs" / blob.storage_key).read_bytes() for blob in blobs
+    }
+    assert file_bytes in stored_payloads
+    assert inline_bytes in stored_payloads
     assert list((tmp_path / "blobs" / "leases" / "install").glob("*.lease")) == []
 
 

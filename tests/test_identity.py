@@ -62,7 +62,8 @@ def test_identity_dir_mode_preserves_symlink_project_path(tmp_path: Path, monkey
 def test_build_project_profile_dedupes_same_file_aliases(tmp_path: Path) -> None:
     readme = tmp_path / "README.md"
     readme.write_text("# Project Profile\n", encoding="utf-8")
-    alias = tmp_path / "readme.md"
+    (tmp_path / "docs").mkdir()
+    alias = tmp_path / "docs" / "README.md"
     alias.symlink_to(readme)
 
     profile = asyncio.run(_build_project_profile(Project(slug="proj", human_key=str(tmp_path)), ["BlueLake"]))

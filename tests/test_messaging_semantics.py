@@ -272,6 +272,15 @@ async def test_send_message_auto_contact_requests_pending_approval_without_targe
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
+        await bootstrap_client.call_tool(
+            "set_contact_policy",
+            {
+                "project_key": "/security/auto-contact-pending",
+                "agent_name": "BlueLake",
+                "registration_token": blue_token,
+                "policy": "contacts_only",
+            },
+        )
 
     async with Client(server) as sender_client:
         with pytest.raises(ToolError) as exc_info:
@@ -330,6 +339,15 @@ async def test_send_message_explicit_false_disables_local_auto_contact(isolated_
         )
         green_token = green.data["registration_token"]
         blue_token = blue.data["registration_token"]
+        await bootstrap_client.call_tool(
+            "set_contact_policy",
+            {
+                "project_key": "/security/auto-contact-disabled",
+                "agent_name": "BlueLake",
+                "registration_token": blue_token,
+                "policy": "contacts_only",
+            },
+        )
 
     async with Client(server) as sender_client:
         with pytest.raises(ToolError):
@@ -381,9 +399,18 @@ async def test_send_message_auto_contact_auto_approves_when_target_is_authentica
             "register_agent",
             {"project_key": "/security/auto-contact-approved", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
-        await client.call_tool(
+        blue = await client.call_tool(
             "register_agent",
             {"project_key": "/security/auto-contact-approved", "program": "codex", "model": "gpt-5", "name": "BlueLake"},
+        )
+        await client.call_tool(
+            "set_contact_policy",
+            {
+                "project_key": "/security/auto-contact-approved",
+                "agent_name": "BlueLake",
+                "registration_token": blue.data["registration_token"],
+                "policy": "contacts_only",
+            },
         )
 
         result = await client.call_tool(
