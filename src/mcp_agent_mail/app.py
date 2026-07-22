@@ -14187,7 +14187,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         agent = await _get_or_create_agent(project, agent_name, program, model, task_description, settings)
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
-        pane_bearer = await _issue_current_pane_credential(project, agent)
+        pane_bearer: str | None = None
+        if settings.runtime_profile == "core":
+            pane_bearer = await _issue_current_pane_credential(project, agent)
+        else:
+            # Non-core runtime authority is the persisted window identity, not
+            # a pane credential.  Bind it during the bootstrap macro so the
+            # controller can immediately reconcile this exact runtime route.
+            await _bind_current_window_identity_to_agent(ctx, project, agent)
 
         file_reservations_result: Optional[dict[str, Any]] = None
         if file_reservation_paths is not None:

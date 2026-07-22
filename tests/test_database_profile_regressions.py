@@ -90,6 +90,52 @@ async def _fresh_http_tool_call(
     return response.status_code, response.json()
 
 
+@pytest.mark.asyncio
+async def test_macro_start_session_binds_http_window_authority_in_database_profile(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_database_profile(monkeypatch)
+    window_uuid = str(uuid.uuid4())
+    project_key = "/regression/database-macro-window-authority"
+
+    status_code, started = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="macro_start_session",
+        arguments={
+            "human_key": project_key,
+            "program": "codex",
+            "model": "gpt-test",
+            "task_description": "database window authority regression",
+        },
+    )
+
+    assert status_code == 200
+    assert not _jsonrpc_failed(started)
+    agent_name = started["result"]["structuredContent"]["agent"]["name"]
+    async with get_session() as session:
+        identity = (
+            await session.execute(
+                select(WindowIdentity).where(
+                    WindowIdentity.window_uuid == window_uuid
+                )
+            )
+        ).scalar_one()
+        agent = await session.get(Agent, identity.agent_id)
+    assert agent is not None
+    assert identity.display_name == agent_name
+    assert agent.name == agent_name
+
+    status_code, status = await _fresh_http_tool_call(
+        window_uuid=window_uuid,
+        tool_name="identity_status",
+        arguments={"project_key": project_key},
+    )
+    assert status_code == 200
+    assert not _jsonrpc_failed(status)
+    assert status["result"]["structuredContent"]["overall"] == "runtime_missing"
+
+
 async def _table_counts() -> tuple[int, int, int, int]:
     async with get_session() as session:
         return (
