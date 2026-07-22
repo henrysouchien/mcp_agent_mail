@@ -312,6 +312,51 @@ class IdempotencyRecord(SQLModel, table=True):
     expires_ts: datetime = Field(index=True)
 
 
+class PaneCredential(SQLModel, table=True):
+    """Durable, secret-backed binding from one pane to one agent identity."""
+
+    __tablename__ = "pane_credentials"
+    __table_args__ = (
+        UniqueConstraint("project_id", "window_uuid", name="uq_pane_project_window"),
+        Index("idx_pane_credentials_agent_active", "agent_id", "revoked_ts", "expires_ts"),
+    )
+
+    id: str = Field(primary_key=True, max_length=64)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    window_uuid: str = Field(max_length=128, index=True)
+    secret_digest: str = Field(min_length=64, max_length=64)
+    pepper_key_id: str = Field(max_length=64)
+    generation: int = Field(default=1, ge=1)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_used_ts: datetime = Field(default_factory=_utcnow_naive)
+    expires_ts: Optional[datetime] = Field(default=None)
+    revoked_ts: Optional[datetime] = Field(default=None)
+    revoke_reason: str = Field(default="", max_length=512)
+
+
+class BootstrapCredential(SQLModel, table=True):
+    """Short-lived, single-use authority for a managed first registration."""
+
+    __tablename__ = "bootstrap_credentials"
+    __table_args__ = (
+        Index("idx_bootstrap_credentials_project_expiry", "project_id", "expires_ts"),
+    )
+
+    id: str = Field(primary_key=True, max_length=64)
+    project_id: Optional[int] = Field(default=None, foreign_key="projects.id", index=True)
+    prospective_project_digest: Optional[str] = Field(default=None, max_length=64)
+    secret_digest: str = Field(min_length=64, max_length=64)
+    pepper_key_id: str = Field(max_length=64)
+    window_uuid: str = Field(max_length=128)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    expires_ts: datetime
+    consumed_ts: Optional[datetime] = Field(default=None)
+    consumed_agent_id: Optional[int] = Field(default=None, foreign_key="agents.id")
+    consumed_idempotency_key: Optional[str] = Field(default=None, max_length=255)
+    revoked_ts: Optional[datetime] = Field(default=None)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
