@@ -46,7 +46,11 @@ from .audit import append_audit_event
 from .config import Settings, get_settings
 from .credentials import (
     CredentialError,
+    consume_bootstrap_credential,
+    create_bootstrap_credential,
     create_pane_credential,
+    derive_registration_credentials,
+    verify_bootstrap_credential,
     verify_pane_credential,
 )
 from .db import (
@@ -155,6 +159,22 @@ def reset_request_pane_credential(token: Token[str]) -> None:
 
 def effective_request_pane_credential() -> str:
     return (_request_pane_credential.get("") or "").strip()
+
+
+def _require_core_owner(settings: Settings, provided_token: str | None) -> None:
+    expected = settings.credentials.owner_token
+    if not expected:
+        raise ToolExecutionError(
+            "CORE_OWNER_AUTHORITY_UNCONFIGURED",
+            "Core owner authority is not configured; set CORE_OWNER_TOKEN before managing core projects.",
+            recoverable=False,
+        )
+    if not provided_token or not hmac.compare_digest(provided_token, expected):
+        raise ToolExecutionError(
+            "OWNER_AUTHENTICATION_REQUIRED",
+            "A valid owner_token is required for this core management operation.",
+            recoverable=True,
+        )
 
 
 class _FastMCPToolGetter(Protocol):
@@ -6507,6 +6527,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         ctx: Context,
         human_key: str,
         identity_mode: Optional[str] = None,
+        owner_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -6589,6 +6610,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
 
         await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
         if settings.runtime_profile == "core":
+            _require_core_owner(settings, owner_token)
             project = await _ensure_git_independent_project(human_key)
         else:
             project = await _ensure_project(human_key)
@@ -6612,6 +6634,91 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 payload[key] = identity_payload.get(key)
         return payload
 
+    @mcp.tool(name="issue_registration_bootstrap")
+    @_instrument_tool(
+        "issue_registration_bootstrap",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write"},
+        project_arg="project_key",
+    )
+    async def issue_registration_bootstrap(
+        ctx: Context,
+        project_key: str,
+        window_uuid: str,
+        owner_token: str,
+        ttl_seconds: int = 600,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Mint short-lived, single-use authority for one managed core registration."""
+        _require_core_owner(settings, owner_token)
+        if not _validate_window_uuid(window_uuid):
+            raise ToolExecutionError(
+                "INVALID_WINDOW_UUID",
+                "window_uuid must be a canonical UUID.",
+                recoverable=True,
+            )
+        key_id = settings.credentials.current_pepper_key_id
+        if not key_id or not settings.credentials.peppers:
+            raise ToolExecutionError(
+                "CREDENTIAL_PEPPER_UNAVAILABLE",
+                "Core registration requires configured credential peppers.",
+                recoverable=False,
+            )
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ValueError("Project must have an id before bootstrap issuance.")
+        async with get_immediate_session() as session:
+            route = await resolve_storage_route(
+                session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+            if route.state != GIT_INDEPENDENT:
+                raise ToolExecutionError(
+                    "BOOTSTRAP_REQUIRES_CORE_PROJECT",
+                    "Registration bootstrap credentials are only valid for Git-independent projects.",
+                    recoverable=True,
+                )
+            issued = await create_bootstrap_credential(
+                session,
+                project_id=project.id,
+                prospective_project_digest=None,
+                window_uuid=window_uuid,
+                pepper_key_id=key_id,
+                peppers=settings.credentials.peppers,
+                expires_ts=_naive_utc() + timedelta(seconds=max(60, ttl_seconds)),
+            )
+            event = await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id="owner/core-bootstrap",
+                actor_agent_id=None,
+                operation_kind="registration_bootstrap_issued_v1",
+                entity_type="bootstrap_credential",
+                entity_id=issued.record.id,
+                payload_version="registration-bootstrap-v1",
+                payload={
+                    "expires_ts": _iso(issued.record.expires_ts),
+                    "window_uuid": window_uuid,
+                },
+            )
+            await assert_route_generation(
+                session,
+                project_id=project.id,
+                expected_state=route.state,
+                expected_generation=route.generation,
+            )
+            await session.commit()
+        await ctx.info(f"Issued registration bootstrap for project '{project.human_key}'.")
+        return {
+            "bootstrap_credential": issued.bearer,
+            "expires_ts": _iso(issued.record.expires_ts),
+            "window_uuid": window_uuid,
+            "audit_event_id": event.id,
+        }
+
     @mcp.tool(name="register_agent")
     @_instrument_tool("register_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name", project_arg="project_key")
     async def register_agent(
@@ -6623,6 +6730,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         task_description: str = "",
         attachments_policy: str = "auto",
         registration_token: Optional[str] = None,
+        bootstrap_credential: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -6713,6 +6822,188 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
             ap = "auto"
+        if project.id is None:
+            raise ValueError("Project must have an id before registering agents.")
+        async with get_session() as route_read_session:
+            route = await resolve_storage_route(
+                route_read_session,
+                project_id=project.id,
+                runtime_profile=settings.runtime_profile,
+                for_mutation=True,
+            )
+        if route.state == GIT_INDEPENDENT:
+            window_uuid = effective_window_identity_uuid(settings)
+            key_id = settings.credentials.current_pepper_key_id
+            if not bootstrap_credential or not idempotency_key:
+                raise ToolExecutionError(
+                    "MANAGED_REGISTRATION_REQUIRED",
+                    "Core registration requires bootstrap_credential and idempotency_key.",
+                    recoverable=True,
+                )
+            if not window_uuid or not _validate_window_uuid(window_uuid):
+                raise ToolExecutionError(
+                    "PANE_IDENTITY_REQUIRED",
+                    "Core registration requires a valid request-scoped pane window UUID.",
+                    recoverable=True,
+                )
+            if not key_id or not settings.credentials.peppers:
+                raise ToolExecutionError(
+                    "CREDENTIAL_PEPPER_UNAVAILABLE",
+                    "Core registration requires configured credential peppers.",
+                    recoverable=False,
+                )
+            if not name or not (
+                validate_explicit_agent_id(name) or validate_agent_name_format(name)
+            ):
+                raise ToolExecutionError(
+                    "EXPLICIT_AGENT_NAME_REQUIRED",
+                    "Managed core registration requires an explicit valid agent name.",
+                    recoverable=True,
+                )
+            request_payload = {
+                "attachments_policy": ap,
+                "model": model,
+                "name": name,
+                "program": program,
+                "task_description": task_description,
+                "window_uuid": window_uuid,
+            }
+            async with get_immediate_session() as session:
+                transaction_route = await resolve_storage_route(
+                    session,
+                    project_id=project.id,
+                    runtime_profile=settings.runtime_profile,
+                    for_mutation=True,
+                )
+                if (
+                    transaction_route.state != route.state
+                    or transaction_route.generation != route.generation
+                ):
+                    raise RuntimeError("Project storage route changed before registration")
+                bootstrap = await verify_bootstrap_credential(
+                    session,
+                    bootstrap_credential,
+                    peppers=settings.credentials.peppers,
+                    window_uuid=window_uuid,
+                    allow_consumed_idempotency_key=idempotency_key,
+                )
+                if bootstrap.project_id != project.id:
+                    raise ToolExecutionError(
+                        "BOOTSTRAP_SCOPE_MISMATCH",
+                        "Bootstrap credential belongs to another project.",
+                        recoverable=True,
+                    )
+
+                async def register_atomic(transaction: Any) -> MutationReceipt:
+                    existing = await transaction.execute(
+                        select(Agent).where(
+                            cast(Any, Agent.project_id) == project.id,
+                            cast(Any, func.lower(Agent.name)) == name.lower(),
+                        )
+                    )
+                    if existing.scalars().first() is not None:
+                        raise ToolExecutionError(
+                            "AGENT_NAME_ALREADY_CLAIMED",
+                            f"Agent identity '{name}' is already registered.",
+                            recoverable=True,
+                        )
+                    agent = Agent(
+                        project_id=project.id,
+                        name=name,
+                        program=program,
+                        model=model,
+                        task_description=task_description,
+                        attachments_policy=ap,
+                        registration_token="pending-bootstrap-derivation",
+                    )
+                    transaction.add(agent)
+                    await transaction.flush()
+                    if agent.id is None:
+                        raise RuntimeError("Agent id was not allocated")
+                    derived = await derive_registration_credentials(
+                        transaction,
+                        bootstrap_credential,
+                        project_id=cast(int, project.id),
+                        agent_id=agent.id,
+                        window_uuid=window_uuid,
+                        idempotency_key=idempotency_key,
+                        pepper_key_id=key_id,
+                        peppers=settings.credentials.peppers,
+                    )
+                    agent.registration_token = derived.registration_token
+                    await consume_bootstrap_credential(
+                        transaction,
+                        bootstrap,
+                        agent_id=agent.id,
+                        idempotency_key=idempotency_key,
+                    )
+                    event = await append_audit_event(
+                        transaction,
+                        project_id=cast(int, project.id),
+                        actor_kind="bootstrap",
+                        actor_scope_id=bootstrap.id,
+                        actor_agent_id=agent.id,
+                        operation_kind="agent_registered_v1",
+                        entity_type="agent",
+                        entity_id=str(agent.id),
+                        payload_version="managed-agent-registration-v1",
+                        payload={
+                            "agent_id": agent.id,
+                            "name": agent.name,
+                            "window_uuid": window_uuid,
+                        },
+                    )
+                    response = _agent_to_dict(agent)
+                    response["audit_event_id"] = event.id
+                    response["event_hash"] = event.event_hash
+                    return MutationReceipt(
+                        response=response,
+                        entity_type="agent",
+                        entity_id=str(agent.id),
+                        project_id=project.id,
+                    )
+
+                atomic_result = await run_idempotent_mutation(
+                    session,
+                    scope_kind="bootstrap",
+                    scope_id=bootstrap.id,
+                    operation_kind="agent_register_v1",
+                    idempotency_key=idempotency_key,
+                    request_payload=request_payload,
+                    expires_ts=_naive_utc() + timedelta(days=30),
+                    mutate=register_atomic,
+                )
+                response = dict(atomic_result.response)
+                agent_id = int(response["id"])
+                agent = await session.get(Agent, agent_id)
+                if agent is None:
+                    raise RuntimeError("Committed registration agent is missing")
+                derived = await derive_registration_credentials(
+                    session,
+                    bootstrap_credential,
+                    project_id=project.id,
+                    agent_id=agent_id,
+                    window_uuid=window_uuid,
+                    idempotency_key=idempotency_key,
+                    pepper_key_id=key_id,
+                    peppers=settings.credentials.peppers,
+                )
+                await assert_route_generation(
+                    session,
+                    project_id=project.id,
+                    expected_state=route.state,
+                    expected_generation=route.generation,
+                )
+                await session.commit()
+            _bind_session_agent(ctx, project, agent)
+            response["registration_token"] = derived.registration_token
+            response["pane_credential"] = derived.pane.bearer
+            response["replayed"] = atomic_result.replayed
+            response["retry_safety"] = "safe_with_idempotency_key"
+            await ctx.info(
+                f"Registered managed agent '{agent.name}' for project '{project.human_key}'."
+            )
+            return response
         if name:
             existing_agent = await _find_agent_optional(project, name)
             if existing_agent is not None:

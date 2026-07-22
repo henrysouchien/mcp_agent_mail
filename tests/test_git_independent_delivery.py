@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -16,11 +18,24 @@ from mcp_agent_mail.models import (
     AuditEvent,
     Blob,
     BlobReference,
+    BootstrapCredential,
     IdempotencyRecord,
     Message,
+    PaneCredential,
     Project,
     ProjectStorageCutover,
 )
+
+
+def _configure_managed_registration(monkeypatch) -> None:
+    encoded = base64.urlsafe_b64encode(b"m" * 32).rstrip(b"=").decode("ascii")
+    monkeypatch.setenv("CREDENTIAL_PEPPERS_JSON", json.dumps({"managed-test": encoded}))
+    monkeypatch.setenv("CREDENTIAL_CURRENT_PEPPER_KEY_ID", "managed-test")
+    monkeypatch.setenv("CORE_OWNER_TOKEN", "owner-secret")
+    monkeypatch.setenv(
+        "MCP_AGENT_MAIL_WINDOW_ID",
+        "95ae694c-0210-4baa-88ab-62dc69295dc9",
+    )
 
 
 async def _create_git_independent_project(human_key: str, slug: str) -> int:
@@ -61,6 +76,7 @@ async def test_core_ensure_project_bootstraps_baseline_without_archive(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    _configure_managed_registration(monkeypatch)
     clear_settings_cache()
 
     async def archive_must_not_open(*args, **kwargs):
@@ -70,31 +86,50 @@ async def test_core_ensure_project_bootstraps_baseline_without_archive(
     async with Client(build_mcp_server()) as client:
         first = await client.call_tool(
             "ensure_project",
-            {"human_key": "/new-core-project"},
+            {"human_key": "/new-core-project", "owner_token": "owner-secret"},
         )
         second = await client.call_tool(
             "ensure_project",
-            {"human_key": "/new-core-project"},
+            {"human_key": "/new-core-project", "owner_token": "owner-secret"},
         )
-        registered = await client.call_tool(
-            "register_agent",
+        bootstrap = await client.call_tool(
+            "issue_registration_bootstrap",
             {
                 "project_key": "/new-core-project",
-                "program": "test",
-                "model": "test",
-                "name": "core-1",
+                "window_uuid": "95ae694c-0210-4baa-88ab-62dc69295dc9",
+                "owner_token": "owner-secret",
             },
+        )
+        registration_arguments = {
+            "project_key": "/new-core-project",
+            "program": "test",
+            "model": "test",
+            "name": "core-1",
+            "bootstrap_credential": bootstrap.data["bootstrap_credential"],
+            "idempotency_key": "register-core-1",
+        }
+        registered = await client.call_tool(
+            "register_agent",
+            registration_arguments,
+        )
+        replay = await client.call_tool(
+            "register_agent",
+            registration_arguments,
         )
 
     assert second.data["id"] == first.data["id"]
     assert registered.data["name"] == "core-1"
+    assert registered.data["registration_token"] == replay.data["registration_token"]
+    assert registered.data["pane_credential"] == replay.data["pane_credential"]
+    assert replay.data["replayed"] is True
     async with get_session() as session:
         cutover = await session.get(ProjectStorageCutover, first.data["id"])
         assert cutover is not None
         assert cutover.state == "git_independent"
         assert cutover.baseline_event_id is not None
         assert await session.scalar(select(func.count()).select_from(Project)) == 1
-        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 3
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 1
 
 
 @pytest.mark.asyncio
@@ -103,6 +138,7 @@ async def test_live_registration_never_opens_archive_for_git_independent_project
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("RUNTIME_PROFILE", "migration")
+    _configure_managed_registration(monkeypatch)
     clear_settings_cache()
     await ensure_schema()
     project_id = await _create_git_independent_project(
@@ -115,6 +151,14 @@ async def test_live_registration_never_opens_archive_for_git_independent_project
 
     monkeypatch.setattr("mcp_agent_mail.app.ensure_archive", archive_must_not_open)
     async with Client(build_mcp_server()) as client:
+        bootstrap = await client.call_tool(
+            "issue_registration_bootstrap",
+            {
+                "project_key": "/git-independent-registration",
+                "window_uuid": "95ae694c-0210-4baa-88ab-62dc69295dc9",
+                "owner_token": "owner-secret",
+            },
+        )
         result = await client.call_tool(
             "register_agent",
             {
@@ -122,14 +166,114 @@ async def test_live_registration_never_opens_archive_for_git_independent_project
                 "program": "test",
                 "model": "test",
                 "name": "BlueLake",
+                "bootstrap_credential": bootstrap.data["bootstrap_credential"],
+                "idempotency_key": "register-blue-lake",
             },
         )
     assert result.data["name"] == "BlueLake"
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Agent)) == 1
-        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 3
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True
+
+
+@pytest.mark.asyncio
+async def test_managed_registration_collapses_one_hundred_public_tool_contenders(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    _configure_managed_registration(monkeypatch)
+    clear_settings_cache()
+    async with Client(build_mcp_server()) as client:
+        await client.call_tool(
+            "ensure_project",
+            {"human_key": "/registration-race", "owner_token": "owner-secret"},
+        )
+        bootstrap = await client.call_tool(
+            "issue_registration_bootstrap",
+            {
+                "project_key": "/registration-race",
+                "window_uuid": "95ae694c-0210-4baa-88ab-62dc69295dc9",
+                "owner_token": "owner-secret",
+            },
+        )
+        arguments = {
+            "project_key": "/registration-race",
+            "program": "test",
+            "model": "test",
+            "name": "race-1",
+            "bootstrap_credential": bootstrap.data["bootstrap_credential"],
+            "idempotency_key": "registration-race-key",
+        }
+        results = await asyncio.gather(
+            *(client.call_tool("register_agent", arguments) for _ in range(100))
+        )
+
+    assert {result.data["id"] for result in results} == {results[0].data["id"]}
+    assert {result.data["pane_credential"] for result in results} == {
+        results[0].data["pane_credential"]
+    }
+    assert sum(result.data["replayed"] is False for result in results) == 1
+    async with get_session() as session:
+        assert await session.scalar(select(func.count()).select_from(Agent)) == 1
+        assert await session.scalar(select(func.count()).select_from(PaneCredential)) == 1
+        assert await session.scalar(select(func.count()).select_from(BootstrapCredential)) == 1
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_registration_rolls_back_before_commit_fault(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    _configure_managed_registration(monkeypatch)
+    clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool(
+            "ensure_project",
+            {"human_key": "/registration-fault", "owner_token": "owner-secret"},
+        )
+        bootstrap = await client.call_tool(
+            "issue_registration_bootstrap",
+            {
+                "project_key": "/registration-fault",
+                "window_uuid": "95ae694c-0210-4baa-88ab-62dc69295dc9",
+                "owner_token": "owner-secret",
+            },
+        )
+
+        async def fail_before_secret_derivation(*args, **kwargs):
+            raise RuntimeError("injected pre-commit failure")
+
+        monkeypatch.setattr(
+            "mcp_agent_mail.app.derive_registration_credentials",
+            fail_before_secret_derivation,
+        )
+        with pytest.raises(Exception, match="injected pre-commit failure"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": "/registration-fault",
+                    "program": "test",
+                    "model": "test",
+                    "name": "fault-1",
+                    "bootstrap_credential": bootstrap.data["bootstrap_credential"],
+                    "idempotency_key": "registration-fault-key",
+                },
+            )
+
+    async with get_session() as session:
+        assert await session.scalar(select(func.count()).select_from(Agent)) == 0
+        assert await session.scalar(select(func.count()).select_from(PaneCredential)) == 0
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 0
+        bootstrap_row = (
+            await session.execute(select(BootstrapCredential))
+        ).scalar_one()
+        assert bootstrap_row.consumed_ts is None
 
 
 @pytest.mark.asyncio

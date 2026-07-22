@@ -108,6 +108,7 @@ class CredentialSettings:
 
     current_pepper_key_id: str | None
     peppers: dict[str, bytes]
+    owner_token: str | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -510,6 +511,7 @@ def _build_settings() -> Settings:
     credential_settings = CredentialSettings(
         current_pepper_key_id=pepper_key_id or None,
         peppers=credential_peppers,
+        owner_token=str(decouple_config("CORE_OWNER_TOKEN", default="") or "").strip() or None,
     )
 
     cors_settings = CorsSettings(

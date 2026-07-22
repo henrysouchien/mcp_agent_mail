@@ -23,6 +23,8 @@ from .models import BootstrapCredential, PaneCredential
 
 _PANE_DOMAIN: Final = b"pane-credential-v1"
 _BOOTSTRAP_DOMAIN: Final = b"bootstrap-credential-v1"
+_BOOTSTRAP_PANE_DOMAIN: Final = b"bootstrap-pane-derivation-v1"
+_BOOTSTRAP_REGISTRATION_DOMAIN: Final = b"bootstrap-registration-derivation-v1"
 _SECRET_BYTES: Final = 32
 
 
@@ -56,6 +58,12 @@ class IssuedPaneCredential:
 class IssuedBootstrapCredential:
     record: BootstrapCredential
     bearer: str
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedRegistrationCredentials:
+    pane: IssuedPaneCredential
+    registration_token: str
 
 
 def _utcnow_naive() -> datetime:
@@ -277,6 +285,7 @@ async def verify_bootstrap_credential(
     *,
     peppers: Mapping[str, bytes],
     window_uuid: str,
+    allow_consumed_idempotency_key: str | None = None,
     now: datetime | None = None,
 ) -> BootstrapCredential:
     credential_id, secret = _parse_bootstrap_bearer(bearer)
@@ -285,7 +294,10 @@ async def verify_bootstrap_credential(
     if (
         record is None
         or record.revoked_ts is not None
-        or record.consumed_ts is not None
+        or (
+            record.consumed_ts is not None
+            and record.consumed_idempotency_key != allow_consumed_idempotency_key
+        )
         or record.expires_ts < timestamp
         or record.window_uuid != window_uuid
     ):
@@ -297,6 +309,71 @@ async def verify_bootstrap_credential(
     if not hmac.compare_digest(expected, record.secret_digest):
         raise InvalidCredentialError("bootstrap credential is invalid")
     return record
+
+
+async def derive_registration_credentials(
+    session: AsyncSession,
+    bootstrap_bearer: str,
+    *,
+    project_id: int,
+    agent_id: int,
+    window_uuid: str,
+    idempotency_key: str,
+    pepper_key_id: str,
+    peppers: Mapping[str, bytes],
+) -> DerivedRegistrationCredentials:
+    """Deterministically mint replayable secrets from one verified bootstrap bearer."""
+    bootstrap_id, bootstrap_secret = _parse_bootstrap_bearer(bootstrap_bearer)
+    context = (
+        f"{project_id}\0{agent_id}\0{window_uuid}\0{idempotency_key}".encode("utf-8")
+    )
+    pane_secret = hmac.new(
+        bootstrap_secret,
+        _BOOTSTRAP_PANE_DOMAIN + b"\0" + context,
+        hashlib.sha256,
+    ).digest()
+    registration_secret = hmac.new(
+        bootstrap_secret,
+        _BOOTSTRAP_REGISTRATION_DOMAIN + b"\0" + context,
+        hashlib.sha256,
+    ).digest()
+    credential_id = hashlib.sha256(
+        _BOOTSTRAP_PANE_DOMAIN + b"\0" + bootstrap_id.encode("utf-8")
+    ).hexdigest()[:32]
+    generation = 1
+    secret_digest = _digest(
+        _pepper(peppers, pepper_key_id),
+        _pane_verifier_input(credential_id, generation, pane_secret),
+    )
+    record = await session.get(PaneCredential, credential_id)
+    if record is None:
+        record = PaneCredential(
+            id=credential_id,
+            project_id=project_id,
+            agent_id=agent_id,
+            window_uuid=window_uuid,
+            secret_digest=secret_digest,
+            pepper_key_id=pepper_key_id,
+            generation=generation,
+        )
+        session.add(record)
+        await session.flush()
+    elif (
+        record.project_id != project_id
+        or record.agent_id != agent_id
+        or record.window_uuid != window_uuid
+        or record.generation != generation
+        or record.pepper_key_id != pepper_key_id
+        or not hmac.compare_digest(record.secret_digest, secret_digest)
+    ):
+        raise InvalidCredentialError("bootstrap-derived pane credential conflicts")
+    return DerivedRegistrationCredentials(
+        pane=IssuedPaneCredential(
+            record=record,
+            bearer=f"{credential_id}.{generation}.{_encode_secret(pane_secret)}",
+        ),
+        registration_token=_encode_secret(registration_secret),
+    )
 
 
 async def consume_bootstrap_credential(
