@@ -186,6 +186,7 @@ class Settings:
     """Top-level application settings."""
 
     environment: str
+    runtime_profile: str  # "legacy" | "migration" | "core"
     # Global gate for worktree-friendly behavior (opt-in; default False)
     worktrees_enabled: bool
     # Identity preferences (phase 1: read-only; behavior remains 'dir' unless features enabled)
@@ -392,6 +393,14 @@ def _build_settings() -> Settings:
             return default
         return _int_optional(raw, key=name)
 
+    def _e(name: str, *, default: str, allowed: frozenset[str]) -> str:
+        return _enum(
+            decouple_config(name, default=""),
+            default=default,
+            allowed=allowed,
+            key=name,
+        )
+
     http_settings = HttpSettings(
         host=decouple_config("HTTP_HOST", default="127.0.0.1"),
         port=_i("HTTP_PORT", default=8765),
@@ -532,6 +541,11 @@ def _build_settings() -> Settings:
 
     return Settings(
         environment=environment,
+        runtime_profile=_e(
+            "RUNTIME_PROFILE",
+            default="legacy",
+            allowed=frozenset({"legacy", "migration", "core"}),
+        ),
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(
             _b("WORKTREES_ENABLED", default=False)

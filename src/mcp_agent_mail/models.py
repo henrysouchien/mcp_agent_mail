@@ -357,6 +357,23 @@ class BootstrapCredential(SQLModel, table=True):
     revoked_ts: Optional[datetime] = Field(default=None)
 
 
+class ProjectStorageCutover(SQLModel, table=True):
+    """Transactionally authoritative storage route for one project."""
+
+    __tablename__ = "project_storage_cutovers"
+    __table_args__ = (Index("idx_project_storage_cutovers_state", "state", "updated_ts"),)
+
+    project_id: int = Field(foreign_key="projects.id", primary_key=True)
+    state: str = Field(default="legacy", max_length=32)
+    generation: int = Field(default=1, ge=1)
+    baseline_event_id: Optional[int] = Field(default=None, foreign_key="audit_events.id")
+    manifest_digest: Optional[str] = Field(default=None, max_length=64)
+    started_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+    completed_ts: Optional[datetime] = Field(default=None)
+    last_error_code: Optional[str] = Field(default=None, max_length=128)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 

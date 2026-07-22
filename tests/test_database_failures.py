@@ -82,6 +82,7 @@ class TestDatabaseAutoCreation:
         assert "idempotency_records" in table_names
         assert "pane_credentials" in table_names
         assert "bootstrap_credentials" in table_names
+        assert "project_storage_cutovers" in table_names
 
     @pytest.mark.asyncio
     async def test_ensure_schema_creates_fts_table(self, isolated_env):
@@ -132,6 +133,7 @@ class TestDatabaseAutoCreation:
         assert "idx_idempotency_expires" in index_names
         assert "idx_pane_credentials_agent_active" in index_names
         assert "idx_bootstrap_credentials_project_expiry" in index_names
+        assert "idx_project_storage_cutovers_state" in index_names
 
     @pytest.mark.asyncio
     async def test_ensure_schema_is_idempotent(self, isolated_env):
