@@ -42,6 +42,11 @@ from sqlalchemy.orm import aliased
 
 from . import rich_logger
 from .config import Settings, get_settings
+from .credentials import (
+    CredentialError,
+    create_pane_credential,
+    verify_pane_credential,
+)
 from .db import (
     dispose_engine_blocking,
     ensure_schema,
@@ -64,6 +69,7 @@ from .models import (
     Message,
     MessageRecipient,
     MessageSummary,
+    PaneCredential,
     Project,
     ProjectSiblingSuggestion,
     Product,
@@ -5328,7 +5334,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             return agent
 
         stored_token = (agent.registration_token or "").strip()
-        if not stored_token:
+        if not stored_token and not provided_token:
             # Adjacent-agent auth for legacy tokenless agents: retire_agent
             # and hard_delete_agent can be authorized by any other authenticated
             # agent in the same project. This unsticks cleanup of pre-token
@@ -5355,16 +5361,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 data={"agent_name": agent.name, "project_key": project.human_key, "action": action},
             )
         if not provided_token:
-            # Fallback: auto-rebind via window identity when session reconnects.
-            # If MCP_AGENT_MAIL_WINDOW_ID is set and maps to this agent in this
-            # project, treat it as proof of identity and bind the session.
-            _wi_uuid = effective_window_identity_uuid()
-            if _wi_uuid and _validate_window_uuid(_wi_uuid):
-                _wi = await _get_window_identity(project, _wi_uuid)
-                if _wi and _wi.display_name == agent.name:
-                    _bind_session_agent(ctx, project, agent)
-                    await _bind_current_window_identity_to_agent(ctx, project, agent)
-                    return agent
             raise ToolExecutionError(
                 "AUTHENTICATION_REQUIRED",
                 (
@@ -5374,7 +5370,23 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 recoverable=True,
                 data={"agent_name": agent.name, "project_key": project.human_key, "token_param": token_param},
             )
-        if not hmac.compare_digest(provided_token, stored_token):
+        authenticated = hmac.compare_digest(provided_token, stored_token)
+        if not authenticated and settings.credentials.peppers:
+            try:
+                async with get_immediate_session() as credential_session:
+                    pane = await verify_pane_credential(
+                        credential_session,
+                        provided_token,
+                        peppers=settings.credentials.peppers,
+                    )
+                    authenticated = (
+                        pane.project_id == project.id and pane.agent_id == agent.id
+                    )
+                    if authenticated:
+                        await credential_session.commit()
+            except CredentialError:
+                authenticated = False
+        if not authenticated:
             raise ToolExecutionError(
                 "AUTHENTICATION_REQUIRED",
                 f"Invalid {token_param} for agent '{agent.name}'.",
@@ -5385,6 +5397,42 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         _bind_session_agent(ctx, project, agent)
         await _bind_current_window_identity_to_agent(ctx, project, agent)
         return agent
+
+    async def _issue_current_pane_credential(
+        project: Project,
+        agent: Agent,
+    ) -> str | None:
+        """Mint the first durable pane bearer; never re-return an existing secret."""
+        window_uuid = effective_window_identity_uuid(settings)
+        key_id = settings.credentials.current_pepper_key_id
+        if (
+            project.id is None
+            or agent.id is None
+            or not window_uuid
+            or not _validate_window_uuid(window_uuid)
+            or not key_id
+            or not settings.credentials.peppers
+        ):
+            return None
+        async with get_immediate_session() as credential_session:
+            existing_result = await credential_session.execute(
+                select(PaneCredential).where(
+                    cast(Any, PaneCredential.project_id) == project.id,
+                    cast(Any, PaneCredential.window_uuid) == window_uuid,
+                )
+            )
+            if existing_result.scalar_one_or_none() is not None:
+                return None
+            issued = await create_pane_credential(
+                credential_session,
+                project_id=project.id,
+                agent_id=agent.id,
+                window_uuid=window_uuid,
+                pepper_key_id=key_id,
+                peppers=settings.credentials.peppers,
+            )
+            await credential_session.commit()
+            return issued.bearer
 
     async def _resolve_authenticated_agent(
         ctx: Context,
@@ -6291,6 +6339,9 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         await ctx.info(f"Registered agent '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
         result["registration_token"] = token
+        pane_bearer = await _issue_current_pane_credential(project, agent)
+        if pane_bearer is not None:
+            result["pane_credential"] = pane_bearer
         # Enrich with window identity info if MCP_AGENT_MAIL_WINDOW_ID is set.
         # NOTE: _get_or_create_agent already resolved this for the archive profile,
         # but propagating it via return type would churn 8+ callers for a cold-path query.
@@ -10351,6 +10402,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         agent = await _get_or_create_agent(project, agent_name, program, model, task_description, settings)
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
+        pane_bearer = await _issue_current_pane_credential(project, agent)
 
         file_reservations_result: Optional[dict[str, Any]] = None
         if file_reservation_paths is not None:
@@ -10385,13 +10437,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             f"macro_start_session prepared agent '{agent.name}' on project '{project.human_key}' "
             f"(file_reservations={len(file_reservations_result['granted']) if file_reservations_result else 0})."
         )
-        return {
+        result = {
             "project": _project_to_dict(project),
             "agent": _agent_to_dict(agent),
             "registration_token": token,
             "file_reservations": file_reservations_result or {"granted": [], "conflicts": []},
             "inbox": inbox_items,
         }
+        if pane_bearer is not None:
+            result["pane_credential"] = pane_bearer
+        return result
 
     @mcp.tool(name="macro_prepare_thread")
     @_instrument_tool(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -101,6 +103,14 @@ class StorageSettings:
 
 
 @dataclass(slots=True, frozen=True)
+class CredentialSettings:
+    """Versioned server peppers for pane/bootstrap credential verification."""
+
+    current_pepper_key_id: str | None
+    peppers: dict[str, bytes]
+
+
+@dataclass(slots=True, frozen=True)
 class CorsSettings:
     """CORS configuration for the HTTP app."""
 
@@ -195,6 +205,7 @@ class Settings:
     http: HttpSettings
     database: DatabaseSettings
     storage: StorageSettings
+    credentials: CredentialSettings
     cors: CorsSettings
     llm: LlmSettings
     tool_filter: ToolFilterSettings
@@ -463,6 +474,44 @@ def _build_settings() -> Settings:
         allow_absolute_attachment_paths=_b("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", default=allow_abs_default == "true"),
     )
 
+    peppers_raw = str(decouple_config("CREDENTIAL_PEPPERS_JSON", default="") or "").strip()
+    pepper_key_id = str(decouple_config("CREDENTIAL_CURRENT_PEPPER_KEY_ID", default="") or "").strip()
+    credential_peppers: dict[str, bytes] = {}
+    if peppers_raw:
+        try:
+            decoded_peppers = json.loads(peppers_raw)
+        except json.JSONDecodeError as exc:
+            raise ConfigError("CREDENTIAL_PEPPERS_JSON: invalid JSON object") from exc
+        if not isinstance(decoded_peppers, dict):
+            raise ConfigError("CREDENTIAL_PEPPERS_JSON: expected a JSON object")
+        for key_id, encoded in decoded_peppers.items():
+            if not isinstance(key_id, str) or not key_id or not isinstance(encoded, str):
+                raise ConfigError("CREDENTIAL_PEPPERS_JSON: keys and values must be non-empty strings")
+            try:
+                padding = "=" * (-len(encoded) % 4)
+                pepper = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+            except (ValueError, UnicodeEncodeError) as exc:
+                raise ConfigError(
+                    f"CREDENTIAL_PEPPERS_JSON: pepper {key_id!r} is not base64url"
+                ) from exc
+            if len(pepper) < 32:
+                raise ConfigError(
+                    f"CREDENTIAL_PEPPERS_JSON: pepper {key_id!r} must decode to at least 32 bytes"
+                )
+            credential_peppers[key_id] = pepper
+        if not pepper_key_id or pepper_key_id not in credential_peppers:
+            raise ConfigError(
+                "CREDENTIAL_CURRENT_PEPPER_KEY_ID must name a configured credential pepper"
+            )
+    elif pepper_key_id:
+        raise ConfigError(
+            "CREDENTIAL_CURRENT_PEPPER_KEY_ID requires CREDENTIAL_PEPPERS_JSON"
+        )
+    credential_settings = CredentialSettings(
+        current_pepper_key_id=pepper_key_id or None,
+        peppers=credential_peppers,
+    )
+
     cors_settings = CorsSettings(
         enabled=_b("HTTP_CORS_ENABLED", default=environment.lower() == "development"),
         origins=_csv("HTTP_CORS_ORIGINS", default=""),
@@ -556,6 +605,7 @@ def _build_settings() -> Settings:
         http=http_settings,
         database=database_settings,
         storage=storage_settings,
+        credentials=credential_settings,
         cors=cors_settings,
         llm=llm_settings,
         tool_filter=tool_filter_settings,

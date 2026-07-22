@@ -117,7 +117,7 @@ async def test_http_bearer_and_cors_preflight(isolated_env, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_http_window_identity_header_authenticates_without_process_env(isolated_env, monkeypatch):
+async def test_http_window_identity_header_routes_but_does_not_authenticate(isolated_env, monkeypatch):
     project_key = "/test/http-window-header"
     agent_name = ""
     window_uuid = str(uuid.uuid4())
@@ -145,11 +145,11 @@ async def test_http_window_identity_header_authenticates_without_process_env(iso
             json=_tool("whois", {"project_key": project_key, "agent_name": agent_name}),
         )
         assert with_header.status_code == 200
-        assert not _jsonrpc_failed(with_header.json())
+        assert _jsonrpc_failed(with_header.json())
 
 
 @pytest.mark.asyncio
-async def test_http_window_identity_bearer_prefix_supports_codex_env_carrier(isolated_env, monkeypatch):
+async def test_http_window_identity_bearer_prefix_is_not_authentication(isolated_env, monkeypatch):
     project_key = "/test/http-window-bearer"
     agent_name = ""
     window_uuid = str(uuid.uuid4())
@@ -170,11 +170,11 @@ async def test_http_window_identity_bearer_prefix_supports_codex_env_carrier(iso
             json=_tool("whois", {"project_key": project_key, "agent_name": agent_name}),
         )
         assert response.status_code == 200
-        assert not _jsonrpc_failed(response.json())
+        assert _jsonrpc_failed(response.json())
 
 
 @pytest.mark.asyncio
-async def test_http_token_backed_whois_binds_request_window_identity(isolated_env, monkeypatch):
+async def test_http_token_backed_whois_does_not_turn_window_id_into_bearer(isolated_env, monkeypatch):
     project_key = "/test/http-window-token-whois"
     agent_name, registration_token = await _create_registered_agent(project_key=project_key)
     window_uuid = str(uuid.uuid4())
@@ -215,7 +215,7 @@ async def test_http_token_backed_whois_binds_request_window_identity(isolated_en
             json=_tool("whois", {"project_key": project_key, "agent_name": agent_name}),
         )
         assert after.status_code == 200
-        assert not _jsonrpc_failed(after.json())
+        assert _jsonrpc_failed(after.json())
 
 
 @pytest.mark.asyncio
@@ -259,7 +259,7 @@ async def test_http_token_backed_whois_does_not_overwrite_conflicting_window_ide
             json=_tool("whois", {"project_key": project_key, "agent_name": first_agent}),
         )
         assert first_still_bound.status_code == 200
-        assert not _jsonrpc_failed(first_still_bound.json())
+        assert _jsonrpc_failed(first_still_bound.json())
 
         second_not_bound = await client.post(
             settings.http.path,
@@ -302,7 +302,7 @@ async def test_http_invalid_request_window_identity_blocks_process_env_fallback(
             json=_tool("whois", {"project_key": project_key, "agent_name": agent_name}),
         )
         assert env_fallback.status_code == 200
-        assert not _jsonrpc_failed(env_fallback.json())
+        assert _jsonrpc_failed(env_fallback.json())
 
         invalid_header = await client.post(
             settings.http.path,
