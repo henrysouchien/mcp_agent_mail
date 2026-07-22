@@ -96,16 +96,53 @@ async def test_core_reservation_retries_replay_one_atomic_receipt(
     async with Client(build_mcp_server()) as client:
         first = await client.call_tool("file_reservation_paths", arguments)
         replay = await client.call_tool("file_reservation_paths", arguments)
+        renew_arguments = {
+            "project_key": "/reservation-core",
+            "agent_name": "FirstAgent",
+            "registration_token": "first-secret",
+            "paths": ["src/core.py"],
+            "extend_seconds": 900,
+            "idempotency_key": "renew-once",
+        }
+        renewed = await client.call_tool("renew_file_reservations", renew_arguments)
+        renewed_replay = await client.call_tool(
+            "renew_file_reservations",
+            renew_arguments,
+        )
+        release_arguments = {
+            "project_key": "/reservation-core",
+            "agent_name": "FirstAgent",
+            "registration_token": "first-secret",
+            "paths": ["src/core.py"],
+            "idempotency_key": "release-once",
+        }
+        released = await client.call_tool(
+            "release_file_reservations",
+            release_arguments,
+        )
+        released_replay = await client.call_tool(
+            "release_file_reservations",
+            release_arguments,
+        )
 
     assert first.data["replayed"] is False
     assert replay.data["replayed"] is True
     assert replay.data["granted"] == first.data["granted"]
     assert replay.data["event_hash"] == first.data["event_hash"]
     assert replay.data["retry_safety"] == "safe_with_idempotency_key"
+    assert renewed.data["replayed"] is False
+    assert renewed_replay.data["replayed"] is True
+    assert renewed_replay.data["file_reservations"] == renewed.data["file_reservations"]
+    assert released.data["released"] == 1
+    assert released.data["replayed"] is False
+    assert released_replay.data["released"] == 1
+    assert released_replay.data["replayed"] is True
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(FileReservation)) == 1
-        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 1
-        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 2
+        reservation = (await session.execute(select(FileReservation))).scalar_one()
+        assert reservation.released_ts is not None
+        assert await session.scalar(select(func.count()).select_from(IdempotencyRecord)) == 3
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 4
         chain = await verify_audit_chain(session, project_id)
     assert chain.valid is True
 

@@ -12516,6 +12516,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         paths: Optional[list[str]] = None,
         file_reservation_ids: Optional[list[int]] = None,
         registration_token: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -12593,6 +12594,130 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             if project.id is None or agent.id is None:
                 raise ValueError("Project and agent must have ids before releasing file_reservations.")
             await ensure_schema()
+            async with get_session() as route_read_session:
+                route = await resolve_storage_route(
+                    route_read_session,
+                    project_id=project.id,
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+            if route.state == GIT_INDEPENDENT:
+                request_payload = {
+                    "file_reservation_ids": file_reservation_ids,
+                    "paths": paths,
+                }
+
+                async def release_atomic(transaction: Any) -> MutationReceipt:
+                    release_now = _naive_utc()
+                    select_stmt = select(FileReservation).where(
+                        cast(Any, FileReservation.project_id) == project.id,
+                        cast(Any, FileReservation.agent_id) == agent.id,
+                        cast(Any, FileReservation.released_ts).is_(None),
+                        or_(
+                            cast(Any, FileReservation.expires_ts).is_(None),
+                            cast(Any, FileReservation.expires_ts) > release_now,
+                        ),
+                    )
+                    if file_reservation_ids:
+                        select_stmt = select_stmt.where(
+                            cast(Any, FileReservation.id).in_(file_reservation_ids)
+                        )
+                    if paths:
+                        select_stmt = select_stmt.where(
+                            cast(Any, FileReservation.path_pattern).in_(paths)
+                        )
+                    result = await transaction.execute(select_stmt)
+                    reservations = list(result.scalars().all())
+                    reservation_ids = [
+                        reservation.id
+                        for reservation in reservations
+                        if reservation.id is not None
+                    ]
+                    if reservation_ids:
+                        await transaction.execute(
+                            update(FileReservation)
+                            .where(
+                                cast(Any, FileReservation.project_id) == project.id,
+                                cast(Any, FileReservation.agent_id) == agent.id,
+                                cast(Any, FileReservation.released_ts).is_(None),
+                                cast(Any, FileReservation.id).in_(reservation_ids),
+                            )
+                            .values(released_ts=release_now)
+                        )
+                    event = await append_audit_event(
+                        transaction,
+                        project_id=cast(int, project.id),
+                        actor_kind="agent",
+                        actor_scope_id=f"{project.id}:{agent.id}",
+                        actor_agent_id=agent.id,
+                        operation_kind="file_reservations_release_v1",
+                        entity_type="file_reservation_batch",
+                        entity_id=idempotency_key or f"agent:{agent.id}",
+                        payload_version="file-reservation-release-v1",
+                        payload={
+                            "released": len(reservation_ids),
+                            "reservation_ids": reservation_ids,
+                        },
+                    )
+                    response = {
+                        "released": len(reservation_ids),
+                        "released_at": _iso(release_now),
+                        "reservation_ids": reservation_ids,
+                        "audit_event_id": event.id,
+                        "event_hash": event.event_hash,
+                    }
+                    return MutationReceipt(
+                        response=response,
+                        entity_type="file_reservation_batch",
+                        entity_id=idempotency_key or f"agent:{agent.id}",
+                        project_id=project.id,
+                    )
+
+                async with get_immediate_session() as session:
+                    transaction_route = await resolve_storage_route(
+                        session,
+                        project_id=project.id,
+                        runtime_profile=get_settings().runtime_profile,
+                        for_mutation=True,
+                    )
+                    if (
+                        transaction_route.state != route.state
+                        or transaction_route.generation != route.generation
+                    ):
+                        raise RuntimeError("Project storage route changed before reservation release")
+                    if idempotency_key:
+                        atomic_result = await run_idempotent_mutation(
+                            session,
+                            scope_kind="agent",
+                            scope_id=f"{project.id}:{agent.id}",
+                            operation_kind="file_reservations_release_v1",
+                            idempotency_key=idempotency_key,
+                            request_payload=request_payload,
+                            expires_ts=_naive_utc() + timedelta(days=30),
+                            mutate=release_atomic,
+                        )
+                        response = dict(atomic_result.response)
+                        replayed = atomic_result.replayed
+                    else:
+                        receipt = await release_atomic(session)
+                        response = dict(receipt.response)
+                        replayed = False
+                    await assert_route_generation(
+                        session,
+                        project_id=project.id,
+                        expected_state=route.state,
+                        expected_generation=route.generation,
+                    )
+                    await session.commit()
+                response["replayed"] = replayed
+                response["retry_safety"] = (
+                    "safe_with_idempotency_key" if idempotency_key else "safe_natural_noop"
+                )
+                await ctx.info(
+                    f"Released {response['released']} Git-independent file_reservations "
+                    f"for '{agent.name}'."
+                )
+                return response
             now = datetime.now(timezone.utc)
             naive_now = _naive_utc(now)  # Compute once for consistency
             reservations: list[FileReservation] = []
@@ -12640,7 +12765,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     [(reservation, agent) for reservation in reservations],
                 )
             await ctx.info(f"Released {affected} file_reservations for '{agent.name}'.")
-            return {"released": affected, "released_at": _iso(now)}
+            return {
+                "released": affected,
+                "released_at": _iso(now),
+                "retry_safety": "safe_natural_noop",
+            }
         except Exception as exc:
             if get_settings().tools_log_enabled:
                 try:
@@ -12886,6 +13015,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         paths: Optional[list[str]] = None,
         file_reservation_ids: Optional[list[int]] = None,
         registration_token: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
@@ -12950,6 +13080,131 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         if project.id is None or agent.id is None:
             raise ValueError("Project and agent must have ids before renewing file_reservations.")
         await ensure_schema()
+        async with get_session() as route_read_session:
+            route = await resolve_storage_route(
+                route_read_session,
+                project_id=project.id,
+                runtime_profile=get_settings().runtime_profile,
+                for_mutation=True,
+            )
+        if route.state == GIT_INDEPENDENT:
+            bump = max(60, int(extend_seconds))
+            request_payload = {
+                "extend_seconds": extend_seconds,
+                "file_reservation_ids": file_reservation_ids,
+                "paths": paths,
+            }
+
+            async def renew_atomic(transaction: Any) -> MutationReceipt:
+                renew_now = datetime.now(timezone.utc)
+                stmt = (
+                    select(FileReservation)
+                    .where(
+                        cast(Any, FileReservation.project_id) == project.id,
+                        cast(Any, FileReservation.agent_id) == agent.id,
+                        cast(Any, FileReservation.released_ts).is_(None),
+                        cast(Any, FileReservation.expires_ts) > _naive_utc(renew_now),
+                    )
+                    .order_by(asc(cast(Any, FileReservation.expires_ts)))
+                )
+                if file_reservation_ids:
+                    stmt = stmt.where(cast(Any, FileReservation.id).in_(file_reservation_ids))
+                if paths:
+                    stmt = stmt.where(cast(Any, FileReservation.path_pattern).in_(paths))
+                result = await transaction.execute(stmt)
+                reservations = list(result.scalars().all())
+                updated: list[dict[str, Any]] = []
+                for reservation in reservations:
+                    old_expiry = reservation.expires_ts
+                    if getattr(old_expiry, "tzinfo", None) is None:
+                        old_expiry = old_expiry.replace(tzinfo=timezone.utc)
+                    base = old_expiry if old_expiry > renew_now else renew_now
+                    reservation.expires_ts = _naive_utc(
+                        base + timedelta(seconds=bump)
+                    )
+                    transaction.add(reservation)
+                    updated.append(
+                        {
+                            "id": reservation.id,
+                            "path_pattern": reservation.path_pattern,
+                            "old_expires_ts": _iso(old_expiry),
+                            "new_expires_ts": _iso(reservation.expires_ts),
+                        }
+                    )
+                event = await append_audit_event(
+                    transaction,
+                    project_id=cast(int, project.id),
+                    actor_kind="agent",
+                    actor_scope_id=f"{project.id}:{agent.id}",
+                    actor_agent_id=agent.id,
+                    operation_kind="file_reservations_renew_v1",
+                    entity_type="file_reservation_batch",
+                    entity_id=idempotency_key or f"agent:{agent.id}",
+                    payload_version="file-reservation-renew-v1",
+                    payload={
+                        "extend_seconds": bump,
+                        "reservation_ids": [item["id"] for item in updated],
+                        "renewed": len(updated),
+                    },
+                )
+                response = {
+                    "renewed": len(updated),
+                    "file_reservations": updated,
+                    "audit_event_id": event.id,
+                    "event_hash": event.event_hash,
+                }
+                return MutationReceipt(
+                    response=response,
+                    entity_type="file_reservation_batch",
+                    entity_id=idempotency_key or f"agent:{agent.id}",
+                    project_id=project.id,
+                )
+
+            async with get_immediate_session() as session:
+                transaction_route = await resolve_storage_route(
+                    session,
+                    project_id=project.id,
+                    runtime_profile=get_settings().runtime_profile,
+                    for_mutation=True,
+                )
+                if (
+                    transaction_route.state != route.state
+                    or transaction_route.generation != route.generation
+                ):
+                    raise RuntimeError("Project storage route changed before reservation renewal")
+                if idempotency_key:
+                    atomic_result = await run_idempotent_mutation(
+                        session,
+                        scope_kind="agent",
+                        scope_id=f"{project.id}:{agent.id}",
+                        operation_kind="file_reservations_renew_v1",
+                        idempotency_key=idempotency_key,
+                        request_payload=request_payload,
+                        expires_ts=_naive_utc() + timedelta(days=30),
+                        mutate=renew_atomic,
+                    )
+                    response = dict(atomic_result.response)
+                    replayed = atomic_result.replayed
+                else:
+                    receipt = await renew_atomic(session)
+                    response = dict(receipt.response)
+                    replayed = False
+                await assert_route_generation(
+                    session,
+                    project_id=project.id,
+                    expected_state=route.state,
+                    expected_generation=route.generation,
+                )
+                await session.commit()
+            response["replayed"] = replayed
+            response["retry_safety"] = (
+                "safe_with_idempotency_key" if idempotency_key else "unsafe_without_key"
+            )
+            await ctx.info(
+                f"Renewed {response['renewed']} Git-independent file_reservation(s) "
+                f"for '{agent.name}'."
+            )
+            return response
         now = datetime.now(timezone.utc)
         bump = max(60, int(extend_seconds))
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
@@ -13011,7 +13266,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             [(reservation, agent) for reservation in file_reservations],
         )
         await ctx.info(f"Renewed {len(updated)} file_reservation(s) for '{agent.name}'.")
-        return {"renewed": len(updated), "file_reservations": updated}
+        return {
+            "renewed": len(updated),
+            "file_reservations": updated,
+            "retry_safety": "unsafe_legacy",
+        }
 
     # --- Build slots (coarse concurrency control) --------------------------------------------
     # Only registered when WORKTREES_ENABLED=1 to reduce token overhead for single-worktree setups
