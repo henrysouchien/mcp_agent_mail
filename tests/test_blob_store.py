@@ -194,3 +194,25 @@ async def test_referenced_blob_is_not_orphan_candidate(tmp_path) -> None:
         )
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_orphan_quarantine_rechecks_install_lease_after_candidate_scan(tmp_path) -> None:
+    store = BlobStore(tmp_path / "blobs")
+    original = await store.install_bytes(b"raced-object")
+    old_time = time.time() - 3600
+    os.utime(original.blob.path, (old_time, old_time))
+    await original.release()
+
+    candidates = await store.orphan_candidates(set(), grace_seconds=60)
+    assert [candidate.digest for candidate in candidates] == [original.blob.digest]
+
+    concurrent_install = await store.install_bytes(b"raced-object")
+    quarantined = await store.quarantine_orphans(
+        set(),
+        grace_seconds=60,
+        dry_run=False,
+    )
+    assert quarantined == []
+    assert original.blob.path.exists()
+    await concurrent_install.release()

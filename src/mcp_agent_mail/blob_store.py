@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
 
+from filelock import FileLock
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -125,6 +126,7 @@ class BlobStore:
         self.install_lease_root = self.root / "leases" / "install"
         self.snapshot_lease_root = self.root / "leases" / "snapshot"
         self.quarantine_root = self.root / "quarantine"
+        self.coordination_lock_path = self.root / ".coordination.lock"
 
     async def install_bytes(
         self,
@@ -165,6 +167,14 @@ class BlobStore:
         max_bytes: int | None,
     ) -> BlobInstallation:
         self._ensure_layout()
+        with FileLock(str(self.coordination_lock_path)):
+            return self._install_chunks_locked_sync(chunks, max_bytes)
+
+    def _install_chunks_locked_sync(
+        self,
+        chunks: Iterable[bytes],
+        max_bytes: int | None,
+    ) -> BlobInstallation:
         digest = hashlib.sha256()
         byte_length = 0
         temp_fd, temp_name = tempfile.mkstemp(prefix="install-", dir=self.temp_root)
@@ -274,6 +284,10 @@ class BlobStore:
 
     def _protect_snapshot_sync(self, digests: set[str]) -> BlobProtectionLease:
         self._ensure_layout()
+        with FileLock(str(self.coordination_lock_path)):
+            return self._protect_snapshot_locked_sync(digests)
+
+    def _protect_snapshot_locked_sync(self, digests: set[str]) -> BlobProtectionLease:
         path = self.snapshot_lease_root / f"{uuid.uuid4().hex}.lease"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -364,8 +378,29 @@ class BlobStore:
             now=now,
         )
         if not dry_run:
-            await asyncio.to_thread(self._quarantine_candidates_sync, candidates)
+            candidates = await asyncio.to_thread(
+                self._quarantine_orphans_locked_sync,
+                set(referenced_digests),
+                grace_seconds,
+                time.time() if now is None else now,
+            )
         return candidates
+
+    def _quarantine_orphans_locked_sync(
+        self,
+        referenced_digests: set[str],
+        grace_seconds: float,
+        now: float,
+    ) -> list[InstalledBlob]:
+        self._ensure_layout()
+        with FileLock(str(self.coordination_lock_path)):
+            candidates = self._orphan_candidates_sync(
+                referenced_digests,
+                grace_seconds,
+                now,
+            )
+            self._quarantine_candidates_sync(candidates)
+            return candidates
 
     def _quarantine_candidates_sync(self, candidates: list[InstalledBlob]) -> None:
         self._ensure_layout()
