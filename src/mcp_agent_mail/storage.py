@@ -736,7 +736,8 @@ _REPO_SEMAPHORE_LIMIT: int = 32  # Max concurrent repo operations
 def _get_repo_cache_lock() -> asyncio.Lock:
     """Get or create the repo cache lock (must be called from async context)."""
     global _REPO_CACHE_LOCK
-    if _REPO_CACHE_LOCK is None:
+    bound_loop = getattr(_REPO_CACHE_LOCK, "_loop", None)
+    if _REPO_CACHE_LOCK is None or (bound_loop is not None and bound_loop.is_closed()):
         _REPO_CACHE_LOCK = asyncio.Lock()
     return _REPO_CACHE_LOCK
 
@@ -744,7 +745,8 @@ def _get_repo_cache_lock() -> asyncio.Lock:
 def _get_repo_semaphore() -> asyncio.Semaphore:
     """Get or create the repo semaphore (must be called from async context)."""
     global _REPO_SEMAPHORE
-    if _REPO_SEMAPHORE is None:
+    bound_loop = getattr(_REPO_SEMAPHORE, "_loop", None)
+    if _REPO_SEMAPHORE is None or (bound_loop is not None and bound_loop.is_closed()):
         _REPO_SEMAPHORE = asyncio.Semaphore(_REPO_SEMAPHORE_LIMIT)
     return _REPO_SEMAPHORE
 
