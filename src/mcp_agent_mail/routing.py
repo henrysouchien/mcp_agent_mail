@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import ProjectStorageCutover
@@ -25,6 +26,30 @@ class StorageRoutingError(RuntimeError):
 
 class MutationQuiescedError(StorageRoutingError):
     """Mutations are intentionally stopped while a cutover is being verified."""
+
+
+async def assert_core_startup_ready(session: AsyncSession) -> None:
+    """Fail startup unless every existing project is durably core-routable."""
+    result = await session.execute(
+        text(
+            """
+            SELECT p.id, c.state, c.baseline_event_id
+            FROM projects AS p
+            LEFT JOIN project_storage_cutovers AS c ON c.project_id = p.id
+            """
+        )
+    )
+    invalid = [
+        int(project_id)
+        for project_id, state, baseline_event_id in result.all()
+        if state != GIT_INDEPENDENT or baseline_event_id is None
+    ]
+    if invalid:
+        preview = ", ".join(str(project_id) for project_id in invalid[:10])
+        raise StorageRoutingError(
+            "core startup refused non-core projects: "
+            f"{preview}{' ...' if len(invalid) > 10 else ''}"
+        )
 
 
 @dataclass(frozen=True, slots=True)

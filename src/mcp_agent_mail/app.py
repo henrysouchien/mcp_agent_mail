@@ -85,7 +85,12 @@ from .models import (
     ProductProjectLink,
     WindowIdentity,
 )
-from .routing import GIT_INDEPENDENT, assert_route_generation, resolve_storage_route
+from .routing import (
+    GIT_INDEPENDENT,
+    assert_core_startup_ready,
+    assert_route_generation,
+    resolve_storage_route,
+)
 from .storage import (
     GitIndexLockError,
     ProjectArchive,
@@ -903,17 +908,28 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
     @asynccontextmanager
     async def lifespan(app: FastMCP) -> AsyncIterator[None]:
         init_engine(settings)
-        heal_summary = await heal_archive_locks(settings)
-        if heal_summary.get("locks_removed") or heal_summary.get("metadata_removed"):
-            logger.info(
-                "archive.healed_on_startup",
-                extra={
-                    "locks_scanned": heal_summary.get("locks_scanned", 0),
-                    "locks_removed": len(heal_summary.get("locks_removed", [])),
-                    "metadata_removed": len(heal_summary.get("metadata_removed", [])),
-                },
-            )
+        if settings.runtime_profile != "core":
+            heal_summary = await heal_archive_locks(settings)
+            if heal_summary.get("locks_removed") or heal_summary.get("metadata_removed"):
+                logger.info(
+                    "archive.healed_on_startup",
+                    extra={
+                        "locks_scanned": heal_summary.get("locks_scanned", 0),
+                        "locks_removed": len(heal_summary.get("locks_removed", [])),
+                        "metadata_removed": len(heal_summary.get("metadata_removed", [])),
+                    },
+                )
         await ensure_schema(settings)
+        if settings.runtime_profile == "core":
+            if not settings.credentials.owner_token:
+                raise RuntimeError("core startup requires CORE_OWNER_TOKEN")
+            if (
+                not settings.credentials.current_pepper_key_id
+                or not settings.credentials.peppers
+            ):
+                raise RuntimeError("core startup requires credential peppers")
+            async with get_session() as startup_session:
+                await assert_core_startup_ready(startup_session)
         try:
             yield
         finally:
@@ -929,8 +945,9 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 except Exception:
                     with suppress(BaseException):
                         dispose_engine_blocking(engine)
-            with suppress(BaseException):
-                clear_repo_cache()
+            if settings.runtime_profile != "core":
+                with suppress(BaseException):
+                    clear_repo_cache()
             if cancelled is not None:
                 raise cancelled
 

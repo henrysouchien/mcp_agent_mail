@@ -133,6 +133,24 @@ async def test_core_ensure_project_bootstraps_baseline_without_archive(
 
 
 @pytest.mark.asyncio
+async def test_core_startup_rejects_existing_legacy_project(
+    isolated_env: object,
+    monkeypatch,
+) -> None:
+    await ensure_schema()
+    async with get_immediate_session() as session:
+        session.add(Project(slug="legacy-at-core-start", human_key="/legacy-at-core-start"))
+        await session.commit()
+    monkeypatch.setenv("RUNTIME_PROFILE", "core")
+    _configure_managed_registration(monkeypatch)
+    clear_settings_cache()
+
+    with pytest.raises(Exception, match="core startup refused non-core projects"):
+        async with Client(build_mcp_server()):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_live_registration_never_opens_archive_for_git_independent_project(
     isolated_env: object,
     monkeypatch,
