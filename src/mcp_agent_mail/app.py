@@ -9596,6 +9596,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "runtime_session_id": binding.runtime_session_id,
             "runtime_incarnation_id": binding.runtime_incarnation_id,
             "pane_instance_id": binding.pane_instance_id,
+            "process_id": binding.process_id,
+            "host_boot_id": binding.host_boot_id,
             "program": binding.program,
             "model": binding.model,
             "task_description": binding.task_description,
@@ -10179,6 +10181,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         runtime_session_id: str,
         runtime_incarnation_id: str,
         pane_instance_id: str,
+        process_id: int,
+        host_boot_id: str,
         host_id: str,
         tmux_server_id: str,
         pane_id: str,
@@ -10216,6 +10220,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "runtime_session_id": runtime_session_id,
             "runtime_incarnation_id": runtime_incarnation_id,
             "pane_instance_id": pane_instance_id,
+            "host_boot_id": host_boot_id,
             "host_id": host_id,
             "tmux_server_id": tmux_server_id,
             "pane_id": pane_id,
@@ -10224,6 +10229,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         }.items():
             if not value.strip():
                 raise ToolExecutionError("INVALID_RUNTIME_BINDING", f"{label} must not be blank.")
+        if process_id < 1:
+            raise ToolExecutionError("INVALID_RUNTIME_BINDING", "process_id must be positive.")
         launch_payload = _decode_continuation_receipt(phase_a_launch_receipt)
         if (
             launch_payload is None
@@ -10247,6 +10254,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "runtime_session_id": runtime_session_id,
             "runtime_incarnation_id": runtime_incarnation_id,
             "pane_instance_id": pane_instance_id,
+            "process_id": process_id,
+            "host_boot_id": host_boot_id,
             "host_id": host_id,
             "tmux_server_id": tmux_server_id,
             "pane_id": pane_id,
@@ -10449,6 +10458,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_session_id=runtime_session_id,
                 runtime_incarnation_id=runtime_incarnation_id,
                 pane_instance_id=pane_instance_id,
+                process_id=process_id,
+                host_boot_id=host_boot_id,
                 generation=generation,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
@@ -10487,6 +10498,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "runtime_session_id": runtime_session_id,
                     "runtime_incarnation_id": runtime_incarnation_id,
                     "pane_instance_id": pane_instance_id,
+                    "process_id": process_id,
+                    "host_boot_id": host_boot_id,
                 },
             )
             return MutationReceipt(
@@ -10499,6 +10512,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "runtime_session_id": runtime_session_id,
                     "runtime_incarnation_id": runtime_incarnation_id,
                     "pane_instance_id": pane_instance_id,
+                    "process_id": process_id,
+                    "host_boot_id": host_boot_id,
                     "generation": generation,
                     "overall": "route_missing",
                 },
@@ -10915,6 +10930,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             binding.runtime_incarnation_id if binding else None
                         ),
                         "pane_instance_id": binding.pane_instance_id if binding else None,
+                        "process_id": binding.process_id if binding else None,
+                        "host_boot_id": binding.host_boot_id if binding else None,
                         "generation": binding.generation if binding else (
                             launch.expected_generation if launch else None
                         ),
@@ -11055,6 +11072,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         runtime_session_id: str,
         runtime_incarnation_id: str,
         pane_instance_id: str,
+        process_id: int,
+        host_boot_id: str,
         host_id: str,
         tmux_server_id: str,
         pane_id: str,
@@ -11071,6 +11090,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "runtime_session_id": runtime_session_id,
             "runtime_incarnation_id": runtime_incarnation_id,
             "pane_instance_id": pane_instance_id,
+            "host_boot_id": host_boot_id,
             "host_id": host_id,
             "tmux_server_id": tmux_server_id,
             "pane_id": pane_id,
@@ -11079,6 +11099,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         }.items():
             if not value.strip():
                 raise ToolExecutionError("INVALID_RUNTIME_BINDING", f"{label} must not be blank.")
+        if process_id < 1:
+            raise ToolExecutionError("INVALID_RUNTIME_BINDING", "process_id must be positive.")
         started = _parse_iso(process_started_ts)
         if started is None:
             raise ToolExecutionError(
@@ -11131,6 +11153,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     active.runtime_session_id == runtime_session_id
                     and active.runtime_incarnation_id == runtime_incarnation_id
                     and active.pane_instance_id == pane_instance_id
+                    and active.process_id == process_id
+                    and active.host_boot_id == host_boot_id
                 )
                 if not same_incarnation:
                     raise ToolExecutionError(
@@ -11198,6 +11222,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_session_id=runtime_session_id,
                 runtime_incarnation_id=runtime_incarnation_id,
                 pane_instance_id=pane_instance_id,
+                process_id=process_id,
+                host_boot_id=host_boot_id,
                 generation=generation,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
@@ -11229,6 +11255,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "runtime_session_id": runtime_session_id,
                     "runtime_incarnation_id": runtime_incarnation_id,
                     "pane_instance_id": pane_instance_id,
+                    "process_id": process_id,
+                    "host_boot_id": host_boot_id,
                     "generation": generation,
                     "host_id": host_id,
                     "tmux_server_id": tmux_server_id,
@@ -11305,6 +11333,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "runtime_session_id": binding.runtime_session_id,
             "runtime_incarnation_id": binding.runtime_incarnation_id,
             "pane_instance_id": binding.pane_instance_id,
+            "process_id": binding.process_id,
+            "host_boot_id": binding.host_boot_id,
             "prior_generation": binding.generation,
             "carrier_digest": carrier_digest,
             "expires_ts": _iso(expires),
@@ -11322,6 +11352,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     runtime_session_id=binding.runtime_session_id,
                     runtime_incarnation_id=binding.runtime_incarnation_id,
                     pane_instance_id=binding.pane_instance_id,
+                    process_id=binding.process_id,
+                    host_boot_id=binding.host_boot_id,
                     prior_generation=binding.generation,
                     carrier_digest=carrier_digest,
                     created_ts=now,
@@ -11351,6 +11383,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         pane_id: str,
         runtime_incarnation_id: str,
         pane_instance_id: str,
+        process_id: int,
+        host_boot_id: str,
         program: str,
         model: str,
         task_description: str,
@@ -11362,6 +11396,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         started = _parse_iso(process_started_ts)
         if payload is None or started is None:
             raise ToolExecutionError("INVALID_CONTINUATION", "Continuation receipt is invalid.")
+        if process_id < 1 or not host_boot_id.strip():
+            raise ToolExecutionError(
+                "INVALID_RUNTIME_BINDING",
+                "process_id must be positive and host_boot_id must not be blank.",
+            )
         started = _naive_utc(started)
         project = await _get_project_by_identifier(project_key)
         if project.id is None or payload.get("project_id") != project.id:
@@ -11415,6 +11454,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 or active.runtime_session_id != receipt.runtime_session_id
                 or active.runtime_incarnation_id != receipt.runtime_incarnation_id
                 or active.pane_instance_id != receipt.pane_instance_id
+                or active.process_id != receipt.process_id
+                or active.host_boot_id != receipt.host_boot_id
             ):
                 raise ToolExecutionError(
                     "STALE_GENERATION",
@@ -11447,6 +11488,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_session_id=receipt.runtime_session_id,
                 runtime_incarnation_id=runtime_incarnation_id,
                 pane_instance_id=pane_instance_id,
+                process_id=process_id,
+                host_boot_id=host_boot_id,
                 generation=receipt.prior_generation + 1,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
@@ -11476,6 +11519,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "runtime_session_id": continued.runtime_session_id,
                     "runtime_incarnation_id": continued.runtime_incarnation_id,
                     "pane_instance_id": continued.pane_instance_id,
+                    "process_id": process_id,
+                    "host_boot_id": host_boot_id,
                     "host_id": host_id,
                     "tmux_server_id": tmux_server_id,
                     "pane_id": pane_id,
@@ -11514,6 +11559,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         runtime_session_id: str,
         runtime_incarnation_id: str,
         pane_instance_id: str,
+        process_id: int,
+        host_boot_id: str,
         host_id: str,
         tmux_server_id: str,
         pane_id: str,
@@ -11532,6 +11579,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
         if not _validate_window_uuid(new_window_uuid):
             raise ToolExecutionError("INVALID_WINDOW_UUID", "new_window_uuid must be a UUID.")
+        if process_id < 1 or not host_boot_id.strip():
+            raise ToolExecutionError(
+                "INVALID_RUNTIME_BINDING",
+                "process_id must be positive and host_boot_id must not be blank.",
+            )
         started = _parse_iso(process_started_ts)
         if started is None:
             raise ToolExecutionError("INVALID_RUNTIME_BINDING", "process_started_ts is invalid.")
@@ -11626,6 +11678,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 runtime_session_id=runtime_session_id,
                 runtime_incarnation_id=runtime_incarnation_id,
                 pane_instance_id=pane_instance_id,
+                process_id=process_id,
+                host_boot_id=host_boot_id,
                 generation=expected_generation + 1,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
@@ -11657,6 +11711,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "runtime_session_id": runtime_session_id,
                     "runtime_incarnation_id": runtime_incarnation_id,
                     "pane_instance_id": pane_instance_id,
+                    "process_id": process_id,
+                    "host_boot_id": host_boot_id,
                     "host_id": host_id,
                     "tmux_server_id": tmux_server_id,
                     "pane_id": pane_id,

@@ -387,6 +387,8 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
             "runtime_session_id": str(uuid.uuid4()),
             "runtime_incarnation_id": runtime_incarnation_id,
             "pane_instance_id": pane_instance_id,
+            "process_id": 5101,
+            "host_boot_id": "boot-fleet",
             "host_id": "host-fleet",
             "tmux_server_id": "server-fleet",
             "pane_id": "%51",
@@ -439,6 +441,8 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert row["logical_agent_key"] == logical_key
         assert row["runtime_incarnation_id"] == runtime_incarnation_id
         assert row["pane_instance_id"] == pane_instance_id
+        assert row["process_id"] == 5101
+        assert row["host_boot_id"] == "boot-fleet"
         assert row["live_tui_reachable"] is True
 
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_locator)
@@ -498,6 +502,8 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
             "runtime_session_id": runtime_session_id,
             "runtime_incarnation_id": runtime_incarnation_id,
             "pane_instance_id": pane_instance_id,
+            "process_id": 2401,
+            "host_boot_id": "boot-a",
             "host_id": "host-a",
             "tmux_server_id": "server-a",
             "pane_id": "%24",
@@ -566,6 +572,8 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                 "pane_id": "%40",
                 "runtime_incarnation_id": str(uuid.uuid4()),
                 "pane_instance_id": str(uuid.uuid4()),
+                "process_id": 4001,
+                "host_boot_id": "boot-a",
                 "program": "codex",
                 "model": "gpt-5.6-new-account",
                 "task_description": "continued runtime",
@@ -587,6 +595,8 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                     "pane_id": "%40",
                     "runtime_incarnation_id": continued.data["runtime_incarnation_id"],
                     "pane_instance_id": continued.data["pane_instance_id"],
+                    "process_id": 4001,
+                    "host_boot_id": "boot-a",
                     "program": "codex",
                     "model": "gpt-5.6-new-account",
                     "task_description": "continued runtime",
@@ -607,6 +617,8 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                 "runtime_session_id": str(uuid.uuid4()),
                 "runtime_incarnation_id": str(uuid.uuid4()),
                 "pane_instance_id": str(uuid.uuid4()),
+                "process_id": 4002,
+                "host_boot_id": "boot-a",
                 "host_id": "host-a",
                 "tmux_server_id": "server-a",
                 "pane_id": "%40",
@@ -701,6 +713,8 @@ async def test_managed_watcher_v2_signal_and_prestop_are_durable_bounded_and_fai
                 "runtime_session_id": runtime_session_id,
                 "runtime_incarnation_id": runtime_incarnation_id,
                 "pane_instance_id": pane_instance_id,
+                "process_id": 4101,
+                "host_boot_id": "boot-watcher",
                 "host_id": "host-watcher",
                 "tmux_server_id": "server-watcher",
                 "pane_id": "%41",
