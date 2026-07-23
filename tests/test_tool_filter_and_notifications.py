@@ -145,6 +145,12 @@ class TestToolFilter:
         names = {tool.name for tool in agent_tools}
         assert names == {
             "identity_status",
+            "ensure_fleet_principal",
+            "activate_fleet_runtime",
+            "publish_fleet_runtime_observation",
+            "publish_fleet_launch_state",
+            "agent_roster_current",
+            "agent_roster",
             "reconcile_runtime_binding",
             "heartbeat_runtime_binding",
             "macro_start_session",

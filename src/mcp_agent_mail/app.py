@@ -420,6 +420,12 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
         "tools": [
             "macro_start_session",
             "identity_status",
+            "ensure_fleet_principal",
+            "activate_fleet_runtime",
+            "publish_fleet_runtime_observation",
+            "publish_fleet_launch_state",
+            "agent_roster_current",
+            "agent_roster",
             "reconcile_runtime_binding",
             "heartbeat_runtime_binding",
             "sync_inbox",
