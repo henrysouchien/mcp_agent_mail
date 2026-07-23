@@ -422,6 +422,7 @@ TOOL_FILTER_PROFILES: dict[str, dict[str, list[str] | set[str]]] = {
             "identity_status",
             "ensure_fleet_principal",
             "activate_fleet_runtime",
+            "issue_continuation_receipt",
             "publish_fleet_runtime_observation",
             "publish_fleet_launch_state",
             "agent_roster_current",
@@ -9944,6 +9945,35 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 if current_marker is not None
                 else None
             )
+            if proof_mode != "create":
+                active_runtime = (
+                    await session.execute(
+                        select(RuntimeBinding)
+                        .where(
+                            cast(Any, RuntimeBinding.project_id) == project.id,
+                            cast(Any, RuntimeBinding.agent_id) == agent.id,
+                            cast(Any, RuntimeBinding.state) != "ended",
+                        )
+                        .order_by(cast(Any, RuntimeBinding.generation).desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    active_runtime is None
+                    or active_runtime.generation != expected_generation
+                ):
+                    raise ToolExecutionError(
+                        "STALE_GENERATION",
+                        "Active runtime generation changed before Phase A.",
+                        recoverable=True,
+                        data={
+                            "current_generation": (
+                                active_runtime.generation
+                                if active_runtime is not None
+                                else None
+                            )
+                        },
+                    )
             staged_identity: WindowIdentity
             if proof_mode == "create":
                 if current_marker is not None:

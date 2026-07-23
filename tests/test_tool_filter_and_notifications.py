@@ -147,6 +147,7 @@ class TestToolFilter:
             "identity_status",
             "ensure_fleet_principal",
             "activate_fleet_runtime",
+            "issue_continuation_receipt",
             "publish_fleet_runtime_observation",
             "publish_fleet_launch_state",
             "agent_roster_current",

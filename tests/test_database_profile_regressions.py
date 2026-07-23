@@ -432,6 +432,30 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
             },
         )
         assert observed.data["overall"] == "live"
+        stale_launch_attempt_id = str(uuid.uuid4())
+        stale_ensure = {
+            **ensure_args,
+            "launch_attempt_id": stale_launch_attempt_id,
+            "proof_mode": "rotate_or_takeover",
+            "window_locator": str(uuid.uuid4()),
+            "expected_generation": 0,
+            "expected_agent_id": ensured.data["agent_id"],
+            "agent_recovery_authority": ensured.data[
+                "agent_recovery_authority"
+            ],
+            "takeover_reason": "stale generation regression",
+            "supervisor_sequence": 4,
+            "idempotency_key": (
+                f"ensure-principal:v1:{project_hash}:{logical_key}:"
+                f"{stale_launch_attempt_id}"
+            ),
+        }
+        with pytest.raises(
+            ToolError,
+            match="generation changed before Phase A",
+        ):
+            await client.call_tool("ensure_fleet_principal", stale_ensure)
+
         roster = await client.call_tool(
             "agent_roster",
             {"project_key": project_key, "owner_token": owner_token},
@@ -444,6 +468,7 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert row["process_id"] == 5101
         assert row["host_boot_id"] == "boot-fleet"
         assert row["live_tui_reachable"] is True
+        assert row["launch_attempt_id"] == launch_attempt_id
 
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_locator)
     _config.clear_settings_cache()
