@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import time
@@ -20,14 +21,18 @@ from mcp_agent_mail.app import _automatic_mutation_keys, build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.models import (
+    ActivePrincipalAuthority,
     Agent,
     AuditEvent,
     FileReservation,
+    FleetLaunchState,
     IdempotencyRecord,
+    LogicalAgentPrincipal,
     Message,
     MessageRecipient,
     Project,
     RuntimeBinding,
+    RuntimeObservation,
     WindowIdentity,
 )
 
@@ -117,7 +122,7 @@ async def test_macro_start_session_binds_http_window_authority_in_database_profi
         identity = (
             await session.execute(
                 select(WindowIdentity).where(
-                    WindowIdentity.window_uuid == window_uuid
+                    cast(Any, WindowIdentity.window_uuid) == window_uuid
                 )
             )
         ).scalar_one()
@@ -322,6 +327,144 @@ async def test_database_concurrent_first_registration_claims_one_window_once(
 
 
 @pytest.mark.asyncio
+async def test_fleet_identity_two_phase_create_converges_to_live_roster(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_database_profile(monkeypatch)
+    owner_token = "test-fleet-controller-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", "")
+    _config.clear_settings_cache()
+    project_key = "/regression/fleet-two-phase-new-project"
+    project_hash = hashlib.sha256(project_key.encode()).hexdigest()
+    logical_key = f"fa:{uuid.uuid4()}"
+    launch_attempt_id = str(uuid.uuid4())
+    window_locator = str(uuid.uuid4())
+    ensure_key = (
+        f"ensure-principal:v1:{project_hash}:{logical_key}:{launch_attempt_id}"
+    )
+    ensure_args = {
+        "canonical_project": project_key,
+        "logical_agent_key": logical_key,
+        "launch_attempt_id": launch_attempt_id,
+        "proof_mode": "create",
+        "window_locator": window_locator,
+        "provider": "codex",
+        "requested_model": "gpt-5.6",
+        "task_description": "two-phase fleet regression",
+        "owner_token": owner_token,
+        "idempotency_key": ensure_key,
+        "supervisor_sequence": 1,
+        "expected_generation": 0,
+    }
+
+    async with Client(build_mcp_server()) as client:
+        ensured = await client.call_tool("ensure_fleet_principal", ensure_args)
+        replayed = await client.call_tool("ensure_fleet_principal", ensure_args)
+        assert ensured.data["overall"] == "starting"
+        assert ensured.data["replayed"] is False
+        assert replayed.data["replayed"] is True
+        assert replayed.data["agent_id"] == ensured.data["agent_id"]
+        changed = dict(ensure_args)
+        changed["requested_model"] = "different-model"
+        with pytest.raises(ToolError, match="different ensure_fleet_principal"):
+            await client.call_tool("ensure_fleet_principal", changed)
+
+        runtime_incarnation_id = str(uuid.uuid4())
+        pane_instance_id = str(uuid.uuid4())
+        activate_key = (
+            f"activate-runtime:v1:{project_hash}:{logical_key}:"
+            f"{launch_attempt_id}:{runtime_incarnation_id}"
+        )
+        activate_args = {
+            "canonical_project": project_key,
+            "logical_agent_key": logical_key,
+            "launch_attempt_id": launch_attempt_id,
+            "phase_a_launch_receipt": ensured.data["launch_receipt"],
+            "proof_mode": "create",
+            "agent_id": ensured.data["agent_id"],
+            "runtime_session_id": str(uuid.uuid4()),
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
+            "host_id": "host-fleet",
+            "tmux_server_id": "server-fleet",
+            "pane_id": "%51",
+            "program": "codex",
+            "model": "gpt-5.6",
+            "task_description": "two-phase fleet regression",
+            "process_started_ts": "2026-07-23T14:00:00Z",
+            "expected_generation": 0,
+            "owner_token": owner_token,
+            "agent_recovery_authority": ensured.data["agent_recovery_authority"],
+            "idempotency_key": activate_key,
+            "supervisor_sequence": 2,
+        }
+        activated = await client.call_tool("activate_fleet_runtime", activate_args)
+        assert activated.data["overall"] == "route_missing"
+        assert activated.data["generation"] == 1
+
+        starting = await client.call_tool(
+            "agent_roster",
+            {"project_key": project_key, "owner_token": owner_token},
+        )
+        assert starting.data["agents"][0]["state"] == "starting"
+
+        observed = await client.call_tool(
+            "publish_fleet_runtime_observation",
+            {
+                "project_key": project_key,
+                "logical_agent_key": logical_key,
+                "runtime_binding_id": activated.data["runtime_binding_id"],
+                "runtime_generation": 1,
+                "observation_sequence": 1,
+                "supervisor_sequence": 3,
+                "observer_id": "fleet-test-observer",
+                "pane_live": True,
+                "route_readback_verified": True,
+                "prompt_state": "idle",
+                "provider_state": "ready",
+                "identity_context_injected": True,
+                "coordination_state": "ready",
+                "owner_token": owner_token,
+            },
+        )
+        assert observed.data["overall"] == "live"
+        roster = await client.call_tool(
+            "agent_roster",
+            {"project_key": project_key, "owner_token": owner_token},
+        )
+        row = roster.data["agents"][0]
+        assert row["state"] == "live"
+        assert row["logical_agent_key"] == logical_key
+        assert row["runtime_incarnation_id"] == runtime_incarnation_id
+        assert row["pane_instance_id"] == pane_instance_id
+        assert row["live_tui_reachable"] is True
+
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_locator)
+    _config.clear_settings_cache()
+    async with Client(build_mcp_server()) as client:
+        blocks = await client.read_resource("resource://roster/current")
+    resource_payload = json.loads(blocks[0].text)
+    assert resource_payload["agents"][0]["logical_agent_key"] == logical_key
+    assert resource_payload["agents"][0]["state"] == "live"
+
+    async with get_session() as session:
+        assert await session.scalar(select(func.count()).select_from(Project)) == 1
+        assert (
+            await session.scalar(select(func.count()).select_from(LogicalAgentPrincipal))
+            == 1
+        )
+        assert (
+            await session.scalar(select(func.count()).select_from(ActivePrincipalAuthority))
+            == 1
+        )
+        assert await session.scalar(select(func.count()).select_from(FleetLaunchState)) == 1
+        assert await session.scalar(select(func.count()).select_from(RuntimeBinding)) == 1
+        assert await session.scalar(select(func.count()).select_from(RuntimeObservation)) == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route_readback(
     isolated_env: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -334,7 +477,8 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
     _config.clear_settings_cache()
     project_key = "/regression/runtime-binding-generation"
     runtime_session_id = str(uuid.uuid4())
-    pane_incarnation_id = str(uuid.uuid4())
+    runtime_incarnation_id = str(uuid.uuid4())
+    pane_instance_id = str(uuid.uuid4())
     started = "2026-07-22T15:00:00Z"
 
     async with Client(build_mcp_server()) as client:
@@ -352,12 +496,14 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
             "registration_token": agent["registration_token"],
             "owner_token": owner_token,
             "runtime_session_id": runtime_session_id,
-            "pane_incarnation_id": pane_incarnation_id,
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
             "host_id": "host-a",
             "tmux_server_id": "server-a",
             "pane_id": "%24",
             "program": "codex",
             "model": "gpt-5.6",
+            "task_description": "runtime binding regression",
             "process_started_ts": started,
             "expected_generation": 0,
         }
@@ -392,7 +538,7 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
         conflict_args = dict(moved_args)
         conflict_args.update(
             {
-                "pane_incarnation_id": str(uuid.uuid4()),
+                "runtime_incarnation_id": str(uuid.uuid4()),
                 "expected_generation": 2,
             }
         )
@@ -418,14 +564,18 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                 "host_id": "host-a",
                 "tmux_server_id": "server-a",
                 "pane_id": "%40",
+                "runtime_incarnation_id": str(uuid.uuid4()),
+                "pane_instance_id": str(uuid.uuid4()),
                 "program": "codex",
                 "model": "gpt-5.6-new-account",
+                "task_description": "continued runtime",
                 "process_started_ts": "2026-07-22T15:10:00Z",
             },
         )
         assert continued.data["generation"] == 3
         assert continued.data["runtime_session_id"] == runtime_session_id
-        assert continued.data["pane_incarnation_id"] == pane_incarnation_id
+        assert continued.data["runtime_incarnation_id"] != runtime_incarnation_id
+        assert continued.data["pane_instance_id"] != pane_instance_id
         with pytest.raises(ToolError, match="consumed or expired"):
             await client.call_tool(
                 "consume_continuation_receipt",
@@ -435,8 +585,11 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                     "host_id": "host-a",
                     "tmux_server_id": "server-a",
                     "pane_id": "%40",
+                    "runtime_incarnation_id": continued.data["runtime_incarnation_id"],
+                    "pane_instance_id": continued.data["pane_instance_id"],
                     "program": "codex",
                     "model": "gpt-5.6-new-account",
+                    "task_description": "continued runtime",
                     "process_started_ts": "2026-07-22T15:10:00Z",
                 },
             )
@@ -452,12 +605,14 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                 "expected_generation": 3,
                 "new_window_uuid": new_window_uuid,
                 "runtime_session_id": str(uuid.uuid4()),
-                "pane_incarnation_id": str(uuid.uuid4()),
+                "runtime_incarnation_id": str(uuid.uuid4()),
+                "pane_instance_id": str(uuid.uuid4()),
                 "host_id": "host-a",
                 "tmux_server_id": "server-a",
                 "pane_id": "%40",
                 "program": "codex",
                 "model": "gpt-5.6-new-task",
+                "task_description": "rotated runtime",
                 "process_started_ts": "2026-07-22T15:20:00Z",
             },
         )
@@ -526,7 +681,8 @@ async def test_managed_watcher_v2_signal_and_prestop_are_durable_bounded_and_fai
 
     window_uuid = str(uuid.uuid4())
     runtime_session_id = str(uuid.uuid4())
-    pane_incarnation_id = str(uuid.uuid4())
+    runtime_incarnation_id = str(uuid.uuid4())
+    pane_instance_id = str(uuid.uuid4())
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
     _config.clear_settings_cache()
     async with Client(build_mcp_server()) as client:
@@ -543,12 +699,14 @@ async def test_managed_watcher_v2_signal_and_prestop_are_durable_bounded_and_fai
                 "registration_token": recipient["registration_token"],
                 "owner_token": owner_token,
                 "runtime_session_id": runtime_session_id,
-                "pane_incarnation_id": pane_incarnation_id,
+                "runtime_incarnation_id": runtime_incarnation_id,
+                "pane_instance_id": pane_instance_id,
                 "host_id": "host-watcher",
                 "tmux_server_id": "server-watcher",
                 "pane_id": "%41",
                 "program": "codex",
                 "model": "gpt-5.6",
+                "task_description": "managed watcher",
                 "process_started_ts": "2026-07-22T15:00:00Z",
                 "expected_generation": 0,
             },
@@ -627,7 +785,8 @@ async def test_managed_watcher_v2_signal_and_prestop_are_durable_bounded_and_fai
         "project_key": project_key,
         "agent_name": recipient["name"],
         "runtime_session_id": runtime_session_id,
-        "pane_incarnation_id": pane_incarnation_id,
+        "runtime_incarnation_id": runtime_incarnation_id,
+        "pane_instance_id": pane_instance_id,
         "runtime_generation": 1,
         "host_id": "host-watcher",
         "tmux_server_id": "server-watcher",

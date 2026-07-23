@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 from git.index.base import IndexFile
@@ -107,6 +108,53 @@ def test_cli_typecheck(monkeypatch):
     result = runner.invoke(app, ["typecheck"])
     assert result.exit_code == 0
     assert captured == [["uvx", "ty", "check"]]
+
+
+def test_agent_roster_project_resolution_precedence(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "roster-repo"
+    nested = repo / "nested"
+    nested.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init"],
+        cwd=str(repo),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    monkeypatch.chdir(nested)
+    monkeypatch.setenv("FLEET_IDENTITY_PROJECT", str(tmp_path / "managed"))
+
+    assert cli_module._resolve_agent_roster_project(str(tmp_path / "explicit")) == str(
+        (tmp_path / "explicit").resolve()
+    )
+    assert cli_module._resolve_agent_roster_project(None) == str(
+        (tmp_path / "managed").resolve()
+    )
+    monkeypatch.delenv("FLEET_IDENTITY_PROJECT")
+    assert cli_module._resolve_agent_roster_project(None) == str(repo.resolve())
+
+
+def test_agent_roster_cli_requires_controller_authority(
+    isolated_env: object,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            credentials=SimpleNamespace(owner_token=None),
+        ),
+    )
+    result = CliRunner().invoke(
+        app,
+        ["agent-roster", "--project", str(tmp_path), "--json"],
+    )
+    assert result.exit_code != 0
+    assert "controller/operator authority" in result.stderr
 
 
 def test_release_sentinel_requires_quiescence_and_detects_state_change(

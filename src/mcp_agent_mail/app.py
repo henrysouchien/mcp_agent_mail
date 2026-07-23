@@ -89,11 +89,13 @@ from .notification_signals import (
     emit_notification_signal_v2,
 )
 from .models import (
+    ActivePrincipalAuthority,
     Agent,
     AgentLink,
     AuditEvent,
     ContinuationReceipt,
     FileReservation,
+    FleetLaunchState,
     InboxCursor,
     Message,
     MessageRecipient,
@@ -105,6 +107,8 @@ from .models import (
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
+    LogicalAgentPrincipal,
+    RuntimeObservation,
     RuntimeBinding,
     StopAttempt,
     WindowIdentity,
@@ -3966,6 +3970,15 @@ async def _create_window_identity(
         )
         session.add(identity)
         try:
+            await session.flush()
+            await _activate_window_identity_marker(
+                session,
+                project_id=project.id,
+                agent_id=agent.id,
+                identity=identity,
+                allow_replace=False,
+                now=now,
+            )
             await session.commit()
             await session.refresh(identity)
             return identity
@@ -3980,6 +3993,49 @@ async def _create_window_identity(
             if existing is not None:
                 return existing
             raise  # Should not happen, but don't swallow unexpected errors
+
+
+async def _activate_window_identity_marker(
+    session: Any,
+    *,
+    project_id: int,
+    agent_id: int,
+    identity: WindowIdentity,
+    allow_replace: bool,
+    now: datetime,
+) -> ActivePrincipalAuthority:
+    """Create or atomically replace one principal's current authority marker."""
+    if identity.id is None:
+        raise ValueError("Window identity must be flushed before activation.")
+    marker = await session.get(ActivePrincipalAuthority, (project_id, agent_id))
+    if marker is None:
+        marker = ActivePrincipalAuthority(
+            project_id=project_id,
+            agent_id=agent_id,
+            window_identity_id=identity.id,
+            authority_generation=1,
+            activated_ts=now,
+        )
+        session.add(marker)
+        return marker
+    if marker.window_identity_id == identity.id:
+        return marker
+    if not allow_replace:
+        raise ToolExecutionError(
+            "AUTHORITY_CONFLICT",
+            "The principal already has a different current window authority.",
+            recoverable=True,
+        )
+    prior = await session.get(WindowIdentity, marker.window_identity_id)
+    if prior is not None:
+        prior.superseded_ts = now
+        prior.expires_ts = now
+        session.add(prior)
+    marker.window_identity_id = identity.id
+    marker.authority_generation += 1
+    marker.activated_ts = now
+    session.add(marker)
+    return marker
 
 
 async def _resolve_window_identity_agent(
@@ -4361,6 +4417,20 @@ async def _get_or_create_agent(
                     )
                     session.add(transaction_window_identity)
                     window_identity = transaction_window_identity
+                if (
+                    database_authoritative
+                    and transaction_window_identity is not None
+                    and agent.id is not None
+                ):
+                    await session.flush()
+                    await _activate_window_identity_marker(
+                        session,
+                        project_id=project.id,
+                        agent_id=agent.id,
+                        identity=transaction_window_identity,
+                        allow_replace=False,
+                        now=_naive_utc(),
+                    )
                 if database_authoritative:
                     await append_audit_event(
                         session,
@@ -4411,6 +4481,16 @@ async def _get_or_create_agent(
                         )
                         session.add(transaction_window_identity)
                         window_identity = transaction_window_identity
+                    if transaction_window_identity is not None and candidate.id is not None:
+                        await session.flush()
+                        await _activate_window_identity_marker(
+                            session,
+                            project_id=project.id,
+                            agent_id=candidate.id,
+                            identity=transaction_window_identity,
+                            allow_replace=False,
+                            now=_naive_utc(),
+                        )
                     await append_audit_event(
                         session,
                         project_id=project.id,
@@ -6402,6 +6482,31 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             window_identity.agent_id = agent.id
             window_identity.display_name = agent.name
 
+        if window_identity.id is None or agent.id is None:
+            return False
+        try:
+            async with get_immediate_session() as session:
+                db_identity = await session.get(WindowIdentity, window_identity.id)
+                if db_identity is None:
+                    return False
+                await _activate_window_identity_marker(
+                    session,
+                    project_id=project.id,
+                    agent_id=agent.id,
+                    identity=db_identity,
+                    allow_replace=False,
+                    now=_naive_utc(),
+                )
+                await session.commit()
+        except ToolExecutionError as exc:
+            if exc.error_type != "AUTHORITY_CONFLICT":
+                raise
+            await _ctx_info_safe(
+                ctx,
+                "Authenticated carrier is staged but is not the principal's current authority.",
+            )
+            return False
+
         await _touch_window_identity(window_identity, ttl_days)
         await _ctx_info_safe(
             ctx,
@@ -7930,7 +8035,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 ) from exc
             event = await append_audit_event(
                 session,
-                project_id=cast(int, project.id),
+                project_id=project.id,
                 actor_kind="owner",
                 actor_scope_id="owner/core-credential-rotate",
                 actor_agent_id=None,
@@ -7942,7 +8047,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             await assert_route_generation(
                 session,
-                project_id=cast(int, project.id),
+                project_id=project.id,
                 expected_state=route.state,
                 expected_generation=route.generation,
             )
@@ -7990,7 +8095,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             event = await append_audit_event(
                 session,
-                project_id=cast(int, project.id),
+                project_id=project.id,
                 actor_kind="owner",
                 actor_scope_id="owner/core-credential-revoke",
                 actor_agent_id=None,
@@ -8002,7 +8107,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             await assert_route_generation(
                 session,
-                project_id=cast(int, project.id),
+                project_id=project.id,
                 expected_state=route.state,
                 expected_generation=route.generation,
             )
@@ -9323,13 +9428,35 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             window_uuid = effective_window_identity_uuid(settings)
             if not window_uuid or not _validate_window_uuid(window_uuid):
                 return None
-            identity = await _get_window_identity(project, window_uuid)
-            if identity is None or identity.id is None:
-                return None
-            bound_agent = await _resolve_window_identity_agent(project, identity)
-            if bound_agent is None or bound_agent.id != agent.id:
-                return None
-            return "window_identity", str(identity.id)
+            now = _naive_utc()
+            async with get_session() as session:
+                result = await session.execute(
+                    select(WindowIdentity)
+                    .join(
+                        ActivePrincipalAuthority,
+                        cast(Any, ActivePrincipalAuthority.window_identity_id)
+                        == WindowIdentity.id,
+                    )
+                    .where(
+                        cast(Any, ActivePrincipalAuthority.project_id) == project.id,
+                        cast(Any, ActivePrincipalAuthority.agent_id) == agent.id,
+                        cast(Any, WindowIdentity.project_id) == project.id,
+                        cast(Any, WindowIdentity.agent_id) == agent.id,
+                        func.lower(cast(Any, WindowIdentity.window_uuid))
+                        == window_uuid.lower(),
+                        cast(Any, WindowIdentity.superseded_ts).is_(None),
+                        _sa_or(
+                            cast(Any, WindowIdentity.expires_ts).is_(None),
+                            cast(Any, WindowIdentity.expires_ts) > now,
+                        ),
+                    )
+                )
+                identity = result.scalar_one_or_none()
+            return (
+                ("window_identity", str(identity.id))
+                if identity is not None and identity.id is not None
+                else None
+            )
 
         window_uuid = effective_window_identity_uuid(settings)
         if not window_uuid:
@@ -9394,6 +9521,53 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         except (ValueError, TypeError, json.JSONDecodeError, binascii.Error):
             return None
 
+    def _locator_digest(window_uuid: str) -> str:
+        return hashlib.sha256(f"window-locator-v1\0{window_uuid.lower()}".encode()).hexdigest()
+
+    def _validate_logical_agent_key(logical_agent_key: str) -> None:
+        try:
+            prefix, raw_uuid = logical_agent_key.split(":", 1)
+            parsed = uuid.UUID(raw_uuid)
+        except (ValueError, AttributeError) as exc:
+            raise ToolExecutionError(
+                "INVALID_LOGICAL_AGENT_KEY",
+                "logical_agent_key must be fa:<lowercase-UUIDv4>.",
+            ) from exc
+        if (
+            prefix != "fa"
+            or parsed.version != 4
+            or logical_agent_key != f"fa:{parsed!s}"
+        ):
+            raise ToolExecutionError(
+                "INVALID_LOGICAL_AGENT_KEY",
+                "logical_agent_key must be fa:<lowercase-UUIDv4>.",
+            )
+
+    def _validate_fleet_idempotency_key(
+        *,
+        phase: str,
+        idempotency_key: str,
+        canonical_project: str,
+        logical_agent_key: str,
+        launch_attempt_id: str,
+        runtime_incarnation_id: str | None = None,
+    ) -> str:
+        project_hash = hashlib.sha256(canonical_project.encode()).hexdigest()
+        expected = (
+            f"ensure-principal:v1:{project_hash}:{logical_agent_key}:{launch_attempt_id}"
+            if phase == "ensure"
+            else (
+                f"activate-runtime:v1:{project_hash}:{logical_agent_key}:"
+                f"{launch_attempt_id}:{runtime_incarnation_id}"
+            )
+        )
+        if idempotency_key != expected:
+            raise ToolExecutionError(
+                "INVALID_IDEMPOTENCY_KEY",
+                f"idempotency_key must equal {expected}.",
+            )
+        return project_hash
+
     async def _active_runtime_binding(
         authority_kind: str,
         authority_id: str,
@@ -9414,9 +9588,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
     def _runtime_binding_payload(binding: RuntimeBinding) -> dict[str, Any]:
         return {
             "runtime_session_id": binding.runtime_session_id,
-            "pane_incarnation_id": binding.pane_incarnation_id,
+            "runtime_incarnation_id": binding.runtime_incarnation_id,
+            "pane_instance_id": binding.pane_instance_id,
             "program": binding.program,
             "model": binding.model,
+            "task_description": binding.task_description,
             "process_started_ts": _iso(binding.process_started_ts),
             "state": binding.state,
             "last_heartbeat_ts": _iso(binding.last_heartbeat_ts),
@@ -9537,6 +9713,1326 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "overall": overall,
         }
 
+    @mcp.tool(name="ensure_fleet_principal")
+    @_instrument_tool(
+        "ensure_fleet_principal",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write", "controller"},
+        project_arg="canonical_project",
+    )
+    async def ensure_fleet_principal(
+        ctx: Context,
+        canonical_project: str,
+        logical_agent_key: str,
+        launch_attempt_id: str,
+        proof_mode: str,
+        window_locator: str,
+        provider: str,
+        requested_model: str,
+        task_description: str,
+        owner_token: str,
+        idempotency_key: str,
+        supervisor_sequence: int,
+        expected_generation: int = 0,
+        expected_agent_id: Optional[int] = None,
+        agent_recovery_authority: Optional[str] = None,
+        continuation_receipt: Optional[str] = None,
+        takeover_reason: Optional[str] = None,
+        requested_public_name: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Ensure one durable fleet principal and stage its launch authority."""
+        del ctx, format
+        _require_owner(settings, owner_token)
+        if settings.runtime_profile != "database":
+            raise ToolExecutionError(
+                "PROFILE_UNSUPPORTED",
+                "Fleet identity bootstrap currently targets the database profile.",
+            )
+        _validate_logical_agent_key(logical_agent_key)
+        if proof_mode not in {
+            "create",
+            "resume_same_authority",
+            "continue_with_receipt",
+            "rotate_or_takeover",
+        }:
+            raise ToolExecutionError("INVALID_PROOF_MODE", "Unsupported fleet proof mode.")
+        if not launch_attempt_id.strip():
+            raise ToolExecutionError("INVALID_LAUNCH_ATTEMPT", "launch_attempt_id must not be blank.")
+        if not _validate_window_uuid(window_locator):
+            raise ToolExecutionError("INVALID_WINDOW_UUID", "window_locator must be a UUID.")
+        if supervisor_sequence < 0 or expected_generation < 0:
+            raise ToolExecutionError("INVALID_FENCE", "Sequence and generation fences must be non-negative.")
+        normalized_project, _ = _validate_new_project_key(canonical_project, "workspace")
+        if canonical_project != normalized_project:
+            raise ToolExecutionError(
+                "PROJECT_MISMATCH",
+                "canonical_project must already be normalized by the fleet canonicalization algorithm.",
+            )
+        project_hash = _validate_fleet_idempotency_key(
+            phase="ensure",
+            idempotency_key=idempotency_key,
+            canonical_project=normalized_project,
+            logical_agent_key=logical_agent_key,
+            launch_attempt_id=launch_attempt_id,
+        )
+        recovery_digest = (
+            hashlib.sha256(agent_recovery_authority.encode()).hexdigest()
+            if agent_recovery_authority
+            else None
+        )
+        continuation_digest = (
+            hashlib.sha256(continuation_receipt.encode()).hexdigest()
+            if continuation_receipt
+            else None
+        )
+        request_payload = {
+            "canonical_project": normalized_project,
+            "logical_agent_key": logical_agent_key,
+            "launch_attempt_id": launch_attempt_id,
+            "proof_mode": proof_mode,
+            "window_locator": window_locator.lower(),
+            "provider": provider,
+            "requested_model": requested_model,
+            "task_description": task_description,
+            "supervisor_sequence": supervisor_sequence,
+            "expected_generation": expected_generation,
+            "expected_agent_id": expected_agent_id,
+            "agent_recovery_authority_digest": recovery_digest,
+            "continuation_receipt_digest": continuation_digest,
+            "takeover_reason": takeover_reason,
+            "requested_public_name": requested_public_name,
+        }
+        now = _naive_utc()
+
+        async def mutate(session: Any) -> MutationReceipt:
+            slug = _compute_project_slug(normalized_project)
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        _sa_or(
+                            cast(Any, Project.human_key) == normalized_project,
+                            cast(Any, Project.slug) == slug,
+                        )
+                    )
+                )
+            ).scalars().first()
+            if project is None:
+                project = Project(
+                    slug=slug,
+                    human_key=normalized_project,
+                    namespace_kind="workspace",
+                )
+                session.add(project)
+                await session.flush()
+                await _append_project_creation_event(
+                    session,
+                    project,
+                    namespace_kind="workspace",
+                )
+            if project.id is None:
+                raise RuntimeError("Project id was not allocated.")
+
+            assignment = (
+                await session.execute(
+                    select(LogicalAgentPrincipal).where(
+                        cast(Any, LogicalAgentPrincipal.project_id) == project.id,
+                        cast(Any, LogicalAgentPrincipal.logical_agent_key)
+                        == logical_agent_key,
+                        cast(Any, LogicalAgentPrincipal.retired_ts).is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            agent: Agent | None = None
+            recovery_authority: str | None = None
+            if assignment is None:
+                if proof_mode != "create" or expected_generation != 0:
+                    raise ToolExecutionError(
+                        "LOGICAL_ASSIGNMENT_MISSING",
+                        "Only create with generation 0 may allocate a logical principal.",
+                    )
+                if expected_agent_id is not None:
+                    raise ToolExecutionError(
+                        "PRINCIPAL_MISMATCH",
+                        "create cannot claim an existing agent id.",
+                    )
+                if requested_public_name:
+                    public_name = requested_public_name
+                    if not validate_agent_name_format(public_name):
+                        raise ToolExecutionError(
+                            "INVALID_AGENT_NAME",
+                            "Controlled migration name is not a valid public Agent Mail name.",
+                        )
+                else:
+                    public_name = ""
+                    for _ in range(1024):
+                        candidate = sanitize_agent_name(generate_agent_name())
+                        if not candidate:
+                            continue
+                        exists = (
+                            await session.execute(
+                                select(Agent.id).where(
+                                    cast(Any, Agent.project_id) == project.id,
+                                    func.lower(cast(Any, Agent.name)) == candidate.lower(),
+                                )
+                            )
+                        ).first()
+                        if candidate and exists is None:
+                            public_name = candidate
+                            break
+                    if not public_name:
+                        raise RuntimeError("Unable to allocate a unique fleet agent name.")
+                recovery_authority = secrets.token_urlsafe(32)
+                agent = Agent(
+                    project_id=project.id,
+                    name=public_name,
+                    program="fleet-principal",
+                    model="unbound",
+                    task_description="",
+                    registration_token=recovery_authority,
+                )
+                session.add(agent)
+                await session.flush()
+                if agent.id is None:
+                    raise RuntimeError("Agent id was not allocated.")
+                assignment = LogicalAgentPrincipal(
+                    project_id=project.id,
+                    logical_agent_key=logical_agent_key,
+                    agent_id=agent.id,
+                    assignment_generation=1,
+                    assigned_ts=now,
+                )
+                session.add(assignment)
+                await session.flush()
+            else:
+                agent = await session.get(Agent, assignment.agent_id)
+                if agent is None or agent.id is None:
+                    raise ToolExecutionError(
+                        "PRINCIPAL_MISMATCH",
+                        "Logical assignment points to a missing principal.",
+                    )
+                if expected_agent_id is not None and expected_agent_id != agent.id:
+                    raise ToolExecutionError("PRINCIPAL_MISMATCH", "Expected principal does not match.")
+                if (
+                    not agent_recovery_authority
+                    or not agent.registration_token
+                    or not hmac.compare_digest(
+                        agent_recovery_authority,
+                        agent.registration_token,
+                    )
+                ):
+                    raise ToolExecutionError(
+                        "AGENT_RECOVERY_AUTHENTICATION_REQUIRED",
+                        "Existing assignments require valid agent recovery authority.",
+                    )
+            assert assignment is not None and agent is not None and agent.id is not None
+
+            current_marker = await session.get(
+                ActivePrincipalAuthority,
+                (project.id, agent.id),
+            )
+            current_identity = (
+                await session.get(WindowIdentity, current_marker.window_identity_id)
+                if current_marker is not None
+                else None
+            )
+            staged_identity: WindowIdentity
+            if proof_mode == "create":
+                if current_marker is not None:
+                    raise ToolExecutionError(
+                        "AUTHORITY_CONFLICT",
+                        "New principal unexpectedly already has current authority.",
+                    )
+                staged_identity = WindowIdentity(
+                    project_id=project.id,
+                    agent_id=agent.id,
+                    window_uuid=window_locator,
+                    display_name=agent.name,
+                    created_ts=now,
+                    last_active_ts=now,
+                    expires_ts=now
+                    + timedelta(days=getattr(settings, "window_identity_ttl_days", 30)),
+                )
+                session.add(staged_identity)
+                await session.flush()
+                await _activate_window_identity_marker(
+                    session,
+                    project_id=project.id,
+                    agent_id=agent.id,
+                    identity=staged_identity,
+                    allow_replace=False,
+                    now=now,
+                )
+            elif proof_mode == "resume_same_authority":
+                if (
+                    current_identity is None
+                    or current_identity.window_uuid.lower() != window_locator.lower()
+                ):
+                    raise ToolExecutionError(
+                        "AUTHORITY_MISMATCH",
+                        "Same-authority resume requires the current locator.",
+                    )
+                staged_identity = current_identity
+            else:
+                if current_identity is None:
+                    raise ToolExecutionError("AUTHORITY_MISSING", "No current authority to replace.")
+                if current_identity.window_uuid.lower() == window_locator.lower():
+                    raise ToolExecutionError(
+                        "AUTHORITY_CONFLICT",
+                        "Continuation/takeover target locator must be fresh.",
+                    )
+                existing_locator = (
+                    await session.execute(
+                        select(WindowIdentity).where(
+                            cast(Any, WindowIdentity.project_id) == project.id,
+                            func.lower(cast(Any, WindowIdentity.window_uuid))
+                            == window_locator.lower(),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing_locator is not None:
+                    raise ToolExecutionError(
+                        "AUTHORITY_CONFLICT",
+                        "Target locator is already registered.",
+                    )
+                if proof_mode == "continue_with_receipt":
+                    payload = (
+                        _decode_continuation_receipt(continuation_receipt)
+                        if continuation_receipt
+                        else None
+                    )
+                    if payload is None:
+                        raise ToolExecutionError(
+                            "INVALID_CONTINUATION",
+                            "A valid continuation receipt is required.",
+                        )
+                    assert continuation_receipt is not None
+                    receipt = await session.get(
+                        ContinuationReceipt,
+                        str(payload.get("nonce", "")),
+                    )
+                    token_digest = hashlib.sha256(continuation_receipt.encode()).hexdigest()
+                    if (
+                        receipt is None
+                        or not hmac.compare_digest(receipt.token_digest, token_digest)
+                        or receipt.project_id != project.id
+                        or receipt.agent_id != agent.id
+                        or receipt.prior_generation != expected_generation
+                        or receipt.consumed_ts is not None
+                        or receipt.expires_ts <= now
+                        or (
+                            receipt.reserved_launch_attempt_id is not None
+                            and receipt.reserved_launch_attempt_id != launch_attempt_id
+                        )
+                    ):
+                        raise ToolExecutionError(
+                            "CONTINUATION_REPLAYED_OR_EXPIRED",
+                            "Continuation receipt cannot be reserved for this launch.",
+                        )
+                    receipt.reserved_launch_attempt_id = launch_attempt_id
+                    receipt.reserved_ts = now
+                    receipt.target_locator_digest = _locator_digest(window_locator)
+                    session.add(receipt)
+                elif not takeover_reason or not takeover_reason.strip():
+                    raise ToolExecutionError(
+                        "TAKEOVER_REASON_REQUIRED",
+                        "rotate_or_takeover requires an explicit reason.",
+                    )
+                staged_identity = WindowIdentity(
+                    project_id=project.id,
+                    agent_id=agent.id,
+                    window_uuid=window_locator,
+                    display_name=agent.name,
+                    created_ts=now,
+                    last_active_ts=now,
+                    expires_ts=now
+                    + timedelta(days=getattr(settings, "window_identity_ttl_days", 30)),
+                )
+                session.add(staged_identity)
+                await session.flush()
+
+            if staged_identity.id is None:
+                raise RuntimeError("Staged identity id was not allocated.")
+            launch_state = await session.get(
+                FleetLaunchState,
+                (project.id, logical_agent_key),
+            )
+            if (
+                launch_state is not None
+                and supervisor_sequence <= launch_state.supervisor_sequence
+                and launch_state.launch_attempt_id != launch_attempt_id
+            ):
+                raise ToolExecutionError(
+                    "STALE_SUPERVISOR_SEQUENCE",
+                    "Launch state sequence did not advance.",
+                )
+            if launch_state is None:
+                launch_state = FleetLaunchState(
+                    project_id=project.id,
+                    logical_agent_key=logical_agent_key,
+                )
+            launch_state.agent_id = agent.id
+            launch_state.desired_state = "running"
+            launch_state.launch_attempt_id = launch_attempt_id
+            launch_state.proof_mode = proof_mode
+            launch_state.coordination_state = "pending"
+            launch_state.identity_context_injected = False
+            launch_state.supervisor_sequence = supervisor_sequence
+            launch_state.expected_generation = expected_generation
+            launch_state.staged_window_identity_id = staged_identity.id
+            launch_state.staged_locator_digest = _locator_digest(window_locator)
+            launch_state.provider = provider
+            launch_state.requested_model = requested_model
+            launch_state.task_description = task_description
+            launch_state.observed_ts = now
+            session.add(launch_state)
+            launch_receipt = _encode_continuation_receipt(
+                {
+                    "version": 1,
+                    "kind": "fleet_launch",
+                    "project_id": project.id,
+                    "logical_agent_key": logical_agent_key,
+                    "agent_id": agent.id,
+                    "launch_attempt_id": launch_attempt_id,
+                    "proof_mode": proof_mode,
+                    "expected_generation": expected_generation,
+                    "staged_window_identity_id": staged_identity.id,
+                    "staged_locator_digest": launch_state.staged_locator_digest,
+                }
+            )
+            await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id=f"fleet-controller/{logical_agent_key}",
+                actor_agent_id=agent.id,
+                operation_kind="fleet_principal_ensured_v1",
+                entity_type="logical_agent_principal",
+                entity_id=str(assignment.id),
+                payload_version="fleet-principal-v1",
+                payload={
+                    "logical_agent_key": logical_agent_key,
+                    "launch_attempt_id": launch_attempt_id,
+                    "proof_mode": proof_mode,
+                    "expected_generation": expected_generation,
+                },
+            )
+            response: dict[str, Any] = {
+                "project_id": project.id,
+                "canonical_project": project.human_key,
+                "logical_agent_key": logical_agent_key,
+                "agent_id": agent.id,
+                "agent_name": agent.name,
+                "assignment_generation": assignment.assignment_generation,
+                "launch_attempt_id": launch_attempt_id,
+                "launch_receipt": launch_receipt,
+                "staged_locator_digest": launch_state.staged_locator_digest,
+                "overall": "starting",
+            }
+            if recovery_authority is not None:
+                response["agent_recovery_authority"] = recovery_authority
+            return MutationReceipt(
+                response=response,
+                entity_type="logical_agent_principal",
+                entity_id=str(assignment.id),
+                project_id=project.id,
+            )
+
+        async with get_immediate_session() as session:
+            result = await run_idempotent_mutation(
+                session,
+                scope_kind="fleet_logical_agent",
+                scope_id=f"{project_hash}:{logical_agent_key}",
+                operation_kind="ensure_fleet_principal_v1",
+                idempotency_key=idempotency_key,
+                request_payload=request_payload,
+                expires_ts=now + timedelta(hours=24),
+                mutate=mutate,
+                now=now,
+            )
+            await session.commit()
+        response = dict(result.response)
+        response["replayed"] = result.replayed
+        return response
+
+    @mcp.tool(name="activate_fleet_runtime")
+    @_instrument_tool(
+        "activate_fleet_runtime",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write", "controller"},
+        project_arg="canonical_project",
+    )
+    async def activate_fleet_runtime(
+        ctx: Context,
+        canonical_project: str,
+        logical_agent_key: str,
+        launch_attempt_id: str,
+        phase_a_launch_receipt: str,
+        proof_mode: str,
+        agent_id: int,
+        runtime_session_id: str,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
+        host_id: str,
+        tmux_server_id: str,
+        pane_id: str,
+        program: str,
+        model: str,
+        task_description: str,
+        process_started_ts: str,
+        expected_generation: int,
+        owner_token: str,
+        agent_recovery_authority: str,
+        idempotency_key: str,
+        supervisor_sequence: int,
+        continuation_receipt: Optional[str] = None,
+        takeover_reason: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically activate one staged fleet runtime generation."""
+        del ctx, format
+        _require_owner(settings, owner_token)
+        _validate_logical_agent_key(logical_agent_key)
+        normalized_project, _ = _validate_new_project_key(canonical_project, "workspace")
+        project_hash = _validate_fleet_idempotency_key(
+            phase="activate",
+            idempotency_key=idempotency_key,
+            canonical_project=normalized_project,
+            logical_agent_key=logical_agent_key,
+            launch_attempt_id=launch_attempt_id,
+            runtime_incarnation_id=runtime_incarnation_id,
+        )
+        started = _parse_iso(process_started_ts)
+        if started is None:
+            raise ToolExecutionError("INVALID_RUNTIME_BINDING", "process_started_ts is invalid.")
+        started = _naive_utc(started)
+        for label, value in {
+            "runtime_session_id": runtime_session_id,
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
+            "host_id": host_id,
+            "tmux_server_id": tmux_server_id,
+            "pane_id": pane_id,
+            "program": program,
+            "model": model,
+        }.items():
+            if not value.strip():
+                raise ToolExecutionError("INVALID_RUNTIME_BINDING", f"{label} must not be blank.")
+        launch_payload = _decode_continuation_receipt(phase_a_launch_receipt)
+        if (
+            launch_payload is None
+            or launch_payload.get("kind") != "fleet_launch"
+            or launch_payload.get("logical_agent_key") != logical_agent_key
+            or launch_payload.get("launch_attempt_id") != launch_attempt_id
+            or launch_payload.get("proof_mode") != proof_mode
+            or launch_payload.get("agent_id") != agent_id
+            or launch_payload.get("expected_generation") != expected_generation
+        ):
+            raise ToolExecutionError("INVALID_LAUNCH_RECEIPT", "Phase-A launch receipt does not match.")
+        request_payload = {
+            "canonical_project": normalized_project,
+            "logical_agent_key": logical_agent_key,
+            "launch_attempt_id": launch_attempt_id,
+            "phase_a_launch_receipt_digest": hashlib.sha256(
+                phase_a_launch_receipt.encode()
+            ).hexdigest(),
+            "proof_mode": proof_mode,
+            "agent_id": agent_id,
+            "runtime_session_id": runtime_session_id,
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
+            "host_id": host_id,
+            "tmux_server_id": tmux_server_id,
+            "pane_id": pane_id,
+            "program": program,
+            "model": model,
+            "task_description": task_description,
+            "process_started_ts": _iso(started),
+            "expected_generation": expected_generation,
+            "agent_recovery_authority_digest": hashlib.sha256(
+                agent_recovery_authority.encode()
+            ).hexdigest(),
+            "continuation_receipt_digest": (
+                hashlib.sha256(continuation_receipt.encode()).hexdigest()
+                if continuation_receipt
+                else None
+            ),
+            "takeover_reason": takeover_reason,
+            "supervisor_sequence": supervisor_sequence,
+        }
+        now = _naive_utc()
+
+        async def mutate(session: Any) -> MutationReceipt:
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(Any, Project.human_key) == normalized_project
+                    )
+                )
+            ).scalar_one_or_none()
+            if project is None or project.id is None:
+                raise ToolExecutionError("PROJECT_MISMATCH", "Phase-A project no longer exists.")
+            if launch_payload.get("project_id") != project.id:
+                raise ToolExecutionError("PROJECT_MISMATCH", "Launch receipt project does not match.")
+            assignment = (
+                await session.execute(
+                    select(LogicalAgentPrincipal).where(
+                        cast(Any, LogicalAgentPrincipal.project_id) == project.id,
+                        cast(Any, LogicalAgentPrincipal.logical_agent_key)
+                        == logical_agent_key,
+                        cast(Any, LogicalAgentPrincipal.agent_id) == agent_id,
+                        cast(Any, LogicalAgentPrincipal.retired_ts).is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            agent = await session.get(Agent, agent_id)
+            launch_state = await session.get(
+                FleetLaunchState,
+                (project.id, logical_agent_key),
+            )
+            if (
+                assignment is None
+                or agent is None
+                or launch_state is None
+                or launch_state.launch_attempt_id != launch_attempt_id
+                or launch_state.proof_mode != proof_mode
+                or launch_state.staged_window_identity_id
+                != launch_payload.get("staged_window_identity_id")
+            ):
+                raise ToolExecutionError("LAUNCH_STATE_MISMATCH", "Staged launch state does not match.")
+            if (
+                not agent.registration_token
+                or not hmac.compare_digest(
+                    agent.registration_token,
+                    agent_recovery_authority,
+                )
+            ):
+                raise ToolExecutionError(
+                    "AGENT_RECOVERY_AUTHENTICATION_REQUIRED",
+                    "Runtime activation requires agent recovery authority.",
+                )
+            if supervisor_sequence <= launch_state.supervisor_sequence:
+                raise ToolExecutionError(
+                    "STALE_SUPERVISOR_SEQUENCE",
+                    "Activation sequence must advance the launch projection.",
+                )
+            staged_identity = await session.get(
+                WindowIdentity,
+                launch_state.staged_window_identity_id,
+            )
+            if (
+                staged_identity is None
+                or _locator_digest(staged_identity.window_uuid)
+                != launch_state.staged_locator_digest
+            ):
+                raise ToolExecutionError("AUTHORITY_MISMATCH", "Staged locator no longer matches.")
+            marker = await session.get(
+                ActivePrincipalAuthority,
+                (project.id, agent_id),
+            )
+            if marker is None:
+                raise ToolExecutionError("AUTHORITY_MISSING", "Principal authority is missing.")
+            active = (
+                await session.execute(
+                    select(RuntimeBinding)
+                    .where(
+                        cast(Any, RuntimeBinding.project_id) == project.id,
+                        cast(Any, RuntimeBinding.agent_id) == agent_id,
+                        cast(Any, RuntimeBinding.state) != "ended",
+                    )
+                    .order_by(cast(Any, RuntimeBinding.generation).desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if expected_generation == 0:
+                if active is not None or proof_mode != "create":
+                    raise ToolExecutionError("STALE_GENERATION", "Generation 0 requires create.")
+                generation = 1
+            else:
+                if active is None or active.generation != expected_generation:
+                    raise ToolExecutionError(
+                        "STALE_GENERATION",
+                        "Active runtime generation changed before activation.",
+                    )
+                if proof_mode == "resume_same_authority":
+                    if marker.window_identity_id != staged_identity.id:
+                        raise ToolExecutionError(
+                            "AUTHORITY_MISMATCH",
+                            "Same-authority resume locator changed.",
+                        )
+                elif proof_mode == "continue_with_receipt":
+                    payload = (
+                        _decode_continuation_receipt(continuation_receipt)
+                        if continuation_receipt
+                        else None
+                    )
+                    receipt = (
+                        await session.get(
+                            ContinuationReceipt,
+                            str(payload.get("nonce", "")),
+                        )
+                        if payload is not None
+                        else None
+                    )
+                    if (
+                        receipt is None
+                        or receipt.reserved_launch_attempt_id != launch_attempt_id
+                        or receipt.target_locator_digest
+                        != launch_state.staged_locator_digest
+                        or receipt.consumed_ts is not None
+                        or receipt.expires_ts <= now
+                    ):
+                        raise ToolExecutionError(
+                            "CONTINUATION_REPLAYED_OR_EXPIRED",
+                            "Reserved continuation proof is no longer valid.",
+                        )
+                    receipt.consumed_ts = now
+                    session.add(receipt)
+                    await _activate_window_identity_marker(
+                        session,
+                        project_id=project.id,
+                        agent_id=agent_id,
+                        identity=staged_identity,
+                        allow_replace=True,
+                        now=now,
+                    )
+                elif proof_mode == "rotate_or_takeover":
+                    if not takeover_reason or not takeover_reason.strip():
+                        raise ToolExecutionError(
+                            "TAKEOVER_REASON_REQUIRED",
+                            "Takeover activation requires its explicit reason.",
+                        )
+                    await _activate_window_identity_marker(
+                        session,
+                        project_id=project.id,
+                        agent_id=agent_id,
+                        identity=staged_identity,
+                        allow_replace=True,
+                        now=now,
+                    )
+                else:
+                    raise ToolExecutionError("INVALID_PROOF_MODE", "Invalid activation proof mode.")
+                active.state = "ended"
+                active.ended_ts = now
+                session.add(active)
+                generation = expected_generation + 1
+
+            occupied = (
+                await session.execute(
+                    select(RuntimeBinding.id).where(
+                        cast(Any, RuntimeBinding.host_id) == host_id,
+                        cast(Any, RuntimeBinding.tmux_server_id) == tmux_server_id,
+                        cast(Any, RuntimeBinding.pane_id) == pane_id,
+                        cast(Any, RuntimeBinding.state) != "ended",
+                    )
+                )
+            ).first()
+            if occupied is not None:
+                raise ToolExecutionError("ROUTE_CONFLICT", "Runtime route is already occupied.")
+            current_marker = await session.get(
+                ActivePrincipalAuthority,
+                (project.id, agent_id),
+            )
+            if current_marker is None:
+                raise ToolExecutionError("AUTHORITY_MISSING", "Activated authority marker is missing.")
+            binding = RuntimeBinding(
+                project_id=project.id,
+                agent_id=agent_id,
+                authority_kind="window_identity",
+                authority_id=str(current_marker.window_identity_id),
+                runtime_session_id=runtime_session_id,
+                runtime_incarnation_id=runtime_incarnation_id,
+                pane_instance_id=pane_instance_id,
+                generation=generation,
+                host_id=host_id,
+                tmux_server_id=tmux_server_id,
+                pane_id=pane_id,
+                program=program,
+                model=model,
+                task_description=task_description,
+                process_started_ts=started,
+                state="starting",
+                last_heartbeat_ts=now,
+                created_ts=now,
+            )
+            session.add(binding)
+            await session.flush()
+            launch_state.coordination_state = "converging"
+            launch_state.identity_context_injected = False
+            launch_state.supervisor_sequence = supervisor_sequence
+            launch_state.expected_generation = generation
+            launch_state.observed_ts = now
+            session.add(launch_state)
+            await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id=f"fleet-controller/{logical_agent_key}",
+                actor_agent_id=agent_id,
+                operation_kind="fleet_runtime_activated_v1",
+                entity_type="runtime_binding",
+                entity_id=str(binding.id),
+                payload_version="fleet-runtime-v1",
+                payload={
+                    "logical_agent_key": logical_agent_key,
+                    "launch_attempt_id": launch_attempt_id,
+                    "proof_mode": proof_mode,
+                    "generation": generation,
+                    "runtime_session_id": runtime_session_id,
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
+                },
+            )
+            return MutationReceipt(
+                response={
+                    "project_id": project.id,
+                    "logical_agent_key": logical_agent_key,
+                    "agent_id": agent_id,
+                    "agent_name": agent.name,
+                    "runtime_binding_id": binding.id,
+                    "runtime_session_id": runtime_session_id,
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
+                    "generation": generation,
+                    "overall": "route_missing",
+                },
+                entity_type="runtime_binding",
+                entity_id=str(binding.id),
+                project_id=project.id,
+            )
+
+        async with get_immediate_session() as session:
+            result = await run_idempotent_mutation(
+                session,
+                scope_kind="fleet_logical_agent",
+                scope_id=f"{project_hash}:{logical_agent_key}",
+                operation_kind="activate_fleet_runtime_v1",
+                idempotency_key=idempotency_key,
+                request_payload=request_payload,
+                expires_ts=now + timedelta(hours=24),
+                mutate=mutate,
+                now=now,
+            )
+            await session.commit()
+        response = dict(result.response)
+        response["replayed"] = result.replayed
+        return response
+
+    @mcp.tool(name="publish_fleet_runtime_observation")
+    @_instrument_tool(
+        "publish_fleet_runtime_observation",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write", "controller", "presence"},
+        project_arg="project_key",
+    )
+    async def publish_fleet_runtime_observation(
+        ctx: Context,
+        project_key: str,
+        logical_agent_key: str,
+        runtime_binding_id: int,
+        runtime_generation: int,
+        observation_sequence: int,
+        supervisor_sequence: int,
+        observer_id: str,
+        pane_live: bool,
+        route_readback_verified: bool,
+        prompt_state: str,
+        provider_state: str,
+        identity_context_injected: bool,
+        coordination_state: str,
+        owner_token: str,
+        observed_ts: Optional[str] = None,
+        last_provider_activity_ts: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Publish fenced supervisor facts and perform the final ready transition."""
+        del ctx, format
+        _require_owner(settings, owner_token)
+        _validate_logical_agent_key(logical_agent_key)
+        if coordination_state not in {
+            "pending",
+            "converging",
+            "ready",
+            "degraded",
+            "failed",
+        }:
+            raise ToolExecutionError("INVALID_COORDINATION_STATE", "Unsupported coordination state.")
+        observed = _parse_iso(observed_ts) if observed_ts else _naive_utc()
+        provider_activity = (
+            _parse_iso(last_provider_activity_ts)
+            if last_provider_activity_ts
+            else None
+        )
+        if observed is None or (last_provider_activity_ts and provider_activity is None):
+            raise ToolExecutionError("INVALID_OBSERVATION", "Observation timestamps must be ISO-8601.")
+        observed = _naive_utc(observed)
+        provider_activity = (
+            _naive_utc(provider_activity)
+            if provider_activity is not None
+            else None
+        )
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ValueError("Project must be persisted before observation.")
+        async with get_immediate_session() as session:
+            launch_state = await session.get(
+                FleetLaunchState,
+                (project.id, logical_agent_key),
+            )
+            binding = await session.get(RuntimeBinding, runtime_binding_id)
+            if (
+                launch_state is None
+                or binding is None
+                or binding.project_id != project.id
+                or binding.agent_id != launch_state.agent_id
+                or binding.generation != runtime_generation
+                or binding.state == "ended"
+            ):
+                raise ToolExecutionError(
+                    "STALE_GENERATION",
+                    "Observation does not match the active projected runtime.",
+                )
+            if supervisor_sequence <= launch_state.supervisor_sequence:
+                raise ToolExecutionError(
+                    "STALE_SUPERVISOR_SEQUENCE",
+                    "Supervisor sequence must increase.",
+                )
+            observation = await session.get(RuntimeObservation, runtime_binding_id)
+            if (
+                observation is not None
+                and observation_sequence <= observation.observation_sequence
+            ):
+                raise ToolExecutionError(
+                    "STALE_OBSERVATION_SEQUENCE",
+                    "Observation sequence must increase.",
+                )
+            if coordination_state == "ready" and not (
+                pane_live
+                and route_readback_verified
+                and identity_context_injected
+                and provider_state in {"healthy", "idle", "busy", "ready"}
+            ):
+                raise ToolExecutionError(
+                    "READINESS_PRECONDITION_FAILED",
+                    "Ready requires live pane, exact route readback, provider health, and identity context.",
+                )
+            if observation is None:
+                observation = RuntimeObservation(
+                    runtime_binding_id=runtime_binding_id,
+                    runtime_generation=runtime_generation,
+                    observer_id=observer_id,
+                )
+            observation.runtime_generation = runtime_generation
+            observation.observation_sequence = observation_sequence
+            observation.observer_id = observer_id
+            observation.pane_live = pane_live
+            observation.route_readback_verified = route_readback_verified
+            observation.prompt_state = prompt_state
+            observation.provider_state = provider_state
+            observation.last_provider_activity_ts = provider_activity
+            observation.observed_ts = observed
+            session.add(observation)
+            launch_state.coordination_state = coordination_state
+            launch_state.identity_context_injected = identity_context_injected
+            launch_state.supervisor_sequence = supervisor_sequence
+            launch_state.observed_ts = observed
+            session.add(launch_state)
+            binding.last_heartbeat_ts = observed
+            binding.state = "healthy" if coordination_state == "ready" else "starting"
+            session.add(binding)
+            await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id=f"fleet-observer/{observer_id}",
+                actor_agent_id=binding.agent_id,
+                operation_kind="fleet_runtime_observed_v1",
+                entity_type="runtime_binding",
+                entity_id=str(binding.id),
+                payload_version="fleet-observation-v1",
+                payload={
+                    "logical_agent_key": logical_agent_key,
+                    "runtime_generation": runtime_generation,
+                    "observation_sequence": observation_sequence,
+                    "supervisor_sequence": supervisor_sequence,
+                    "coordination_state": coordination_state,
+                    "identity_context_injected": identity_context_injected,
+                },
+            )
+            await session.commit()
+        return {
+            "project_id": project.id,
+            "logical_agent_key": logical_agent_key,
+            "runtime_binding_id": runtime_binding_id,
+            "generation": runtime_generation,
+            "coordination_state": coordination_state,
+            "identity_context_injected": identity_context_injected,
+            "overall": "live" if coordination_state == "ready" else coordination_state,
+        }
+
+    @mcp.tool(name="publish_fleet_launch_state")
+    @_instrument_tool(
+        "publish_fleet_launch_state",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write", "controller"},
+        project_arg="project_key",
+    )
+    async def publish_fleet_launch_state(
+        ctx: Context,
+        project_key: str,
+        logical_agent_key: str,
+        desired_state: str,
+        coordination_state: str,
+        supervisor_sequence: int,
+        owner_token: str,
+        launch_attempt_id: Optional[str] = None,
+        identity_context_injected: bool = False,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Project a desired/terminal launch transition, including pre-principal failure."""
+        del ctx, format
+        _require_owner(settings, owner_token)
+        _validate_logical_agent_key(logical_agent_key)
+        if desired_state not in {"running", "held", "ended"}:
+            raise ToolExecutionError("INVALID_DESIRED_STATE", "Unsupported desired state.")
+        if coordination_state not in {
+            "pending",
+            "converging",
+            "ready",
+            "degraded",
+            "failed",
+        }:
+            raise ToolExecutionError("INVALID_COORDINATION_STATE", "Unsupported coordination state.")
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ValueError("Project must be persisted before launch-state publication.")
+        now = _naive_utc()
+        async with get_immediate_session() as session:
+            launch_state = await session.get(
+                FleetLaunchState,
+                (project.id, logical_agent_key),
+            )
+            if launch_state is not None and supervisor_sequence <= launch_state.supervisor_sequence:
+                raise ToolExecutionError(
+                    "STALE_SUPERVISOR_SEQUENCE",
+                    "Supervisor sequence must increase.",
+                )
+            if launch_state is None:
+                launch_state = FleetLaunchState(
+                    project_id=project.id,
+                    logical_agent_key=logical_agent_key,
+                )
+            launch_state.desired_state = desired_state
+            launch_state.coordination_state = coordination_state
+            launch_state.supervisor_sequence = supervisor_sequence
+            launch_state.launch_attempt_id = launch_attempt_id
+            launch_state.identity_context_injected = identity_context_injected
+            launch_state.observed_ts = now
+            session.add(launch_state)
+            await session.commit()
+        return {
+            "project_id": project.id,
+            "logical_agent_key": logical_agent_key,
+            "desired_state": desired_state,
+            "coordination_state": coordination_state,
+            "supervisor_sequence": supervisor_sequence,
+        }
+
+    async def _fleet_roster_projection(
+        project: Project,
+        *,
+        include_history: bool,
+    ) -> list[dict[str, Any]]:
+        if project.id is None:
+            return []
+        now = _naive_utc()
+        async with get_session() as session:
+            launch_rows = (
+                await session.execute(
+                    select(FleetLaunchState).where(
+                        cast(Any, FleetLaunchState.project_id) == project.id
+                    )
+                )
+            ).scalars().all()
+            assignments = (
+                await session.execute(
+                    select(LogicalAgentPrincipal).where(
+                        cast(Any, LogicalAgentPrincipal.project_id) == project.id
+                    )
+                )
+            ).scalars().all()
+            assignment_by_key = {
+                row.logical_agent_key: row
+                for row in assignments
+                if include_history or row.retired_ts is None
+            }
+            launch_by_key = {row.logical_agent_key: row for row in launch_rows}
+            logical_keys = sorted(set(assignment_by_key) | set(launch_by_key))
+            rows: list[dict[str, Any]] = []
+            for logical_key in logical_keys:
+                launch = launch_by_key.get(logical_key)
+                assignment = assignment_by_key.get(logical_key)
+                agent_id = launch.agent_id if launch and launch.agent_id else (
+                    assignment.agent_id if assignment else None
+                )
+                agent = await session.get(Agent, agent_id) if agent_id is not None else None
+                binding = None
+                observation = None
+                marker = None
+                last_message_activity_ts = None
+                if agent_id is not None:
+                    binding = (
+                        await session.execute(
+                            select(RuntimeBinding)
+                            .where(
+                                cast(Any, RuntimeBinding.project_id) == project.id,
+                                cast(Any, RuntimeBinding.agent_id) == agent_id,
+                                cast(Any, RuntimeBinding.state) != "ended",
+                            )
+                            .order_by(cast(Any, RuntimeBinding.generation).desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    marker = await session.get(
+                        ActivePrincipalAuthority,
+                        (project.id, agent_id),
+                    )
+                    if binding is not None and binding.id is not None:
+                        observation = await session.get(RuntimeObservation, binding.id)
+                    sent_activity = await session.scalar(
+                        select(func.max(Message.created_ts)).where(
+                            cast(Any, Message.project_id) == project.id,
+                            cast(Any, Message.sender_id) == agent_id,
+                        )
+                    )
+                    received_activity = await session.scalar(
+                        select(func.max(Message.created_ts))
+                        .join(
+                            MessageRecipient,
+                            cast(Any, MessageRecipient.message_id) == Message.id,
+                        )
+                        .where(
+                            cast(Any, Message.project_id) == project.id,
+                            cast(Any, MessageRecipient.agent_id) == agent_id,
+                        )
+                    )
+                    activity_candidates = [
+                        value
+                        for value in (sent_activity, received_activity)
+                        if value is not None
+                    ]
+                    if activity_candidates:
+                        last_message_activity_ts = max(activity_candidates)
+                conflict = bool(
+                    binding is not None
+                    and (
+                        marker is None
+                        or binding.authority_id != str(marker.window_identity_id)
+                    )
+                )
+                fresh = bool(
+                    observation is not None
+                    and (now - observation.observed_ts).total_seconds() <= 45
+                )
+                live = bool(
+                    launch is not None
+                    and launch.coordination_state == "ready"
+                    and launch.identity_context_injected
+                    and binding is not None
+                    and binding.state == "healthy"
+                    and observation is not None
+                    and observation.pane_live
+                    and observation.route_readback_verified
+                    and fresh
+                    and marker is not None
+                )
+                if conflict:
+                    state = "conflict"
+                elif launch is not None and launch.coordination_state == "degraded":
+                    state = "coordination_degraded"
+                elif live:
+                    state = "live"
+                elif launch is not None and launch.coordination_state == "failed":
+                    state = "launch_failed"
+                elif binding is not None and observation is not None and not fresh:
+                    state = "stale"
+                elif (
+                    launch is not None
+                    and launch.desired_state == "running"
+                    and launch.coordination_state in {"pending", "converging"}
+                ):
+                    state = "starting"
+                elif (
+                    agent is not None
+                    and (
+                        launch is None
+                        or launch.desired_state == "held"
+                    )
+                ):
+                    state = "durable_only"
+                else:
+                    state = "ended"
+                if state == "ended" and not include_history:
+                    continue
+                issue_codes = {
+                    "conflict": ["AUTHORITY_ROUTE_CONFLICT"],
+                    "coordination_degraded": ["COORDINATION_DEGRADED"],
+                    "launch_failed": ["LAUNCH_FAILED"],
+                    "stale": ["OBSERVATION_STALE"],
+                }.get(state, [])
+                rows.append(
+                    {
+                        "project_id": project.id,
+                        "canonical_project": project.human_key,
+                        "logical_agent_key": logical_key,
+                        "agent_id": agent_id,
+                        "agent_name": agent.name if agent else None,
+                        "state": state,
+                        "desired_state": launch.desired_state if launch else None,
+                        "coordination_state": launch.coordination_state if launch else None,
+                        "launch_attempt_id": launch.launch_attempt_id if launch else None,
+                        "identity_context_injected": (
+                            launch.identity_context_injected if launch else False
+                        ),
+                        "runtime_binding_id": binding.id if binding else None,
+                        "runtime_session_id": binding.runtime_session_id if binding else None,
+                        "program": binding.program if binding else (
+                            launch.provider if launch else None
+                        ),
+                        "model": binding.model if binding else (
+                            launch.requested_model if launch else None
+                        ),
+                        "task_description": binding.task_description if binding else (
+                            launch.task_description if launch else None
+                        ),
+                        "runtime_incarnation_id": (
+                            binding.runtime_incarnation_id if binding else None
+                        ),
+                        "pane_instance_id": binding.pane_instance_id if binding else None,
+                        "generation": binding.generation if binding else (
+                            launch.expected_generation if launch else None
+                        ),
+                        "route": (
+                            {
+                                "host_id": binding.host_id,
+                                "tmux_server_id": binding.tmux_server_id,
+                                "pane_id": binding.pane_id,
+                            }
+                            if binding
+                            else None
+                        ),
+                        "last_heartbeat_ts": (
+                            _iso(binding.last_heartbeat_ts) if binding else None
+                        ),
+                        "last_provider_activity_ts": (
+                            _iso(observation.last_provider_activity_ts)
+                            if observation and observation.last_provider_activity_ts
+                            else None
+                        ),
+                        "last_message_activity_ts": (
+                            _iso(last_message_activity_ts)
+                            if last_message_activity_ts
+                            else None
+                        ),
+                        "observation_fresh": fresh,
+                        "durable_reachable": agent is not None,
+                        "live_tui_reachable": state == "live",
+                        "issue_codes": issue_codes,
+                    }
+                )
+            return rows
+
+    async def _current_roster_project() -> Project:
+        if settings.runtime_profile == "core":
+            raise ToolExecutionError(
+                "PROFILE_UNSUPPORTED",
+                "Core current-project roster resolution requires the later pane-credential adapter.",
+            )
+        window_uuid = effective_window_identity_uuid(settings)
+        if not window_uuid or not _validate_window_uuid(window_uuid):
+            raise ToolExecutionError(
+                "CURRENT_PROJECT_UNRESOLVED",
+                "Authenticated pane authority did not resolve a current project.",
+            )
+        now = _naive_utc()
+        async with get_session() as session:
+            projects = (
+                await session.execute(
+                    select(Project)
+                    .join(
+                        WindowIdentity,
+                        cast(Any, WindowIdentity.project_id) == Project.id,
+                    )
+                    .join(
+                        ActivePrincipalAuthority,
+                        cast(Any, ActivePrincipalAuthority.window_identity_id)
+                        == WindowIdentity.id,
+                    )
+                    .where(
+                        func.lower(cast(Any, WindowIdentity.window_uuid))
+                        == window_uuid.lower(),
+                        cast(Any, WindowIdentity.superseded_ts).is_(None),
+                        _sa_or(
+                            cast(Any, WindowIdentity.expires_ts).is_(None),
+                            cast(Any, WindowIdentity.expires_ts) > now,
+                        ),
+                    )
+                )
+            ).scalars().all()
+        if len(projects) != 1:
+            raise ToolExecutionError(
+                "CURRENT_PROJECT_UNRESOLVED",
+                "Authenticated pane authority must resolve exactly one project.",
+            )
+        return projects[0]
+
+    @mcp.tool(name="agent_roster_current")
+    @_instrument_tool(
+        "agent_roster_current",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "read"},
+        complexity="low",
+    )
+    async def agent_roster_current(
+        ctx: Context,
+        include_history: bool = False,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Read the roster for the one project implied by authenticated pane authority."""
+        del ctx, format
+        project = await _current_roster_project()
+        rows = await _fleet_roster_projection(project, include_history=include_history)
+        return {"project": _project_to_dict(project), "agents": rows}
+
+    @mcp.tool(name="agent_roster")
+    @_instrument_tool(
+        "agent_roster",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "read", "controller"},
+        project_arg="project_key",
+        complexity="low",
+    )
+    async def agent_roster(
+        ctx: Context,
+        project_key: str,
+        owner_token: str,
+        include_history: bool = False,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Read an explicit project roster with controller/operator authority."""
+        del ctx, format
+        _require_owner(settings, owner_token)
+        project = await _get_project_by_identifier(project_key)
+        rows = await _fleet_roster_projection(project, include_history=include_history)
+        return {"project": _project_to_dict(project), "agents": rows}
+
+    @mcp.resource("resource://roster/current", mime_type="application/json")
+    async def roster_current_resource() -> dict[str, Any]:
+        """Read the canonical current-project fleet roster."""
+        project = await _current_roster_project()
+        rows = await _fleet_roster_projection(project, include_history=False)
+        return {"project": _project_to_dict(project), "agents": rows}
+
     @mcp.tool(name="reconcile_runtime_binding")
     @_instrument_tool(
         "reconcile_runtime_binding",
@@ -9551,12 +11047,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         registration_token: str,
         owner_token: str,
         runtime_session_id: str,
-        pane_incarnation_id: str,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
         host_id: str,
         tmux_server_id: str,
         pane_id: str,
         program: str,
         model: str,
+        task_description: str,
         process_started_ts: str,
         expected_generation: int = 0,
         format: Optional[str] = None,
@@ -9565,7 +11063,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         _require_owner(settings, owner_token)
         for label, value in {
             "runtime_session_id": runtime_session_id,
-            "pane_incarnation_id": pane_incarnation_id,
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
             "host_id": host_id,
             "tmux_server_id": tmux_server_id,
             "pane_id": pane_id,
@@ -9624,7 +11123,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             else:
                 same_incarnation = (
                     active.runtime_session_id == runtime_session_id
-                    and active.pane_incarnation_id == pane_incarnation_id
+                    and active.runtime_incarnation_id == runtime_incarnation_id
+                    and active.pane_instance_id == pane_instance_id
                 )
                 if not same_incarnation:
                     raise ToolExecutionError(
@@ -9690,13 +11190,15 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 authority_kind=authority[0],
                 authority_id=authority[1],
                 runtime_session_id=runtime_session_id,
-                pane_incarnation_id=pane_incarnation_id,
+                runtime_incarnation_id=runtime_incarnation_id,
+                pane_instance_id=pane_instance_id,
                 generation=generation,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
                 pane_id=pane_id,
                 program=program,
                 model=model,
+                task_description=task_description,
                 process_started_ts=started,
                 state="healthy",
                 last_heartbeat_ts=now,
@@ -9719,13 +11221,15 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "authority_kind": authority[0],
                     "authority_id": authority[1],
                     "runtime_session_id": runtime_session_id,
-                    "pane_incarnation_id": pane_incarnation_id,
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
                     "generation": generation,
                     "host_id": host_id,
                     "tmux_server_id": tmux_server_id,
                     "pane_id": pane_id,
                     "program": program,
                     "model": model,
+                    "task_description": task_description,
                 },
             )
             await session.commit()
@@ -9793,7 +11297,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "authority_kind": authority[0],
             "authority_id": authority[1],
             "runtime_session_id": binding.runtime_session_id,
-            "pane_incarnation_id": binding.pane_incarnation_id,
+            "runtime_incarnation_id": binding.runtime_incarnation_id,
+            "pane_instance_id": binding.pane_instance_id,
             "prior_generation": binding.generation,
             "carrier_digest": carrier_digest,
             "expires_ts": _iso(expires),
@@ -9809,7 +11314,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     authority_kind=authority[0],
                     authority_id=authority[1],
                     runtime_session_id=binding.runtime_session_id,
-                    pane_incarnation_id=binding.pane_incarnation_id,
+                    runtime_incarnation_id=binding.runtime_incarnation_id,
+                    pane_instance_id=binding.pane_instance_id,
                     prior_generation=binding.generation,
                     carrier_digest=carrier_digest,
                     created_ts=now,
@@ -9837,8 +11343,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         host_id: str,
         tmux_server_id: str,
         pane_id: str,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
         program: str,
         model: str,
+        task_description: str,
         process_started_ts: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -9898,7 +11407,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 active is None
                 or active.generation != receipt.prior_generation
                 or active.runtime_session_id != receipt.runtime_session_id
-                or active.pane_incarnation_id != receipt.pane_incarnation_id
+                or active.runtime_incarnation_id != receipt.runtime_incarnation_id
+                or active.pane_instance_id != receipt.pane_instance_id
             ):
                 raise ToolExecutionError(
                     "STALE_GENERATION",
@@ -9929,13 +11439,15 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 authority_kind=receipt.authority_kind,
                 authority_id=receipt.authority_id,
                 runtime_session_id=receipt.runtime_session_id,
-                pane_incarnation_id=receipt.pane_incarnation_id,
+                runtime_incarnation_id=runtime_incarnation_id,
+                pane_instance_id=pane_instance_id,
                 generation=receipt.prior_generation + 1,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
                 pane_id=pane_id,
                 program=program,
                 model=model,
+                task_description=task_description,
                 process_started_ts=started,
                 state="healthy",
                 last_heartbeat_ts=now,
@@ -9956,12 +11468,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 payload={
                     "generation": continued.generation,
                     "runtime_session_id": continued.runtime_session_id,
-                    "pane_incarnation_id": continued.pane_incarnation_id,
+                    "runtime_incarnation_id": continued.runtime_incarnation_id,
+                    "pane_instance_id": continued.pane_instance_id,
                     "host_id": host_id,
                     "tmux_server_id": tmux_server_id,
                     "pane_id": pane_id,
                     "program": program,
                     "model": model,
+                    "task_description": task_description,
                 },
             )
             await session.commit()
@@ -9969,7 +11483,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "project_id": project.id,
             "agent_id": agent.id,
             "runtime_session_id": continued.runtime_session_id,
-            "pane_incarnation_id": continued.pane_incarnation_id,
+            "runtime_incarnation_id": continued.runtime_incarnation_id,
+            "pane_instance_id": continued.pane_instance_id,
             "generation": continued.generation,
             "overall": "route_missing",
         }
@@ -9991,12 +11506,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         expected_generation: int,
         new_window_uuid: str,
         runtime_session_id: str,
-        pane_incarnation_id: str,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
         host_id: str,
         tmux_server_id: str,
         pane_id: str,
         program: str,
         model: str,
+        task_description: str,
         process_started_ts: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -10072,10 +11589,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             ).first()
             if occupied is not None:
                 raise ToolExecutionError("ROUTE_CONFLICT", "New occupant route is already owned.")
-            old_identity.expires_ts = now
             active.state = "ended"
             active.ended_ts = now
-            session.add(old_identity)
             session.add(active)
             new_identity = WindowIdentity(
                 project_id=project.id,
@@ -10089,19 +11604,29 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             session.add(new_identity)
             await session.flush()
+            await _activate_window_identity_marker(
+                session,
+                project_id=project.id,
+                agent_id=agent.id,
+                identity=new_identity,
+                allow_replace=True,
+                now=now,
+            )
             rotated = RuntimeBinding(
                 project_id=project.id,
                 agent_id=agent.id,
                 authority_kind="window_identity",
                 authority_id=str(new_identity.id),
                 runtime_session_id=runtime_session_id,
-                pane_incarnation_id=pane_incarnation_id,
+                runtime_incarnation_id=runtime_incarnation_id,
+                pane_instance_id=pane_instance_id,
                 generation=expected_generation + 1,
                 host_id=host_id,
                 tmux_server_id=tmux_server_id,
                 pane_id=pane_id,
                 program=program,
                 model=model,
+                task_description=task_description,
                 process_started_ts=started,
                 state="healthy",
                 last_heartbeat_ts=now,
@@ -10124,12 +11649,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "new_authority_id": str(new_identity.id),
                     "generation": rotated.generation,
                     "runtime_session_id": runtime_session_id,
-                    "pane_incarnation_id": pane_incarnation_id,
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
                     "host_id": host_id,
                     "tmux_server_id": tmux_server_id,
                     "pane_id": pane_id,
                     "program": program,
                     "model": model,
+                    "task_description": task_description,
                 },
             )
             await session.commit()
@@ -10138,7 +11665,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "agent_id": agent.id,
             "authority_id": new_identity.id,
             "runtime_session_id": runtime_session_id,
-            "pane_incarnation_id": pane_incarnation_id,
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
             "generation": rotated.generation,
             "overall": "route_missing",
         }
@@ -10238,7 +11766,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_key: str,
         agent_name: str,
         runtime_session_id: str,
-        pane_incarnation_id: str,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
         generation: int,
         registration_token: Optional[str] = None,
         observed_state: str = "healthy",
@@ -10269,7 +11798,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         cast(Any, RuntimeBinding.authority_kind) == authority[0],
                         cast(Any, RuntimeBinding.authority_id) == authority[1],
                         cast(Any, RuntimeBinding.runtime_session_id) == runtime_session_id,
-                        cast(Any, RuntimeBinding.pane_incarnation_id) == pane_incarnation_id,
+                        cast(Any, RuntimeBinding.runtime_incarnation_id) == runtime_incarnation_id,
+                        cast(Any, RuntimeBinding.pane_instance_id) == pane_instance_id,
                         cast(Any, RuntimeBinding.generation) == generation,
                         cast(Any, RuntimeBinding.state) != "ended",
                     )
@@ -13470,7 +15000,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         project_key: str,
         agent_name: str,
         runtime_session_id: str,
-        pane_incarnation_id: str,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
         runtime_generation: int,
         host_id: str,
         tmux_server_id: str,
@@ -13532,7 +15063,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             cast(Any, RuntimeBinding.project_id) == project.id,
                             cast(Any, RuntimeBinding.agent_id) == agent.id,
                             cast(Any, RuntimeBinding.runtime_session_id) == runtime_session_id,
-                            cast(Any, RuntimeBinding.pane_incarnation_id) == pane_incarnation_id,
+                            cast(Any, RuntimeBinding.runtime_incarnation_id) == runtime_incarnation_id,
+                            cast(Any, RuntimeBinding.pane_instance_id) == pane_instance_id,
                             cast(Any, RuntimeBinding.generation) == runtime_generation,
                             cast(Any, RuntimeBinding.host_id) == host_id,
                             cast(Any, RuntimeBinding.tmux_server_id) == tmux_server_id,

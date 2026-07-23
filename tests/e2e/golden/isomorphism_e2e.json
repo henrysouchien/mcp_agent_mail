@@ -16,7 +16,6 @@
             "ack_required": false,
             "attachments": [],
             "bcc": [],
-            "body_md": "approved path",
             "cc": [],
             "created_ts": "2025-01-01T00:03:26+00:00",
             "from": "BlueLake",
@@ -26,8 +25,7 @@
             "id": 6,
             "importance": "normal",
             "project_id": 2,
-            "reply_to": null,
-            "sender_id": 1,
+            "retry_safety": "unsafe_legacy",
             "subject": "Cross Project",
             "thread_id": null,
             "to": [
@@ -59,7 +57,6 @@
         "ack_required": true,
         "attachments": [],
         "bcc": [],
-        "body_md": "deny-case",
         "cc": [],
         "created_ts": "2025-01-01T00:16:11+00:00",
         "from": "BlueLake",
@@ -69,8 +66,7 @@
         "id": 5,
         "importance": "normal",
         "project_id": 2,
-        "reply_to": null,
-        "sender_id": 1,
+        "retry_safety": "unsafe_legacy",
         "subject": "Contact request from BlueLake",
         "thread_id": null,
         "to": [
@@ -112,7 +108,6 @@
         "ack_required": true,
         "attachments": [],
         "bcc": [],
-        "body_md": "e2e",
         "cc": [],
         "created_ts": "2025-01-01T00:16:12+00:00",
         "from": "BlueLake",
@@ -122,8 +117,7 @@
         "id": 4,
         "importance": "normal",
         "project_id": 2,
-        "reply_to": null,
-        "sender_id": 1,
+        "retry_safety": "unsafe_legacy",
         "subject": "Contact request from BlueLake",
         "thread_id": null,
         "to": [
@@ -161,6 +155,7 @@
           "reused": false
         }
       ],
+      "retry_safety": "unsafe_legacy",
       "warnings": [
         "enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via `install_precommit_guard` for the authoritative reservation gate."
       ]
@@ -177,6 +172,7 @@
           "reused": false
         }
       ],
+      "retry_safety": "unsafe_legacy",
       "warnings": [
         "enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via `install_precommit_guard` for the authoritative reservation gate."
       ]
@@ -193,6 +189,7 @@
           "reused": true
         }
       ],
+      "retry_safety": "unsafe_legacy",
       "warnings": [
         "enforcement_off_for_code_paths: 1 of 1 reserved paths are code-repo paths; server-side exclusivity is advisory only. Install the pre-commit guard via `install_precommit_guard` for the authoritative reservation gate."
       ]
@@ -266,6 +263,7 @@
         "worktree_name": null
       },
       "identity_mode_used": "dir",
+      "namespace_kind": "workspace",
       "normalized_remote": null,
       "project_uid": "a164c0c98d6a913b0814",
       "repo_root": null,
@@ -295,6 +293,7 @@
         "worktree_name": null
       },
       "identity_mode_used": "dir",
+      "namespace_kind": "workspace",
       "normalized_remote": null,
       "project_uid": "a78ae1d5150177e0bb6f",
       "repo_root": null,
@@ -351,6 +350,7 @@
       "created_at": "2025-01-01T00:00:01+00:00",
       "human_key": "/alpha",
       "id": 1,
+      "namespace_kind": "workspace",
       "slug": "alpha"
     },
     "project_resource_beta": {
@@ -392,6 +392,7 @@
       "created_at": "2025-01-01T00:00:02+00:00",
       "human_key": "/beta",
       "id": 2,
+      "namespace_kind": "workspace",
       "slug": "beta"
     },
     "whois": {
@@ -421,7 +422,7 @@
             "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
             "height": 4,
             "media_type": "image/webp",
-            "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+            "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
             "type": "inline",
             "width": 4
           },
@@ -430,7 +431,7 @@
             "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
             "height": 128,
             "media_type": "image/webp",
-            "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+            "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
             "type": "inline",
             "width": 128
           }
@@ -442,6 +443,8 @@
         "importance": "normal",
         "kind": "to",
         "project_id": 1,
+        "recipient_obligation_id": "<recipient_obligation_id>",
+        "recipient_provenance": "explicit_to",
         "reply_to": null,
         "sender_id": 1,
         "subject": "Launch Plan",
@@ -458,6 +461,8 @@
         "importance": "normal",
         "kind": "to",
         "project_id": 1,
+        "recipient_obligation_id": "<recipient_obligation_id>",
+        "recipient_provenance": "explicit_to",
         "reply_to": null,
         "sender_id": 1,
         "subject": "Follow Up",
@@ -482,7 +487,7 @@
               "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
               "height": 4,
               "media_type": "image/webp",
-              "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+              "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
               "type": "inline",
               "width": 4
             },
@@ -491,7 +496,7 @@
               "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
               "height": 128,
               "media_type": "image/webp",
-              "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+              "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
               "type": "inline",
               "width": 128
             }
@@ -502,6 +507,8 @@
           "importance": "normal",
           "kind": "to",
           "project_id": 1,
+          "recipient_obligation_id": "<recipient_obligation_id>",
+          "recipient_provenance": "explicit_to",
           "reply_to": null,
           "sender_id": 1,
           "subject": "Launch Plan",
@@ -517,6 +524,8 @@
           "importance": "normal",
           "kind": "to",
           "project_id": 1,
+          "recipient_obligation_id": "<recipient_obligation_id>",
+          "recipient_provenance": "explicit_to",
           "reply_to": null,
           "sender_id": 1,
           "subject": "Follow Up",
@@ -542,7 +551,7 @@
               "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
               "height": 4,
               "media_type": "image/webp",
-              "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+              "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
               "type": "inline",
               "width": 4
             },
@@ -551,7 +560,7 @@
               "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
               "height": 128,
               "media_type": "image/webp",
-              "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+              "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
               "type": "inline",
               "width": 128
             }
@@ -642,7 +651,7 @@
           "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
           "height": 4,
           "media_type": "image/webp",
-          "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+          "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
           "type": "inline",
           "width": 4
         },
@@ -651,7 +660,7 @@
           "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
           "height": 128,
           "media_type": "image/webp",
-          "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+          "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
           "type": "inline",
           "width": 128
         }
@@ -681,6 +690,8 @@
         "importance": "normal",
         "kind": "to",
         "project_id": 2,
+        "recipient_obligation_id": "<recipient_obligation_id>",
+        "recipient_provenance": "explicit_to",
         "reply_to": null,
         "sender_id": 5,
         "subject": "Beta Hello",
@@ -842,13 +853,13 @@
       }
     },
     "preview_status": {
-      "files_indexed": 23,
-      "last_modified_iso": "2024-08-30T06:40:21+00:00",
-      "last_modified_ns": 1725000021000000000,
+      "files_indexed": 24,
+      "last_modified_iso": "2024-08-30T06:40:22+00:00",
+      "last_modified_ns": 1725000022000000000,
       "manifest_iso": "2024-08-30T06:40:06+00:00",
       "manifest_ns": 1725000006000000000,
       "manual_token": 0,
-      "signature": "787c4295ff40a968ae55b7b0ab2bf1085ec07e296b24347741612fbe1a8b74e6"
+      "signature": "7d0209d19c4238ef9820a8b481727d751356ce6734f062a1dc4ec8c5421cb704"
     },
     "scrub_summary": {
       "ack_flags_cleared": 6,

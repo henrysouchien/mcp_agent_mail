@@ -36,6 +36,7 @@ from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
 
+from . import models as _models  # noqa: F401  # Register all SQLModel tables.
 from .config import DatabaseSettings, Settings, clear_settings_cache, get_settings
 
 T = TypeVar("T")
@@ -941,6 +942,15 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE projects ADD COLUMN namespace_kind VARCHAR(32) DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE window_identities ADD COLUMN agent_id INTEGER DEFAULT NULL REFERENCES agents(id)",
+        "ALTER TABLE window_identities ADD COLUMN superseded_ts DATETIME DEFAULT NULL",
+        "ALTER TABLE runtime_bindings RENAME COLUMN pane_incarnation_id TO pane_instance_id",
+        "ALTER TABLE runtime_bindings ADD COLUMN runtime_incarnation_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE runtime_bindings ADD COLUMN task_description VARCHAR(2048) NOT NULL DEFAULT ''",
+        "ALTER TABLE continuation_receipts RENAME COLUMN pane_incarnation_id TO pane_instance_id",
+        "ALTER TABLE continuation_receipts ADD COLUMN runtime_incarnation_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE continuation_receipts ADD COLUMN target_locator_digest VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE continuation_receipts ADD COLUMN reserved_launch_attempt_id VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE continuation_receipts ADD COLUMN reserved_ts DATETIME DEFAULT NULL",
         "ALTER TABLE message_recipients ADD COLUMN provenance VARCHAR(32) DEFAULT NULL",
         "ALTER TABLE message_recipients ADD COLUMN obligation_id VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
@@ -952,12 +962,30 @@ def _setup_fts(connection: Any) -> None:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
 
+    # The prior schema conflated pane and process incarnations. Preserve its
+    # best available value during the one-way full cutover; subsequent writes
+    # must provide distinct identifiers.
+    with suppress(Exception):
+        connection.exec_driver_sql(
+            "UPDATE runtime_bindings SET runtime_incarnation_id = pane_instance_id "
+            "WHERE runtime_incarnation_id = ''"
+        )
+    with suppress(Exception):
+        connection.exec_driver_sql(
+            "UPDATE continuation_receipts SET runtime_incarnation_id = pane_instance_id "
+            "WHERE runtime_incarnation_id = ''"
+        )
+
     # Index migrations for newly added columns.
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS ix_projects_namespace_kind ON projects (namespace_kind)",
         "CREATE INDEX IF NOT EXISTS ix_window_identities_agent_id ON window_identities (agent_id)",
+        "CREATE INDEX IF NOT EXISTS ix_window_identities_superseded_ts "
+        "ON window_identities (superseded_ts)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_logical_agent_principals_active_agent "
+        "ON logical_agent_principals (project_id, agent_id) WHERE retired_ts IS NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_bindings_active_authority "
         "ON runtime_bindings (authority_kind, authority_id) WHERE state != 'ended'",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_runtime_bindings_active_route "
@@ -970,6 +998,76 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
     ]:
         connection.exec_driver_sql(index_sql)
+
+    _backfill_active_principal_authorities(connection)
+
+
+def _backfill_active_principal_authorities(connection: Any) -> None:
+    """Select one enforceable current database authority for legacy principals.
+
+    Future-expiring rows are current candidates. Multiple candidates are
+    migrated only when exactly one is referenced by the principal's active
+    runtime binding; otherwise startup fails closed for operator resolution.
+    """
+    candidates = connection.exec_driver_sql(
+        """
+        SELECT project_id, agent_id, GROUP_CONCAT(id) AS identity_ids, COUNT(*) AS candidate_count
+        FROM window_identities
+        WHERE agent_id IS NOT NULL
+          AND superseded_ts IS NULL
+          AND (expires_ts IS NULL OR expires_ts > CURRENT_TIMESTAMP)
+        GROUP BY project_id, agent_id
+        """
+    ).mappings().all()
+    for row in candidates:
+        project_id = int(row["project_id"])
+        agent_id = int(row["agent_id"])
+        existing = connection.exec_driver_sql(
+            """
+            SELECT window_identity_id
+            FROM active_principal_authorities
+            WHERE project_id = ? AND agent_id = ?
+            """,
+            (project_id, agent_id),
+        ).first()
+        if existing is not None:
+            continue
+        identity_ids = [
+            int(value)
+            for value in str(row["identity_ids"] or "").split(",")
+            if value
+        ]
+        selected_id: int | None = identity_ids[0] if len(identity_ids) == 1 else None
+        if selected_id is None:
+            placeholders = ",".join("?" for _ in identity_ids)
+            active_rows = connection.exec_driver_sql(
+                f"""
+                SELECT DISTINCT CAST(authority_id AS INTEGER) AS authority_id
+                FROM runtime_bindings
+                WHERE project_id = ?
+                  AND agent_id = ?
+                  AND authority_kind = 'window_identity'
+                  AND state != 'ended'
+                  AND CAST(authority_id AS INTEGER) IN ({placeholders})
+                """,
+                (project_id, agent_id, *identity_ids),
+            ).all()
+            active_ids = {int(value[0]) for value in active_rows}
+            if len(active_ids) == 1:
+                selected_id = active_ids.pop()
+        if selected_id is None:
+            raise RuntimeError(
+                "Ambiguous active window authorities require operator resolution "
+                f"for project_id={project_id}, agent_id={agent_id}."
+            )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO active_principal_authorities
+                (project_id, agent_id, window_identity_id, authority_generation, activated_ts)
+            VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+            """,
+            (project_id, agent_id, selected_id),
+        )
 
 
 def get_database_path(settings: Settings | None = None) -> Path | None:

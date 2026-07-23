@@ -186,6 +186,76 @@ class WindowIdentity(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     last_active_ts: datetime = Field(default_factory=_utcnow_naive)
     expires_ts: Optional[datetime] = Field(default=None)
+    superseded_ts: Optional[datetime] = Field(default=None, index=True)
+
+
+class LogicalAgentPrincipal(SQLModel, table=True):
+    """Durable supervisor logical-agent assignment to one Agent Mail principal."""
+
+    __tablename__ = "logical_agent_principals"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "logical_agent_key",
+            name="uq_logical_agent_principal_project_key",
+        ),
+        Index(
+            "idx_logical_agent_principal_project_agent",
+            "project_id",
+            "agent_id",
+            "retired_ts",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    logical_agent_key: str = Field(max_length=64, index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    assignment_generation: int = Field(default=1, ge=1)
+    assigned_ts: datetime = Field(default_factory=_utcnow_naive)
+    retired_ts: Optional[datetime] = Field(default=None)
+
+
+class ActivePrincipalAuthority(SQLModel, table=True):
+    """Database-enforceable selector for one principal's current window authority."""
+
+    __tablename__ = "active_principal_authorities"
+
+    project_id: int = Field(foreign_key="projects.id", primary_key=True)
+    agent_id: int = Field(foreign_key="agents.id", primary_key=True)
+    window_identity_id: int = Field(
+        foreign_key="window_identities.id",
+        unique=True,
+        index=True,
+    )
+    authority_generation: int = Field(default=1, ge=1)
+    activated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class FleetLaunchState(SQLModel, table=True):
+    """Sequence-fenced desired and coordination projection for the fleet roster."""
+
+    __tablename__ = "fleet_launch_states"
+
+    project_id: int = Field(foreign_key="projects.id", primary_key=True)
+    logical_agent_key: str = Field(primary_key=True, max_length=64)
+    agent_id: Optional[int] = Field(default=None, foreign_key="agents.id", index=True)
+    desired_state: str = Field(default="running", max_length=16)
+    launch_attempt_id: Optional[str] = Field(default=None, max_length=64, index=True)
+    proof_mode: Optional[str] = Field(default=None, max_length=32)
+    coordination_state: str = Field(default="pending", max_length=16)
+    identity_context_injected: bool = Field(default=False)
+    supervisor_sequence: int = Field(default=0, ge=0)
+    expected_generation: int = Field(default=0, ge=0)
+    staged_window_identity_id: Optional[int] = Field(
+        default=None,
+        foreign_key="window_identities.id",
+    )
+    staged_locator_digest: Optional[str] = Field(default=None, max_length=64)
+    provider: Optional[str] = Field(default=None, max_length=128)
+    requested_model: Optional[str] = Field(default=None, max_length=128)
+    task_description: str = Field(default="", max_length=2048)
+    observed_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
 class RuntimeBinding(SQLModel, table=True):
@@ -215,18 +285,40 @@ class RuntimeBinding(SQLModel, table=True):
     authority_kind: str = Field(max_length=32)
     authority_id: str = Field(max_length=64, index=True)
     runtime_session_id: str = Field(max_length=128, index=True)
-    pane_incarnation_id: str = Field(max_length=128, index=True)
+    runtime_incarnation_id: str = Field(max_length=128, index=True)
+    pane_instance_id: str = Field(max_length=128, index=True)
     generation: int = Field(default=1, ge=1)
     host_id: str = Field(max_length=255)
     tmux_server_id: str = Field(max_length=255)
     pane_id: str = Field(max_length=64)
     program: str = Field(max_length=128)
     model: str = Field(max_length=128)
+    task_description: str = Field(default="", max_length=2048)
     process_started_ts: datetime
     state: str = Field(default="starting", max_length=32)
     last_heartbeat_ts: datetime = Field(default_factory=_utcnow_naive)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     ended_ts: Optional[datetime] = Field(default=None)
+
+
+class RuntimeObservation(SQLModel, table=True):
+    """Latest sequence-fenced supervisor observation for one runtime binding."""
+
+    __tablename__ = "runtime_observations"
+
+    runtime_binding_id: int = Field(
+        foreign_key="runtime_bindings.id",
+        primary_key=True,
+    )
+    runtime_generation: int = Field(ge=1)
+    observation_sequence: int = Field(default=0, ge=0)
+    observer_id: str = Field(max_length=128)
+    pane_live: bool = Field(default=False)
+    route_readback_verified: bool = Field(default=False)
+    prompt_state: str = Field(default="unknown", max_length=32)
+    provider_state: str = Field(default="unknown", max_length=32)
+    last_provider_activity_ts: Optional[datetime] = Field(default=None)
+    observed_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
 class InboxCursor(SQLModel, table=True):
@@ -292,9 +384,13 @@ class ContinuationReceipt(SQLModel, table=True):
     authority_kind: str = Field(max_length=32)
     authority_id: str = Field(max_length=64)
     runtime_session_id: str = Field(max_length=128)
-    pane_incarnation_id: str = Field(max_length=128)
+    runtime_incarnation_id: str = Field(max_length=128)
+    pane_instance_id: str = Field(max_length=128)
     prior_generation: int = Field(ge=1)
     carrier_digest: str = Field(min_length=64, max_length=64)
+    target_locator_digest: Optional[str] = Field(default=None, max_length=64)
+    reserved_launch_attempt_id: Optional[str] = Field(default=None, max_length=64)
+    reserved_ts: Optional[datetime] = Field(default=None)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     expires_ts: datetime
     consumed_ts: Optional[datetime] = Field(default=None)

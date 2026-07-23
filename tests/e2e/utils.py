@@ -113,6 +113,8 @@ def normalize_output(payload: Any, replacements: Iterable[tuple[str, str]], *, p
         normalized = [normalize_output(item, replacements, parent_key=parent_key) for item in payload]
         return _sort_known_lists(parent_key, normalized)
     if isinstance(payload, str):
+        if parent_key == "recipient_obligation_id":
+            return "<recipient_obligation_id>"
         return _apply_replacements(payload, replacements)
     return payload
 

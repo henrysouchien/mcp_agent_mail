@@ -29,6 +29,7 @@ import click
 import httpx
 import typer
 import uvicorn
+from fastmcp import Client as FastMCPClient
 from filelock import BaseFileLock, FileLock, Timeout as LockTimeout
 from rich.console import Console
 from rich.table import Table
@@ -413,6 +414,112 @@ doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
 release_app = typer.Typer(help="Release safety checks for production state")
 app.add_typer(release_app, name="release")
+
+
+def _resolve_agent_roster_project(explicit_project: str | None) -> str:
+    """Resolve CLI project from explicit input, managed env, or canonical cwd."""
+    selected = (explicit_project or "").strip()
+    if not selected:
+        selected = os.environ.get("FLEET_IDENTITY_PROJECT", "").strip()
+    if selected:
+        return str(Path(selected).expanduser().resolve())
+    cwd = Path.cwd().resolve()
+    completed = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if completed.returncode == 0 and completed.stdout.strip():
+        return str(Path(completed.stdout.strip()).resolve())
+    return str(cwd)
+
+
+@app.command("agent-roster")
+def agent_roster_cli(
+    project: Annotated[
+        Optional[str],
+        typer.Option(
+            "--project",
+            "-p",
+            help="Canonical project path; defaults to $FLEET_IDENTITY_PROJECT then Git/cwd.",
+        ),
+    ] = None,
+    include_history: bool = typer.Option(
+        False,
+        "--include-history",
+        help="Include ended and retired logical agents.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """List the canonical fleet roster for the current project."""
+    project_key = _resolve_agent_roster_project(project)
+    settings = get_settings()
+    owner_token = settings.credentials.owner_token
+    if not owner_token:
+        raise click.ClickException(
+            "agent-roster requires configured controller/operator authority."
+        )
+
+    async def _read() -> dict[str, Any]:
+        async with FastMCPClient(build_mcp_server()) as client:
+            result = await client.call_tool(
+                "agent_roster",
+                {
+                    "project_key": project_key,
+                    "owner_token": owner_token,
+                    "include_history": include_history,
+                },
+            )
+            return dict(result.data)
+
+    payload = _run_async(_read())
+    if json_output:
+        console.print_json(json.dumps(payload))
+        return
+    agents = list(payload.get("agents", []))
+    table = Table(
+        title=f"Fleet roster — {project_key}",
+        show_lines=False,
+        pad_edge=False,
+    )
+    table.add_column("Agent", style="bold cyan")
+    table.add_column("State")
+    table.add_column("Provider")
+    table.add_column("Model")
+    table.add_column("Generation", justify="right")
+    table.add_column("Route")
+    table.add_column("Logical key", overflow="fold")
+    state_styles = {
+        "live": "green",
+        "starting": "yellow",
+        "stale": "yellow",
+        "durable_only": "blue",
+        "launch_failed": "red",
+        "coordination_degraded": "magenta",
+        "conflict": "bold red",
+        "ended": "dim",
+    }
+    for row in agents:
+        route = row.get("route") or {}
+        route_text = (
+            f"{route.get('host_id')}:{route.get('tmux_server_id')}:{route.get('pane_id')}"
+            if route
+            else "—"
+        )
+        state = str(row.get("state") or "unknown")
+        style = state_styles.get(state, "white")
+        table.add_row(
+            str(row.get("agent_name") or "—"),
+            f"[{style}]{state}[/{style}]",
+            str(row.get("program") or "—"),
+            str(row.get("model") or "—"),
+            str(row.get("generation") or "—"),
+            route_text,
+            str(row.get("logical_agent_key") or "—"),
+        )
+    console.print(table)
 
 
 def _release_state_paths() -> dict[str, Path]:
