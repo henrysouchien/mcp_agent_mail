@@ -10941,6 +10941,9 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         "state": state,
                         "desired_state": launch.desired_state if launch else None,
                         "coordination_state": launch.coordination_state if launch else None,
+                        "supervisor_sequence": (
+                            launch.supervisor_sequence if launch else None
+                        ),
                         "launch_attempt_id": launch.launch_attempt_id if launch else None,
                         "identity_context_injected": (
                             launch.identity_context_injected if launch else False
@@ -10988,6 +10991,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                             else None
                         ),
                         "observation_fresh": fresh,
+                        "observation_sequence": (
+                            observation.observation_sequence
+                            if observation
+                            else None
+                        ),
                         "durable_reachable": agent is not None,
                         "live_tui_reachable": state == "live",
                         "issue_codes": issue_codes,

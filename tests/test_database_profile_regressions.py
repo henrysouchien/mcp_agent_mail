@@ -469,6 +469,8 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert row["host_boot_id"] == "boot-fleet"
         assert row["live_tui_reachable"] is True
         assert row["launch_attempt_id"] == launch_attempt_id
+        assert row["supervisor_sequence"] == 3
+        assert row["observation_sequence"] == 1
 
     monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_locator)
     _config.clear_settings_cache()
@@ -477,6 +479,8 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
     resource_payload = json.loads(blocks[0].text)
     assert resource_payload["agents"][0]["logical_agent_key"] == logical_key
     assert resource_payload["agents"][0]["state"] == "live"
+    assert resource_payload["agents"][0]["supervisor_sequence"] == 3
+    assert resource_payload["agents"][0]["observation_sequence"] == 1
 
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Project)) == 1
