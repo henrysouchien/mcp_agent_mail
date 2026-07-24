@@ -9661,6 +9661,22 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             return result.scalar_one_or_none()
 
+    async def _latest_runtime_binding(
+        authority_kind: str,
+        authority_id: str,
+    ) -> RuntimeBinding | None:
+        async with get_session() as session:
+            result = await session.execute(
+                select(RuntimeBinding)
+                .where(
+                    cast(Any, RuntimeBinding.authority_kind) == authority_kind,
+                    cast(Any, RuntimeBinding.authority_id) == authority_id,
+                )
+                .order_by(cast(Any, RuntimeBinding.generation).desc())
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
     def _runtime_binding_payload(binding: RuntimeBinding) -> dict[str, Any]:
         return {
             "runtime_session_id": binding.runtime_session_id,
@@ -9745,6 +9761,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             binding = await _active_runtime_binding(*authority)
             if binding is None:
                 overall = "runtime_missing"
+                last_binding = await _latest_runtime_binding(*authority)
+                if last_binding is not None:
+                    generation = last_binding.generation
+                    runtime_payload = _runtime_binding_payload(last_binding)
             else:
                 generation = binding.generation
                 runtime_payload = _runtime_binding_payload(binding)
@@ -10193,9 +10213,43 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         .limit(1)
                     )
                 ).scalar_one_or_none()
+                ended_runtime = None
+                if active_runtime is None and proof_mode == "resume_same_authority":
+                    ended_runtime = (
+                        await session.execute(
+                            select(RuntimeBinding)
+                            .where(
+                                cast(Any, RuntimeBinding.project_id) == project.id,
+                                cast(Any, RuntimeBinding.agent_id) == agent.id,
+                                cast(Any, RuntimeBinding.state) == "ended",
+                            )
+                            .order_by(cast(Any, RuntimeBinding.generation).desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                durable_resume = (
+                    ended_runtime is not None
+                    and ended_runtime.generation == expected_generation
+                    and launch_state is not None
+                    and launch_state.agent_id == agent.id
+                    and launch_state.desired_state == "held"
+                    and launch_state.coordination_state == "ready"
+                    and launch_state.expected_generation
+                    == expected_generation
+                    and launch_state.provider == provider
+                    and current_identity is not None
+                    and current_identity.window_uuid.lower()
+                    == window_locator.lower()
+                    and ended_runtime.authority_kind == "window_identity"
+                    and ended_runtime.authority_id
+                    == str(current_identity.id)
+                )
                 if (
-                    active_runtime is None
-                    or active_runtime.generation != expected_generation
+                    (
+                        active_runtime is None
+                        or active_runtime.generation != expected_generation
+                    )
+                    and not durable_resume
                 ):
                     raise ToolExecutionError(
                         "STALE_GENERATION",
@@ -10627,6 +10681,20 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            ended = None
+            if active is None and proof_mode == "resume_same_authority":
+                ended = (
+                    await session.execute(
+                        select(RuntimeBinding)
+                        .where(
+                            cast(Any, RuntimeBinding.project_id) == project.id,
+                            cast(Any, RuntimeBinding.agent_id) == agent_id,
+                            cast(Any, RuntimeBinding.state) == "ended",
+                        )
+                        .order_by(cast(Any, RuntimeBinding.generation).desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
             if expected_generation == 0:
                 if active is not None or proof_mode not in {
                     "create",
@@ -10638,7 +10706,20 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     )
                 generation = 1
             else:
-                if active is None or active.generation != expected_generation:
+                durable_resume = (
+                    active is None
+                    and ended is not None
+                    and ended.generation == expected_generation
+                    and ended.runtime_session_id == runtime_session_id
+                    and marker.window_identity_id == staged_identity.id
+                    and ended.authority_kind == "window_identity"
+                    and ended.authority_id == str(staged_identity.id)
+                    and ended.program == program
+                )
+                if (
+                    (active is None or active.generation != expected_generation)
+                    and not durable_resume
+                ):
                     raise ToolExecutionError(
                         "STALE_GENERATION",
                         "Active runtime generation changed before activation.",
@@ -10701,9 +10782,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     )
                 else:
                     raise ToolExecutionError("INVALID_PROOF_MODE", "Invalid activation proof mode.")
-                active.state = "ended"
-                active.ended_ts = now
-                session.add(active)
+                if active is not None:
+                    active.state = "ended"
+                    active.ended_ts = now
+                    session.add(active)
                 generation = expected_generation + 1
 
             occupied = (

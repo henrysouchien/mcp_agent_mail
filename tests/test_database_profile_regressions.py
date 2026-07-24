@@ -804,6 +804,91 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert binding is not None
         assert binding.state == "ended"
 
+    resume_attempt_id = str(uuid.uuid4())
+    resume_args = {
+        **ensure_args,
+        "launch_attempt_id": resume_attempt_id,
+        "proof_mode": "resume_same_authority",
+        "expected_generation": 1,
+        "expected_agent_id": ensured.data["agent_id"],
+        "agent_recovery_authority": ensured.data[
+            "agent_recovery_authority"
+        ],
+        "supervisor_sequence": 5,
+        "idempotency_key": (
+            f"ensure-principal:v1:{project_hash}:{logical_key}:"
+            f"{resume_attempt_id}"
+        ),
+    }
+    async with Client(build_mcp_server()) as client:
+        resumed = await client.call_tool(
+            "ensure_fleet_principal",
+            resume_args,
+        )
+        assert resumed.data["agent_id"] == ensured.data["agent_id"]
+        assert resumed.data["overall"] == "starting"
+
+        wrong_incarnation = str(uuid.uuid4())
+        with pytest.raises(ToolError) as wrong_session:
+            await client.call_tool(
+                "activate_fleet_runtime",
+                {
+                    **activate_args,
+                    "launch_attempt_id": resume_attempt_id,
+                    "phase_a_launch_receipt": resumed.data["launch_receipt"],
+                    "proof_mode": "resume_same_authority",
+                    "runtime_session_id": str(uuid.uuid4()),
+                    "runtime_incarnation_id": wrong_incarnation,
+                    "process_id": 5102,
+                    "process_started_ts": "2026-07-23T15:00:00Z",
+                    "expected_generation": 1,
+                    "supervisor_sequence": 6,
+                    "idempotency_key": (
+                        f"activate-runtime:v1:{project_hash}:{logical_key}:"
+                        f"{resume_attempt_id}:{wrong_incarnation}"
+                    ),
+                },
+            )
+        assert decode_error_marker(str(wrong_session.value))[
+            "type"
+        ] == "STALE_GENERATION"
+
+        resumed_incarnation = str(uuid.uuid4())
+        reactivated = await client.call_tool(
+            "activate_fleet_runtime",
+            {
+                **activate_args,
+                "launch_attempt_id": resume_attempt_id,
+                "phase_a_launch_receipt": resumed.data["launch_receipt"],
+                "proof_mode": "resume_same_authority",
+                "runtime_incarnation_id": resumed_incarnation,
+                "process_id": 5102,
+                "process_started_ts": "2026-07-23T15:00:00Z",
+                "expected_generation": 1,
+                "supervisor_sequence": 6,
+                "idempotency_key": (
+                    f"activate-runtime:v1:{project_hash}:{logical_key}:"
+                    f"{resume_attempt_id}:{resumed_incarnation}"
+                ),
+            },
+        )
+        assert reactivated.data["generation"] == 2
+        assert reactivated.data["agent_id"] == ensured.data["agent_id"]
+
+    async with get_session() as session:
+        bindings = (
+            await session.execute(
+                select(RuntimeBinding)
+                .where(RuntimeBinding.agent_id == ensured.data["agent_id"])
+                .order_by(RuntimeBinding.generation)
+            )
+        ).scalars().all()
+        assert [binding.state for binding in bindings] == [
+            "ended",
+            "starting",
+        ]
+        assert [binding.generation for binding in bindings] == [1, 2]
+
 
 @pytest.mark.asyncio
 async def test_late_absence_replay_accepts_exact_runtime_ended_by_new_generation(
