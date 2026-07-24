@@ -9814,6 +9814,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         expected_generation: int = 0,
         expected_agent_id: Optional[int] = None,
         agent_recovery_authority: Optional[str] = None,
+        recovery_launch_attempt_id: Optional[str] = None,
         continuation_receipt: Optional[str] = None,
         takeover_reason: Optional[str] = None,
         requested_public_name: Optional[str] = None,
@@ -9830,6 +9831,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         _validate_logical_agent_key(logical_agent_key)
         if proof_mode not in {
             "create",
+            "retry_failed_create",
             "resume_same_authority",
             "continue_with_receipt",
             "rotate_or_takeover",
@@ -9837,6 +9839,21 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             raise ToolExecutionError("INVALID_PROOF_MODE", "Unsupported fleet proof mode.")
         if not launch_attempt_id.strip():
             raise ToolExecutionError("INVALID_LAUNCH_ATTEMPT", "launch_attempt_id must not be blank.")
+        if proof_mode == "retry_failed_create":
+            if (
+                not recovery_launch_attempt_id
+                or not recovery_launch_attempt_id.strip()
+                or recovery_launch_attempt_id == launch_attempt_id
+            ):
+                raise ToolExecutionError(
+                    "INVALID_LAUNCH_ATTEMPT",
+                    "A failed create retry requires its distinct prior launch attempt.",
+                )
+        elif recovery_launch_attempt_id is not None:
+            raise ToolExecutionError(
+                "INVALID_LAUNCH_ATTEMPT",
+                "A recovery launch attempt is valid only for failed create retry.",
+            )
         if not _validate_window_uuid(window_locator):
             raise ToolExecutionError("INVALID_WINDOW_UUID", "window_locator must be a UUID.")
         if supervisor_sequence < 0 or expected_generation < 0:
@@ -9877,6 +9894,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "expected_generation": expected_generation,
             "expected_agent_id": expected_agent_id,
             "agent_recovery_authority_digest": recovery_digest,
+            "recovery_launch_attempt_id": recovery_launch_attempt_id,
             "continuation_receipt_digest": continuation_digest,
             "takeover_reason": takeover_reason,
             "requested_public_name": requested_public_name,
@@ -9921,9 +9939,23 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     )
                 )
             ).scalar_one_or_none()
+            existing_locator = (
+                await session.execute(
+                    select(WindowIdentity).where(
+                        cast(Any, WindowIdentity.project_id) == project.id,
+                        func.lower(cast(Any, WindowIdentity.window_uuid))
+                        == window_locator.lower(),
+                    )
+                )
+            ).scalar_one_or_none()
             agent: Agent | None = None
             recovery_authority: str | None = None
             if assignment is None:
+                if existing_locator is not None:
+                    raise ToolExecutionError(
+                        "WINDOW_LOCATOR_ALREADY_ASSIGNED",
+                        "The requested window locator is already assigned.",
+                    )
                 if proof_mode != "create" or expected_generation != 0:
                     raise ToolExecutionError(
                         "LOGICAL_ASSIGNMENT_MISSING",
@@ -10014,7 +10046,48 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 if current_marker is not None
                 else None
             )
-            if proof_mode != "create":
+            launch_state = await session.get(
+                FleetLaunchState,
+                (project.id, logical_agent_key),
+            )
+            if proof_mode == "retry_failed_create":
+                if expected_generation != 0:
+                    raise ToolExecutionError(
+                        "STALE_GENERATION",
+                        "A failed create retry requires generation 0.",
+                    )
+                active_runtime = (
+                    await session.execute(
+                        select(RuntimeBinding)
+                        .where(
+                            cast(Any, RuntimeBinding.project_id) == project.id,
+                            cast(Any, RuntimeBinding.agent_id) == agent.id,
+                            cast(Any, RuntimeBinding.state) != "ended",
+                        )
+                        .order_by(cast(Any, RuntimeBinding.generation).desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    active_runtime is not None
+                    or current_marker is None
+                    or current_identity is None
+                    or current_identity.window_uuid.lower() != window_locator.lower()
+                    or existing_locator is None
+                    or existing_locator.id != current_identity.id
+                    or launch_state is None
+                    or launch_state.agent_id != agent.id
+                    or launch_state.coordination_state != "failed"
+                    or launch_state.launch_attempt_id
+                    != recovery_launch_attempt_id
+                    or launch_state.provider != provider
+                    or launch_state.requested_model != requested_model
+                ):
+                    raise ToolExecutionError(
+                        "LAUNCH_STATE_MISMATCH",
+                        "Failed create retry does not match the authoritative launch state.",
+                    )
+            elif proof_mode != "create":
                 active_runtime = (
                     await session.execute(
                         select(RuntimeBinding)
@@ -10070,6 +10143,9 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     allow_replace=False,
                     now=now,
                 )
+            elif proof_mode == "retry_failed_create":
+                assert current_identity is not None
+                staged_identity = current_identity
             elif proof_mode == "resume_same_authority":
                 if (
                     current_identity is None
@@ -10088,15 +10164,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         "AUTHORITY_CONFLICT",
                         "Continuation/takeover target locator must be fresh.",
                     )
-                existing_locator = (
-                    await session.execute(
-                        select(WindowIdentity).where(
-                            cast(Any, WindowIdentity.project_id) == project.id,
-                            func.lower(cast(Any, WindowIdentity.window_uuid))
-                            == window_locator.lower(),
-                        )
-                    )
-                ).scalar_one_or_none()
                 if existing_locator is not None:
                     raise ToolExecutionError(
                         "AUTHORITY_CONFLICT",
@@ -10160,10 +10227,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
 
             if staged_identity.id is None:
                 raise RuntimeError("Staged identity id was not allocated.")
-            launch_state = await session.get(
-                FleetLaunchState,
-                (project.id, logical_agent_key),
-            )
             if (
                 launch_state is not None
                 and supervisor_sequence <= launch_state.supervisor_sequence
@@ -10459,8 +10522,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 )
             ).scalar_one_or_none()
             if expected_generation == 0:
-                if active is not None or proof_mode != "create":
-                    raise ToolExecutionError("STALE_GENERATION", "Generation 0 requires create.")
+                if active is not None or proof_mode not in {
+                    "create",
+                    "retry_failed_create",
+                }:
+                    raise ToolExecutionError(
+                        "STALE_GENERATION",
+                        "Generation 0 requires create or failed-create retry.",
+                    )
                 generation = 1
             else:
                 if active is None or active.generation != expected_generation:
@@ -10573,6 +10642,16 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             )
             session.add(binding)
             await session.flush()
+            runtime_fence_token = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    (
+                        "agent-mail-runtime-fence-v1:"
+                        f"{project.id}:{binding.id}:"
+                        f"{binding.authority_id}:{generation}"
+                    ),
+                )
+            )
             launch_state.coordination_state = "converging"
             launch_state.identity_context_injected = False
             launch_state.supervisor_sequence = supervisor_sequence
@@ -10596,6 +10675,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "generation": generation,
                     "runtime_session_id": runtime_session_id,
                     "runtime_incarnation_id": runtime_incarnation_id,
+                    "fence_token": runtime_fence_token,
                     "pane_instance_id": pane_instance_id,
                     "process_id": process_id,
                     "host_boot_id": host_boot_id,
@@ -10610,6 +10690,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "runtime_binding_id": binding.id,
                     "runtime_session_id": runtime_session_id,
                     "runtime_incarnation_id": runtime_incarnation_id,
+                    "fence_token": runtime_fence_token,
                     "pane_instance_id": pane_instance_id,
                     "process_id": process_id,
                     "host_boot_id": host_boot_id,
@@ -10649,6 +10730,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         ctx: Context,
         project_key: str,
         logical_agent_key: str,
+        launch_attempt_id: str,
         runtime_binding_id: int,
         runtime_generation: int,
         observation_sequence: int,
@@ -10661,6 +10743,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         identity_context_injected: bool,
         coordination_state: str,
         owner_token: str,
+        idempotency_key: str,
         observed_ts: Optional[str] = None,
         last_provider_activity_ts: Optional[str] = None,
         format: Optional[str] = None,
@@ -10691,10 +10774,59 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             if provider_activity is not None
             else None
         )
-        project = await _get_project_by_identifier(project_key)
-        if project.id is None:
-            raise ValueError("Project must be persisted before observation.")
-        async with get_immediate_session() as session:
+        normalized_project, _ = _validate_new_project_key(
+            project_key,
+            "workspace",
+        )
+        if project_key != normalized_project:
+            raise ToolExecutionError(
+                "PROJECT_MISMATCH",
+                "project_key must already be normalized.",
+            )
+        project_hash = hashlib.sha256(normalized_project.encode()).hexdigest()
+        expected_idempotency_key = (
+            f"observe-runtime:v1:{project_hash}:{logical_agent_key}:"
+            f"{launch_attempt_id}:{runtime_binding_id}:{runtime_generation}:"
+            f"{observation_sequence}:{supervisor_sequence}"
+        )
+        if idempotency_key != expected_idempotency_key:
+            raise ToolExecutionError(
+                "INVALID_IDEMPOTENCY_KEY",
+                "Runtime observation idempotency key is invalid.",
+            )
+        request_payload = {
+            "project_key": normalized_project,
+            "logical_agent_key": logical_agent_key,
+            "launch_attempt_id": launch_attempt_id,
+            "runtime_binding_id": runtime_binding_id,
+            "runtime_generation": runtime_generation,
+            "observation_sequence": observation_sequence,
+            "supervisor_sequence": supervisor_sequence,
+            "observer_id": observer_id,
+            "pane_live": pane_live,
+            "route_readback_verified": route_readback_verified,
+            "prompt_state": prompt_state,
+            "provider_state": provider_state,
+            "identity_context_injected": identity_context_injected,
+            "coordination_state": coordination_state,
+            "observed_ts": observed_ts,
+            "last_provider_activity_ts": last_provider_activity_ts,
+        }
+        request_now = _naive_utc()
+
+        async def mutate(session: Any) -> MutationReceipt:
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(Any, Project.human_key) == normalized_project
+                    )
+                )
+            ).scalar_one_or_none()
+            if project is None or project.id is None:
+                raise ToolExecutionError(
+                    "PROJECT_NOT_FOUND",
+                    "Fleet observation project does not exist.",
+                )
             launch_state = await session.get(
                 FleetLaunchState,
                 (project.id, logical_agent_key),
@@ -10705,6 +10837,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 or binding is None
                 or binding.project_id != project.id
                 or binding.agent_id != launch_state.agent_id
+                or launch_state.launch_attempt_id != launch_attempt_id
                 or binding.generation != runtime_generation
                 or binding.state == "ended"
             ):
@@ -10791,16 +10924,42 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "identity_context_injected": identity_context_injected,
                 },
             )
+            return MutationReceipt(
+                response={
+                    "project_id": project.id,
+                    "logical_agent_key": logical_agent_key,
+                    "launch_attempt_id": launch_attempt_id,
+                    "runtime_binding_id": runtime_binding_id,
+                    "generation": runtime_generation,
+                    "coordination_state": coordination_state,
+                    "identity_context_injected": identity_context_injected,
+                    "overall": (
+                        "live"
+                        if coordination_state == "ready"
+                        else coordination_state
+                    ),
+                },
+                entity_type="runtime_binding",
+                entity_id=str(runtime_binding_id),
+                project_id=project.id,
+            )
+
+        async with get_immediate_session() as session:
+            result = await run_idempotent_mutation(
+                session,
+                scope_kind="fleet_logical_agent",
+                scope_id=f"{project_hash}:{logical_agent_key}",
+                operation_kind="publish_fleet_runtime_observation_v1",
+                idempotency_key=idempotency_key,
+                request_payload=request_payload,
+                expires_ts=request_now + timedelta(hours=24),
+                mutate=mutate,
+                now=request_now,
+            )
             await session.commit()
-        return {
-            "project_id": project.id,
-            "logical_agent_key": logical_agent_key,
-            "runtime_binding_id": runtime_binding_id,
-            "generation": runtime_generation,
-            "coordination_state": coordination_state,
-            "identity_context_injected": identity_context_injected,
-            "overall": "live" if coordination_state == "ready" else coordination_state,
-        }
+        response = dict(result.response)
+        response["replayed"] = result.replayed
+        return response
 
     @mcp.tool(name="end_fleet_runtime_absent")
     @_instrument_tool(

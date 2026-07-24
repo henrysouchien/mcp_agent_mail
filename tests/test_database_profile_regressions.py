@@ -532,11 +532,10 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
             assert staged_principal.model == "unbound"
             assert staged_principal.task_description == ""
 
-        observed = await client.call_tool(
-            "publish_fleet_runtime_observation",
-            {
+        observation_args = {
                 "project_key": project_key,
                 "logical_agent_key": logical_key,
+                "launch_attempt_id": launch_attempt_id,
                 "runtime_binding_id": activated.data["runtime_binding_id"],
                 "runtime_generation": 1,
                 "observation_sequence": 1,
@@ -549,9 +548,23 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
                 "identity_context_injected": True,
                 "coordination_state": "ready",
                 "owner_token": owner_token,
-            },
+                "idempotency_key": (
+                    f"observe-runtime:v1:{project_hash}:{logical_key}:"
+                    f"{launch_attempt_id}:"
+                    f"{activated.data['runtime_binding_id']}:1:1:3"
+                ),
+            }
+        observed = await client.call_tool(
+            "publish_fleet_runtime_observation",
+            observation_args,
+        )
+        observed_replay = await client.call_tool(
+            "publish_fleet_runtime_observation",
+            observation_args,
         )
         assert observed.data["overall"] == "live"
+        assert observed.data["replayed"] is False
+        assert observed_replay.data["replayed"] is True
         async with get_session() as session:
             principal = await session.get(Agent, ensured.data["agent_id"])
             assert principal is not None
