@@ -11091,7 +11091,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 launch_state is None
                 or binding is None
                 or observation is None
-                or launch_state.launch_attempt_id != launch_attempt_id
                 or binding.project_id != project.id
                 or binding.agent_id != launch_state.agent_id
                 or binding.generation != runtime_generation
@@ -11099,16 +11098,32 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 or binding.pane_instance_id != pane_instance_id
                 or binding.process_id != process_id
                 or binding.process_started_ts != started
-                or binding.state == "ended"
+                or observation.runtime_generation != runtime_generation
             ):
                 raise ToolExecutionError(
                     "STALE_GENERATION",
                     "Absence proof does not match the exact active runtime.",
                 )
-            if observation.runtime_generation != runtime_generation:
+            if binding.state == "ended":
+                return MutationReceipt(
+                    response={
+                        "project_id": project.id,
+                        "logical_agent_key": logical_agent_key,
+                        "runtime_binding_id": runtime_binding_id,
+                        "generation": runtime_generation,
+                        "desired_state": launch_state.desired_state,
+                        "coordination_state": launch_state.coordination_state,
+                        "overall": "ended",
+                        "already_ended": True,
+                    },
+                    entity_type="runtime_binding",
+                    entity_id=str(runtime_binding_id),
+                    project_id=project.id,
+                )
+            if launch_state.launch_attempt_id != launch_attempt_id:
                 raise ToolExecutionError(
                     "STALE_GENERATION",
-                    "Absence proof observation generation changed.",
+                    "Absence proof launch attempt is no longer current.",
                 )
             if supervisor_sequence <= launch_state.supervisor_sequence:
                 raise ToolExecutionError(

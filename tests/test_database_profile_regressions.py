@@ -806,6 +806,194 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
 
 
 @pytest.mark.asyncio
+async def test_late_absence_replay_accepts_exact_runtime_ended_by_new_generation(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_database_profile(monkeypatch)
+    owner_token = "test-late-absence-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
+    _config.clear_settings_cache()
+    project_key = "/regression/late-absence-replay"
+    project_hash = hashlib.sha256(project_key.encode()).hexdigest()
+    logical_key = f"fa:{uuid.uuid4()}"
+    old_launch_attempt_id = str(uuid.uuid4())
+    current_launch_attempt_id = str(uuid.uuid4())
+    old_incarnation_id = str(uuid.uuid4())
+    current_incarnation_id = str(uuid.uuid4())
+    pane_instance_id = str(uuid.uuid4())
+    old_started = datetime(2026, 7, 23, 14, 0, 0)
+    current_started = datetime(2026, 7, 23, 15, 0, 0)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async with Client(build_mcp_server()) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        registered = await _register_agent(
+            client,
+            project_key=project_key,
+            name="BlueRidge",
+        )
+        async with get_session() as session:
+            project = (
+                await session.execute(
+                    select(Project).where(Project.human_key == project_key)
+                )
+            ).scalar_one()
+            assert project.id is not None
+            agent_id = int(registered["id"])
+            session.add(
+                FleetLaunchState(
+                    project_id=project.id,
+                    logical_agent_key=logical_key,
+                    agent_id=agent_id,
+                    desired_state="running",
+                    launch_attempt_id=current_launch_attempt_id,
+                    proof_mode="resume_same_authority",
+                    coordination_state="ready",
+                    identity_context_injected=True,
+                    supervisor_sequence=8,
+                    expected_generation=2,
+                    provider="grok",
+                    requested_model="provider-default",
+                    task_description="current generation remains authoritative",
+                )
+            )
+            old_binding = RuntimeBinding(
+                project_id=project.id,
+                agent_id=agent_id,
+                authority_kind="test",
+                authority_id="late-replay-authority",
+                runtime_session_id=str(uuid.uuid4()),
+                runtime_incarnation_id=old_incarnation_id,
+                pane_instance_id=pane_instance_id,
+                generation=1,
+                host_id="host-late-replay",
+                host_boot_id="boot-late-replay",
+                tmux_server_id="tmux-late-replay",
+                pane_id="%91",
+                program="grok",
+                model="provider-default",
+                task_description="superseded runtime",
+                process_id=9101,
+                process_started_ts=old_started,
+                state="ended",
+                last_heartbeat_ts=now - timedelta(minutes=10),
+                created_ts=now - timedelta(minutes=20),
+                ended_ts=now - timedelta(minutes=5),
+            )
+            session.add(old_binding)
+            await session.flush()
+            assert old_binding.id is not None
+            session.add(
+                RuntimeObservation(
+                    runtime_binding_id=old_binding.id,
+                    runtime_generation=1,
+                    observation_sequence=1,
+                    observer_id="prior-observer",
+                    pane_live=False,
+                    route_readback_verified=False,
+                    prompt_state="absent",
+                    provider_state="absent",
+                    observed_ts=now - timedelta(minutes=10),
+                )
+            )
+            current_binding = RuntimeBinding(
+                project_id=project.id,
+                agent_id=agent_id,
+                authority_kind="test",
+                authority_id="late-replay-authority",
+                runtime_session_id=str(uuid.uuid4()),
+                runtime_incarnation_id=current_incarnation_id,
+                pane_instance_id=pane_instance_id,
+                generation=2,
+                host_id="host-late-replay",
+                host_boot_id="boot-late-replay",
+                tmux_server_id="tmux-late-replay",
+                pane_id="%91",
+                program="grok",
+                model="provider-default",
+                task_description="current runtime",
+                process_id=9102,
+                process_started_ts=current_started,
+                state="healthy",
+                last_heartbeat_ts=now,
+                created_ts=now - timedelta(minutes=4),
+            )
+            session.add(current_binding)
+            await session.flush()
+            assert current_binding.id is not None
+            session.add(
+                RuntimeObservation(
+                    runtime_binding_id=current_binding.id,
+                    runtime_generation=2,
+                    observation_sequence=1,
+                    observer_id="current-observer",
+                    pane_live=True,
+                    route_readback_verified=True,
+                    prompt_state="idle",
+                    provider_state="ready",
+                    observed_ts=now,
+                )
+            )
+            await session.commit()
+            project_id = project.id
+            old_binding_id = old_binding.id
+            current_binding_id = current_binding.id
+
+        absence_observed_ts = datetime.now(timezone.utc).isoformat()
+        end_args = {
+            "project_key": project_key,
+            "logical_agent_key": logical_key,
+            "launch_attempt_id": old_launch_attempt_id,
+            "runtime_binding_id": old_binding_id,
+            "runtime_generation": 1,
+            "runtime_incarnation_id": old_incarnation_id,
+            "pane_instance_id": pane_instance_id,
+            "process_id": 9101,
+            "process_started_ts": "2026-07-23T14:00:00Z",
+            "pane_absence_event_id": str(uuid.uuid4()),
+            "pane_absence_observed_ts": absence_observed_ts,
+            "process_absence_event_id": str(uuid.uuid4()),
+            "process_absence_observed_ts": absence_observed_ts,
+            "observation_sequence": 2,
+            "supervisor_sequence": 4,
+            "observer_id": "late-observer",
+            "owner_token": owner_token,
+            "idempotency_key": (
+                f"end-absent-runtime:v1:{project_hash}:{logical_key}:"
+                f"{old_binding_id}:1"
+            ),
+        }
+        reconciled = await client.call_tool(
+            "end_fleet_runtime_absent",
+            end_args,
+        )
+        replayed = await client.call_tool(
+            "end_fleet_runtime_absent",
+            end_args,
+        )
+        assert reconciled.data["overall"] == "ended"
+        assert reconciled.data["already_ended"] is True
+        assert reconciled.data["generation"] == 1
+        assert reconciled.data["replayed"] is False
+        assert replayed.data["replayed"] is True
+
+    async with get_session() as session:
+        launch_state = await session.get(
+            FleetLaunchState,
+            (project_id, logical_key),
+        )
+        old_binding = await session.get(RuntimeBinding, old_binding_id)
+        current_binding = await session.get(RuntimeBinding, current_binding_id)
+        assert launch_state is not None
+        assert launch_state.launch_attempt_id == current_launch_attempt_id
+        assert launch_state.expected_generation == 2
+        assert launch_state.supervisor_sequence == 8
+        assert old_binding is not None and old_binding.state == "ended"
+        assert current_binding is not None and current_binding.state == "healthy"
+
+
+@pytest.mark.asyncio
 async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route_readback(
     isolated_env: object,
     monkeypatch: pytest.MonkeyPatch,
