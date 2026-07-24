@@ -19,6 +19,7 @@ from sqlalchemy import func, select
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import _automatic_mutation_keys, build_mcp_server
 from mcp_agent_mail.db import get_session
+from mcp_agent_mail.error_contract import decode_error_marker
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.models import (
     ActivePrincipalAuthority,
@@ -366,11 +367,14 @@ async def test_pre_principal_terminal_projection_creates_visible_failed_roster_r
             **projection_args,
             "desired_state": "held",
         }
-        with pytest.raises(ToolError, match="exact supervisor sequence replay changed"):
+        with pytest.raises(ToolError) as failed_projection:
             await client.call_tool(
                 "publish_fleet_launch_state",
                 changed_projection,
             )
+        assert decode_error_marker(str(failed_projection.value))[
+            "type"
+        ] == "STALE_SUPERVISOR_SEQUENCE"
 
         roster = await client.call_tool(
             "agent_roster",
@@ -388,7 +392,7 @@ async def test_pre_principal_terminal_projection_creates_visible_failed_roster_r
         assert row["live_tui_reachable"] is False
 
         project_hash = hashlib.sha256(project_key.encode()).hexdigest()
-        with pytest.raises(ToolError, match="sequence did not advance"):
+        with pytest.raises(ToolError) as stale_sequence:
             await client.call_tool(
                 "ensure_fleet_principal",
                 {
@@ -409,6 +413,9 @@ async def test_pre_principal_terminal_projection_creates_visible_failed_roster_r
                     "expected_generation": 0,
                 },
             )
+        assert decode_error_marker(str(stale_sequence.value))[
+            "type"
+        ] == "STALE_SUPERVISOR_SEQUENCE"
 
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Project)) == 1
@@ -460,8 +467,11 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert replayed.data["agent_id"] == ensured.data["agent_id"]
         changed = dict(ensure_args)
         changed["requested_model"] = "different-model"
-        with pytest.raises(ToolError, match="different ensure_fleet_principal"):
+        with pytest.raises(ToolError) as changed_replay:
             await client.call_tool("ensure_fleet_principal", changed)
+        assert decode_error_marker(str(changed_replay.value))[
+            "type"
+        ] == "IDEMPOTENCY_KEY_REUSE_MISMATCH"
 
         runtime_incarnation_id = str(uuid.uuid4())
         pane_instance_id = str(uuid.uuid4())
@@ -632,11 +642,11 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
                 f"{stale_launch_attempt_id}"
             ),
         }
-        with pytest.raises(
-            ToolError,
-            match="generation changed before Phase A",
-        ):
+        with pytest.raises(ToolError) as stale_generation:
             await client.call_tool("ensure_fleet_principal", stale_ensure)
+        assert decode_error_marker(str(stale_generation.value))[
+            "type"
+        ] == "STALE_GENERATION"
 
         roster = await client.call_tool(
             "agent_roster",
@@ -689,11 +699,14 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         ),
     }
     async with Client(build_mcp_server()) as client:
-        with pytest.raises(ToolError, match="five minutes"):
+        with pytest.raises(ToolError) as grace_active:
             await client.call_tool(
                 "end_fleet_runtime_absent",
                 premature_end_args,
             )
+        assert decode_error_marker(str(grace_active.value))[
+            "type"
+        ] == "ABSENCE_GRACE_ACTIVE"
 
     async with get_session() as session:
         observation = await session.get(
@@ -849,8 +862,11 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
 
         stale_args = dict(moved_args)
         stale_args["pane_id"] = "%32"
-        with pytest.raises(ToolError, match="generation changed"):
+        with pytest.raises(ToolError) as stale_reconcile:
             await client.call_tool("reconcile_runtime_binding", stale_args)
+        assert decode_error_marker(str(stale_reconcile.value))[
+            "type"
+        ] == "STALE_GENERATION"
 
         conflict_args = dict(moved_args)
         conflict_args.update(
@@ -859,8 +875,11 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
                 "expected_generation": 2,
             }
         )
-        with pytest.raises(ToolError, match="another active runtime incarnation"):
+        with pytest.raises(ToolError) as runtime_conflict:
             await client.call_tool("reconcile_runtime_binding", conflict_args)
+        assert decode_error_marker(str(runtime_conflict.value))[
+            "type"
+        ] == "RUNTIME_CONFLICT"
 
         issued = await client.call_tool(
             "issue_continuation_receipt",

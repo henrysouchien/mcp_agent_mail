@@ -71,6 +71,7 @@ from .db import (
     start_query_tracking,
     stop_query_tracking,
 )
+from .error_contract import build_error_envelope, encode_error_marker
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .idempotency import (
     IdempotencyKeyReuseMismatchError,
@@ -559,6 +560,52 @@ class ToolExecutionError(Exception):
         }
 
 
+_FLEET_ERROR_CONTRACT_TOOLS = {
+    "activate_fleet_runtime",
+    "agent_roster_current",
+    "end_fleet_runtime_absent",
+    "ensure_fleet_principal",
+    "heartbeat_runtime_binding",
+    "identity_status",
+    "pre_stop_decision",
+    "publish_fleet_launch_state",
+    "publish_fleet_runtime_observation",
+    "reconcile_runtime_binding",
+}
+
+
+def _fleet_public_tool_error(
+    tool_name: str,
+    exc: ToolExecutionError,
+    bound: inspect.BoundArguments,
+) -> ToolExecutionError:
+    raw_attempt_id = bound.arguments.get("launch_attempt_id")
+    launch_attempt_id: str | None = None
+    if isinstance(raw_attempt_id, str):
+        with suppress(ValueError):
+            launch_attempt_id = str(uuid.UUID(raw_attempt_id))
+    envelope = build_error_envelope(
+        error_type=exc.error_type,
+        operation=tool_name,
+        launch_attempt_id=launch_attempt_id,
+    )
+    return ToolExecutionError(
+        exc.error_type,
+        encode_error_marker(envelope),
+        recoverable=envelope["recoverable"],
+    )
+
+
+def _tool_transport_error(
+    tool_name: str,
+    exc: ToolExecutionError,
+    bound: inspect.BoundArguments,
+) -> ToolExecutionError:
+    if tool_name in _FLEET_ERROR_CONTRACT_TOOLS:
+        return _fleet_public_tool_error(tool_name, exc, bound)
+    return exc
+
+
 def _record_tool_error(tool_name: str, exc: Exception) -> None:
     logger.warning(
         "tool_error",
@@ -750,8 +797,9 @@ def _instrument_tool(
             except ToolExecutionError as exc:
                 metrics["errors"] += 1
                 _record_tool_error(tool_name, exc)
-                error = exc
-                raise
+                transport_exc = _tool_transport_error(tool_name, exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except IdempotencyKeyReuseMismatchError as exc:
                 metrics["errors"] += 1
                 _record_tool_error(tool_name, exc)
@@ -764,8 +812,9 @@ def _instrument_tool(
                         "recovery": "retry with the original request or a new idempotency key",
                     },
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except IdempotencyReceiptExpiredError as exc:
                 metrics["errors"] += 1
                 _record_tool_error(tool_name, exc)
@@ -778,8 +827,9 @@ def _instrument_tool(
                         "recovery": "reconcile the committed entity before choosing a new key",
                     },
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except IdempotencyVersionUnavailableError as exc:
                 metrics["errors"] += 1
                 _record_tool_error(tool_name, exc)
@@ -792,8 +842,9 @@ def _instrument_tool(
                         "recovery": "restore a server version that supports the retained fingerprint version",
                     },
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except NoResultFound as exc:
                 # Handle agent/project not found errors with helpful messages
                 metrics["errors"] += 1
@@ -804,8 +855,9 @@ def _instrument_tool(
                     recoverable=True,
                     data={"tool": tool_name},
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except ValueError as exc:
                 # Invalid argument value
                 metrics["errors"] += 1
@@ -816,8 +868,9 @@ def _instrument_tool(
                     recoverable=True,
                     data={"tool": tool_name, "error_detail": str(exc)},
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except TypeError as exc:
                 # Wrong argument type
                 metrics["errors"] += 1
@@ -837,8 +890,9 @@ def _instrument_tool(
                     recoverable=True,
                     data={"tool": tool_name, "error_detail": str(exc)},
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except KeyError as exc:
                 # Missing key/field
                 metrics["errors"] += 1
@@ -849,8 +903,9 @@ def _instrument_tool(
                     recoverable=True,
                     data={"tool": tool_name, "missing_field": str(exc)},
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except SATimeoutError as exc:
                 # SQLAlchemy pool timeout (QueuePool exhausted)
                 metrics["errors"] += 1
@@ -868,8 +923,9 @@ def _instrument_tool(
                         "error_detail": str(exc),
                     },
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except TimeoutError as exc:
                 # Timeout (database lock, network, etc.)
                 metrics["errors"] += 1
@@ -880,8 +936,9 @@ def _instrument_tool(
                     recoverable=True,
                     data={"tool": tool_name, "error_detail": str(exc)},
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except OSError as exc:
                 # Handle file descriptor exhaustion (EMFILE) with cache cleanup
                 import errno
@@ -907,8 +964,9 @@ def _instrument_tool(
                         recoverable=False,
                         data={"tool": tool_name, "errno": exc.errno, "error_detail": str(exc)},
                     )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             except Exception as exc:
                 # Catch-all for unexpected errors - provide helpful categorization
                 metrics["errors"] += 1
@@ -948,8 +1006,9 @@ def _instrument_tool(
                     recoverable=recoverable,
                     data={"tool": tool_name, "original_error": error_type, "error_detail": error_msg},
                 )
-                error = wrapped_exc
-                raise wrapped_exc from exc
+                transport_exc = _tool_transport_error(tool_name, wrapped_exc, bound)
+                error = transport_exc
+                raise transport_exc from exc
             finally:
                 _record_recent(tool_name, project_value, agent_value)
 

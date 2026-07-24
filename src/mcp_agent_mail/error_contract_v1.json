@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "context_policy": "empty_object",
+  "default": {
+    "message": "Agent Mail rejected the operation.",
+    "retry_class": "never"
+  },
+  "policies": {
+    "ADAPTER_OUTCOME_UNKNOWN": {
+      "message": "The fleet identity adapter outcome is unknown; replay the exact journaled command to reconcile authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "AGENT_MAIL_TRANSPORT_ERROR": {
+      "message": "The Agent Mail transport outcome is unknown; reconcile authoritative state before retrying.",
+      "retry_class": "reconcile"
+    },
+    "AGENT_RECOVERY_AUTHENTICATION_REQUIRED": {
+      "message": "Agent recovery authorization is required.",
+      "retry_class": "operator_action"
+    },
+    "AUTHORITY_CONFLICT": {
+      "message": "The requested Agent Mail authority conflicts.",
+      "retry_class": "operator_action"
+    },
+    "AUTHORITY_MISSING": {
+      "message": "The requested Agent Mail authority does not exist.",
+      "retry_class": "operator_action"
+    },
+    "CONNECTION_ERROR": {
+      "message": "Agent Mail lost a connection after dispatch; reconcile authoritative state before retrying.",
+      "retry_class": "reconcile"
+    },
+    "DATABASE_ERROR": {
+      "message": "Agent Mail encountered a commit-uncertain database failure; reconcile authoritative state before retrying.",
+      "retry_class": "reconcile"
+    },
+    "DATABASE_OPERATION_TIMEOUT": {
+      "message": "Agent Mail timed out after dispatch; reconcile authoritative state before retrying.",
+      "retry_class": "reconcile"
+    },
+    "DATABASE_POOL_EXHAUSTED": {
+      "message": "Agent Mail could not acquire a database connection before dispatch.",
+      "retry_class": "transient"
+    },
+    "GENERATION_MISMATCH": {
+      "message": "Agent Mail rejected a stale generation; reload authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "IDEMPOTENCY_RECEIPT_EXPIRED": {
+      "message": "The Agent Mail idempotency receipt is unavailable; reconcile authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "INVALID_RUNTIME_STATE": {
+      "message": "The requested operation is not valid for the authoritative runtime state.",
+      "retry_class": "operator_action"
+    },
+    "LAUNCH_STATE_MISMATCH": {
+      "message": "Agent Mail rejected a launch-state mismatch; reload authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "LOGICAL_ASSIGNMENT_MISSING": {
+      "message": "The requested Agent Mail logical assignment does not exist.",
+      "retry_class": "operator_action"
+    },
+    "NOT_FOUND": {
+      "message": "The requested Agent Mail resource does not exist.",
+      "retry_class": "operator_action"
+    },
+    "OWNER_AUTHENTICATION_REQUIRED": {
+      "message": "Agent Mail owner authorization is required.",
+      "retry_class": "operator_action"
+    },
+    "PERMISSION_ERROR": {
+      "message": "Agent Mail rejected the operation authorization.",
+      "retry_class": "operator_action"
+    },
+    "PRINCIPAL_MISMATCH": {
+      "message": "The requested Agent Mail principal does not match authoritative state.",
+      "retry_class": "operator_action"
+    },
+    "PROJECT_MISMATCH": {
+      "message": "The requested Agent Mail project does not match authoritative state.",
+      "retry_class": "operator_action"
+    },
+    "PROJECT_NOT_FOUND": {
+      "message": "The requested Agent Mail project does not exist.",
+      "retry_class": "operator_action"
+    },
+    "RESOURCE_BUSY": {
+      "message": "Agent Mail reported an indeterminate resource state; reconcile before retrying.",
+      "retry_class": "reconcile"
+    },
+    "RESOURCE_EXHAUSTED": {
+      "message": "Agent Mail reported an indeterminate resource state; reconcile before retrying.",
+      "retry_class": "reconcile"
+    },
+    "ROUTE_CONFLICT": {
+      "message": "The requested Agent Mail route conflicts.",
+      "retry_class": "operator_action"
+    },
+    "ROUTE_PUBLICATION_UNCERTAIN": {
+      "message": "The local route publication outcome is incomplete; reconcile the exact launch before retrying.",
+      "retry_class": "reconcile"
+    },
+    "RUNTIME_COMMIT_UNCERTAIN": {
+      "message": "The Agent Mail runtime update may have committed; reconcile authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "STALE_GENERATION": {
+      "message": "Agent Mail rejected a stale generation; reload authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "STALE_SUPERVISOR_SEQUENCE": {
+      "message": "Agent Mail rejected a stale supervisor sequence; reload authoritative state.",
+      "retry_class": "reconcile"
+    },
+    "SUPERVISOR_PROJECTION_UNCERTAIN": {
+      "message": "The authoritative lifecycle result was received, but the local supervisor projection is incomplete; replay the exact journaled command.",
+      "retry_class": "reconcile"
+    },
+    "TIMEOUT": {
+      "message": "Agent Mail timed out after dispatch; reconcile authoritative state before retrying.",
+      "retry_class": "reconcile"
+    },
+    "UPSTREAM_ERROR_CONTRACT_INVALID": {
+      "message": "Agent Mail returned an invalid error contract.",
+      "retry_class": "never"
+    },
+    "WINDOW_LOCATOR_ALREADY_ASSIGNED": {
+      "message": "The requested window locator is already assigned.",
+      "retry_class": "operator_action"
+    }
+  },
+  "vectors": [
+    {
+      "schema_version": 1,
+      "error_id": "11111111-1111-4111-8111-111111111111",
+      "type": "DATABASE_OPERATION_TIMEOUT",
+      "message": "Agent Mail timed out after dispatch; reconcile authoritative state before retrying.",
+      "recoverable": true,
+      "retry_class": "reconcile",
+      "operation": "ensure_fleet_principal",
+      "launch_attempt_id": "22222222-2222-4222-8222-222222222222",
+      "sanitized_context": {}
+    },
+    {
+      "schema_version": 1,
+      "error_id": "33333333-3333-4333-8333-333333333333",
+      "type": "WINDOW_LOCATOR_ALREADY_ASSIGNED",
+      "message": "The requested window locator is already assigned.",
+      "recoverable": true,
+      "retry_class": "operator_action",
+      "operation": "ensure_fleet_principal",
+      "launch_attempt_id": null,
+      "sanitized_context": {}
+    },
+    {
+      "schema_version": 1,
+      "error_id": "44444444-4444-4444-8444-444444444444",
+      "type": "UNRECOGNIZED_SERVER_FAILURE",
+      "message": "Agent Mail rejected the operation.",
+      "recoverable": false,
+      "retry_class": "never",
+      "operation": "activate_fleet_runtime",
+      "launch_attempt_id": null,
+      "sanitized_context": {}
+    },
+    {
+      "schema_version": 1,
+      "error_id": "55555555-5555-4555-8555-555555555555",
+      "type": "AGENT_MAIL_TRANSPORT_ERROR",
+      "message": "The Agent Mail transport outcome is unknown; reconcile authoritative state before retrying.",
+      "recoverable": true,
+      "retry_class": "reconcile",
+      "operation": "publish_fleet_launch_state",
+      "launch_attempt_id": "66666666-6666-4666-8666-666666666666",
+      "sanitized_context": {}
+    }
+  ]
+}
