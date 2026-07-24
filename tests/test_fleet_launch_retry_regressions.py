@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -11,7 +12,7 @@ from sqlalchemy import func, select
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
-from mcp_agent_mail.db import get_session
+from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.error_contract import decode_error_marker
 from mcp_agent_mail.models import (
     ActivePrincipalAuthority,
@@ -145,6 +146,160 @@ async def test_locator_conflict_is_typed_and_creates_no_ghost_rows(
         "runtimes": 0,
         "observations": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_create_adopts_exact_unmanaged_locator_owner(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del isolated_env
+    owner_token = configure_database_profile(monkeypatch)
+    project_key = "/regression/fleet-legacy-owner-adoption"
+    logical_key = f"fa:{uuid.uuid4()}"
+    locator = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    await ensure_schema()
+    async with get_session() as session:
+        project = Project(
+            slug="regression-fleet-legacy-owner-adoption",
+            human_key=project_key,
+            namespace_kind="workspace",
+        )
+        session.add(project)
+        await session.flush()
+        assert project.id is not None
+        legacy_agent = Agent(
+            project_id=project.id,
+            name="ScarletBeaver",
+            program="claude-code",
+            model="claude-opus",
+            task_description="legacy live pane awaiting managed adoption",
+            registration_token="legacy-recovery-authority",
+        )
+        session.add(legacy_agent)
+        await session.flush()
+        assert legacy_agent.id is not None
+        identity = WindowIdentity(
+            project_id=project.id,
+            agent_id=legacy_agent.id,
+            window_uuid=locator,
+            display_name=legacy_agent.name,
+            expires_ts=now + timedelta(days=30),
+        )
+        session.add(identity)
+        await session.flush()
+        assert identity.id is not None
+        session.add(
+            ActivePrincipalAuthority(
+                project_id=project.id,
+                agent_id=legacy_agent.id,
+                window_identity_id=identity.id,
+            )
+        )
+        await session.commit()
+        legacy_agent_id = legacy_agent.id
+
+    async with Client(build_mcp_server()) as client:
+        adopted = await client.call_tool(
+            "ensure_fleet_principal",
+            ensure_arguments(
+                project=project_key,
+                logical_key=logical_key,
+                attempt_id=str(uuid.uuid4()),
+                locator=locator,
+                owner_token=owner_token,
+                supervisor_sequence=1,
+            ),
+        )
+
+    assert adopted.data["agent_id"] == legacy_agent_id
+    assert adopted.data["agent_name"] == "ScarletBeaver"
+    assert adopted.data["adopted_legacy_principal"] is True
+    assert (
+        adopted.data["agent_recovery_authority"]
+        == "legacy-recovery-authority"
+    )
+    assert await authority_counts() == {
+        "projects": 1,
+        "agents": 1,
+        "assignments": 1,
+        "identities": 1,
+        "authorities": 1,
+        "launches": 1,
+        "runtimes": 0,
+        "observations": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_does_not_adopt_expired_unmanaged_locator_owner(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del isolated_env
+    owner_token = configure_database_profile(monkeypatch)
+    project_key = "/regression/fleet-expired-legacy-owner"
+    locator = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    await ensure_schema()
+    async with get_session() as session:
+        project = Project(
+            slug="regression-fleet-expired-legacy-owner",
+            human_key=project_key,
+            namespace_kind="workspace",
+        )
+        session.add(project)
+        await session.flush()
+        assert project.id is not None
+        legacy_agent = Agent(
+            project_id=project.id,
+            name="ExpiredOwner",
+            program="claude-code",
+            model="claude-opus",
+            task_description="expired unmanaged locator owner",
+            registration_token="expired-recovery-authority",
+        )
+        session.add(legacy_agent)
+        await session.flush()
+        assert legacy_agent.id is not None
+        identity = WindowIdentity(
+            project_id=project.id,
+            agent_id=legacy_agent.id,
+            window_uuid=locator,
+            display_name=legacy_agent.name,
+            expires_ts=now - timedelta(minutes=1),
+        )
+        session.add(identity)
+        await session.flush()
+        assert identity.id is not None
+        session.add(
+            ActivePrincipalAuthority(
+                project_id=project.id,
+                agent_id=legacy_agent.id,
+                window_identity_id=identity.id,
+            )
+        )
+        await session.commit()
+
+    async with Client(build_mcp_server()) as client:
+        with pytest.raises(ToolError) as error:
+            await client.call_tool(
+                "ensure_fleet_principal",
+                ensure_arguments(
+                    project=project_key,
+                    logical_key=f"fa:{uuid.uuid4()}",
+                    attempt_id=str(uuid.uuid4()),
+                    locator=locator,
+                    owner_token=owner_token,
+                    supervisor_sequence=1,
+                ),
+            )
+
+    envelope = decode_error_marker(str(error.value))
+    assert envelope["type"] == "WINDOW_LOCATOR_ALREADY_ASSIGNED"
 
 
 @pytest.mark.asyncio

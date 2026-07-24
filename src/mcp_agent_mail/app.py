@@ -9950,12 +9950,101 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             ).scalar_one_or_none()
             agent: Agent | None = None
             recovery_authority: str | None = None
+            adopted_legacy_principal = False
             if assignment is None:
                 if existing_locator is not None:
-                    raise ToolExecutionError(
-                        "WINDOW_LOCATOR_ALREADY_ASSIGNED",
-                        "The requested window locator is already assigned.",
+                    legacy_agent = (
+                        await session.get(Agent, existing_locator.agent_id)
+                        if existing_locator.agent_id is not None
+                        else None
                     )
+                    legacy_marker = (
+                        await session.get(
+                            ActivePrincipalAuthority,
+                            (project.id, existing_locator.agent_id),
+                        )
+                        if existing_locator.agent_id is not None
+                        else None
+                    )
+                    legacy_assignment = (
+                        await session.execute(
+                            select(LogicalAgentPrincipal.id)
+                            .where(
+                                cast(Any, LogicalAgentPrincipal.project_id)
+                                == project.id,
+                                cast(Any, LogicalAgentPrincipal.agent_id)
+                                == existing_locator.agent_id,
+                            )
+                            .limit(1)
+                        )
+                    ).first()
+                    legacy_launch = (
+                        await session.execute(
+                            select(FleetLaunchState.agent_id)
+                            .where(
+                                cast(Any, FleetLaunchState.project_id)
+                                == project.id,
+                                cast(Any, FleetLaunchState.agent_id)
+                                == existing_locator.agent_id,
+                            )
+                            .limit(1)
+                        )
+                    ).first()
+                    legacy_runtime = (
+                        await session.execute(
+                            select(RuntimeBinding.id)
+                            .where(
+                                cast(Any, RuntimeBinding.project_id) == project.id,
+                                cast(Any, RuntimeBinding.agent_id)
+                                == existing_locator.agent_id,
+                            )
+                            .limit(1)
+                        )
+                    ).first()
+                    legacy_is_adoptable = (
+                        proof_mode == "create"
+                        and expected_generation == 0
+                        and expected_agent_id is None
+                        and legacy_agent is not None
+                        and legacy_agent.id is not None
+                        and legacy_agent.retired_at is None
+                        and existing_locator.superseded_ts is None
+                        and (
+                            existing_locator.expires_ts is None
+                            or existing_locator.expires_ts > now
+                        )
+                        and (
+                            not requested_public_name
+                            or requested_public_name.casefold()
+                            == legacy_agent.name.casefold()
+                        )
+                        and legacy_marker is not None
+                        and legacy_marker.window_identity_id == existing_locator.id
+                        and legacy_assignment is None
+                        and legacy_launch is None
+                        and legacy_runtime is None
+                    )
+                    if not legacy_is_adoptable:
+                        raise ToolExecutionError(
+                            "WINDOW_LOCATOR_ALREADY_ASSIGNED",
+                            "The requested window locator is already assigned.",
+                        )
+                    agent = legacy_agent
+                    recovery_authority = (
+                        agent.registration_token or secrets.token_urlsafe(32)
+                    )
+                    agent.registration_token = recovery_authority
+                    assignment = LogicalAgentPrincipal(
+                        project_id=project.id,
+                        logical_agent_key=logical_agent_key,
+                        agent_id=agent.id,
+                        assignment_generation=1,
+                        assigned_ts=now,
+                    )
+                    session.add(agent)
+                    session.add(assignment)
+                    await session.flush()
+                    adopted_legacy_principal = True
                 if proof_mode != "create" or expected_generation != 0:
                     raise ToolExecutionError(
                         "LOGICAL_ASSIGNMENT_MISSING",
@@ -9966,54 +10055,58 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         "PRINCIPAL_MISMATCH",
                         "create cannot claim an existing agent id.",
                     )
-                if requested_public_name:
-                    public_name = requested_public_name
-                    if not validate_agent_name_format(public_name):
-                        raise ToolExecutionError(
-                            "INVALID_AGENT_NAME",
-                            "Controlled migration name is not a valid public Agent Mail name.",
-                        )
-                else:
-                    public_name = ""
-                    for _ in range(1024):
-                        candidate = sanitize_agent_name(generate_agent_name())
-                        if not candidate:
-                            continue
-                        exists = (
-                            await session.execute(
-                                select(Agent.id).where(
-                                    cast(Any, Agent.project_id) == project.id,
-                                    func.lower(cast(Any, Agent.name)) == candidate.lower(),
-                                )
+                if assignment is None:
+                    if requested_public_name:
+                        public_name = requested_public_name
+                        if not validate_agent_name_format(public_name):
+                            raise ToolExecutionError(
+                                "INVALID_AGENT_NAME",
+                                "Controlled migration name is not a valid public Agent Mail name.",
                             )
-                        ).first()
-                        if candidate and exists is None:
-                            public_name = candidate
-                            break
-                    if not public_name:
-                        raise RuntimeError("Unable to allocate a unique fleet agent name.")
-                recovery_authority = secrets.token_urlsafe(32)
-                agent = Agent(
-                    project_id=project.id,
-                    name=public_name,
-                    program="fleet-principal",
-                    model="unbound",
-                    task_description="",
-                    registration_token=recovery_authority,
-                )
-                session.add(agent)
-                await session.flush()
-                if agent.id is None:
-                    raise RuntimeError("Agent id was not allocated.")
-                assignment = LogicalAgentPrincipal(
-                    project_id=project.id,
-                    logical_agent_key=logical_agent_key,
-                    agent_id=agent.id,
-                    assignment_generation=1,
-                    assigned_ts=now,
-                )
-                session.add(assignment)
-                await session.flush()
+                    else:
+                        public_name = ""
+                        for _ in range(1024):
+                            candidate = sanitize_agent_name(generate_agent_name())
+                            if not candidate:
+                                continue
+                            exists = (
+                                await session.execute(
+                                    select(Agent.id).where(
+                                        cast(Any, Agent.project_id) == project.id,
+                                        func.lower(cast(Any, Agent.name))
+                                        == candidate.lower(),
+                                    )
+                                )
+                            ).first()
+                            if candidate and exists is None:
+                                public_name = candidate
+                                break
+                        if not public_name:
+                            raise RuntimeError(
+                                "Unable to allocate a unique fleet agent name."
+                            )
+                    recovery_authority = secrets.token_urlsafe(32)
+                    agent = Agent(
+                        project_id=project.id,
+                        name=public_name,
+                        program="fleet-principal",
+                        model="unbound",
+                        task_description="",
+                        registration_token=recovery_authority,
+                    )
+                    session.add(agent)
+                    await session.flush()
+                    if agent.id is None:
+                        raise RuntimeError("Agent id was not allocated.")
+                    assignment = LogicalAgentPrincipal(
+                        project_id=project.id,
+                        logical_agent_key=logical_agent_key,
+                        agent_id=agent.id,
+                        assignment_generation=1,
+                        assigned_ts=now,
+                    )
+                    session.add(assignment)
+                    await session.flush()
             else:
                 agent = await session.get(Agent, assignment.agent_id)
                 if agent is None or agent.id is None:
@@ -10118,31 +10211,37 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     )
             staged_identity: WindowIdentity
             if proof_mode == "create":
-                if current_marker is not None:
+                if current_marker is not None and not adopted_legacy_principal:
                     raise ToolExecutionError(
                         "AUTHORITY_CONFLICT",
                         "New principal unexpectedly already has current authority.",
                     )
-                staged_identity = WindowIdentity(
-                    project_id=project.id,
-                    agent_id=agent.id,
-                    window_uuid=window_locator,
-                    display_name=agent.name,
-                    created_ts=now,
-                    last_active_ts=now,
-                    expires_ts=now
-                    + timedelta(days=getattr(settings, "window_identity_ttl_days", 30)),
-                )
-                session.add(staged_identity)
-                await session.flush()
-                await _activate_window_identity_marker(
-                    session,
-                    project_id=project.id,
-                    agent_id=agent.id,
-                    identity=staged_identity,
-                    allow_replace=False,
-                    now=now,
-                )
+                if adopted_legacy_principal:
+                    assert current_identity is not None
+                    staged_identity = current_identity
+                else:
+                    staged_identity = WindowIdentity(
+                        project_id=project.id,
+                        agent_id=agent.id,
+                        window_uuid=window_locator,
+                        display_name=agent.name,
+                        created_ts=now,
+                        last_active_ts=now,
+                        expires_ts=now
+                        + timedelta(
+                            days=getattr(settings, "window_identity_ttl_days", 30)
+                        ),
+                    )
+                    session.add(staged_identity)
+                    await session.flush()
+                    await _activate_window_identity_marker(
+                        session,
+                        project_id=project.id,
+                        agent_id=agent.id,
+                        identity=staged_identity,
+                        allow_replace=False,
+                        now=now,
+                    )
             elif proof_mode == "retry_failed_create":
                 assert current_identity is not None
                 staged_identity = current_identity
@@ -10275,7 +10374,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 actor_kind="owner",
                 actor_scope_id=f"fleet-controller/{logical_agent_key}",
                 actor_agent_id=agent.id,
-                operation_kind="fleet_principal_ensured_v1",
+                operation_kind=(
+                    "fleet_legacy_principal_adopted_v1"
+                    if adopted_legacy_principal
+                    else "fleet_principal_ensured_v1"
+                ),
                 entity_type="logical_agent_principal",
                 entity_id=str(assignment.id),
                 payload_version="fleet-principal-v1",
@@ -10284,6 +10387,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "launch_attempt_id": launch_attempt_id,
                     "proof_mode": proof_mode,
                     "expected_generation": expected_generation,
+                    "adopted_legacy_principal": adopted_legacy_principal,
                 },
             )
             response: dict[str, Any] = {
@@ -10298,6 +10402,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 "staged_locator_digest": launch_state.staged_locator_digest,
                 "overall": "starting",
             }
+            if adopted_legacy_principal:
+                response["adopted_legacy_principal"] = True
             if recovery_authority is not None:
                 response["agent_recovery_authority"] = recovery_authority
             return MutationReceipt(
