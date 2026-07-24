@@ -1,285 +1,384 @@
 ---
 name: agent-mail
-description: "MCP Agent Mail - Mail-like coordination layer for multi-agent workflows. Identities, inbox/outbox, file reservations, contact policies, threaded messaging, pre-commit guard, Human Overseer, static exports, disaster recovery. Git+SQLite backed. Python/FastMCP."
+description: >-
+  MCP Agent Mail for multi-agent coordination. Use when agents need file locks,
+  messaging, inboxes, or conflict prevention. Handles macro_start_session,
+  file_reservation_paths, send_message, threading, pre-commit guards.
 ---
 
-# MCP Agent Mail
+<!-- TOC: Deployment Mode | Bootstrap | Core Ops | File Reservations | Beads | Troubleshooting | Identity | Human Overseer | Pre-Commit Guard | References -->
 
-A mail-like coordination layer for coding agents exposed as an HTTP-only FastMCP server. Provides memorable identities, inbox/outbox, file reservation leases, contact policies, searchable message history, and Human Overseer messaging. Backed by Git (human-auditable artifacts) and SQLite (fast queries with FTS5).
+# Using MCP Agent Mail
 
-## Why This Exists
+> **Core Insight:** Without coordination, multiple agents overwrite each other's work. Agent Mail provides identities, messaging, and file reservations to prevent conflicts.
 
-Without coordination, multiple agents:
-- Overwrite each other's edits or panic on unexpected diffs
-- Miss critical context from parallel workstreams
-- Require humans to relay messages between tools
+## When to Use What
 
-Agent Mail solves this with:
-- Memorable identities (adjective+noun names like "GreenCastle")
-- Advisory file reservations to signal editing intent
-- Threaded messaging with importance levels and acknowledgments
-- Pre-commit guard to enforce reservations at commit time
-- Human Overseer for direct human-to-agent communication
+| Situation | Action |
+|-----------|--------|
+| Starting in legacy/migration mode | `macro_start_session` |
+| Starting in core mode | Use the managed registration flow below; do not use `macro_start_session` for first registration |
+| About to edit files | `file_reservation_paths` → edit → `release_file_reservations` |
+| Need to tell another agent something | `send_message` with `thread_id` and a stable `idempotency_key` |
+| Mail notification or phase boundary | Core: `sync_inbox` → `read_messages` → `mark_message_read`/`acknowledge_message`; legacy/migration may batch with `update_messages` |
+| Picking up someone else's work | Core: read the thread/inbox directly; legacy/migration: `macro_prepare_thread` |
+| Can't message an agent | Core: stop and coordinate out of band; contact mutation tools remain legacy/migration |
+| Server seems broken | Check liveness and readiness separately, then use `health_check()`; do not retry a timed-out write with a new idempotency key |
 
-## Starting the Server
+---
 
-```bash
-# Quickest way (alias added during install)
-am
+## Deployment Mode
 
-# Or manually
-cd ~/projects/mcp_agent_mail
-./scripts/run_server_with_token.sh
+Agent Mail has two operational contracts:
+
+- **Core (`RUNTIME_PROFILE=core`)**: SQLite plus content-addressed blobs are authoritative. Runtime messaging does not require Git. Registration is managed, names are explicit, retryable mutations use their documented idempotency/fencing contract, and durable pane authentication uses an opaque pane bearer.
+- **Legacy/migration**: the Git archive remains available and the historical macros and auto-registration behavior still apply.
+
+Do not infer the mode from the fact that the collaborating code repository uses Git. "Git-independent" means Agent Mail's own runtime persistence no longer shells out to Git; it does not mean user repositories stop using Git.
+
+For rollout and operator requirements, read [CORE-DEPLOYMENT.md](references/CORE-DEPLOYMENT.md).
+
+---
+
+## Session Bootstrap
+
+### Core mode (new deployment)
+
+First registration is a controller-mediated flow:
+
+1. The launcher supplies a stable, pane-scoped UUID as `X-MCP-Agent-Mail-Window-ID`. A compatibility `Authorization: Bearer mcp-window:<uuid>` routing carrier exists only for deployments that do not already use Authorization for HTTP bearer/JWT authentication. The UUID scopes registration but does not authenticate the pane.
+2. An owner-authorized controller ensures the project and issues a short-lived bootstrap credential for that UUID.
+3. Call `register_agent` with an explicit stable `name`, the bootstrap credential, and one stable `idempotency_key`.
+4. Securely persist the returned `pane_credential` outside prompts, logs, tmux options, and repository files.
+5. Inject it on later HTTP requests as `X-MCP-Agent-Mail-Pane-Credential`. The alias `X-Agent-Mail-Pane-Credential` is also accepted.
+
+```text
+register_agent(
+  project_key="/abs/path/to/project",
+  program="claude-code",
+  model="YOUR_MODEL",
+  name="GreenCastle",
+  task_description="Working on auth module",
+  bootstrap_credential=<securely supplied bootstrap>,
+  idempotency_key="register:GreenCastle:attempt-1"
+)
 ```
 
-Default: `http://127.0.0.1:8765`
-Web UI for humans: `http://127.0.0.1:8765/mail`
+Never print, paste into chat, or commit `CORE_OWNER_TOKEN`, bootstrap credentials, registration tokens, pane credentials, or credential peppers. On a timeout, replay the exact request with the exact same idempotency key.
 
-## Core Concepts
+`macro_start_session` does not yet implement the managed first-registration contract. Use it only in legacy/migration mode or for a deployment that explicitly wraps it with managed registration.
 
-### Projects
-Each working directory (absolute path) is a project. Agents in the same directory share a project namespace. Use the same `project_key` for agents that need to coordinate.
-
-### Agent Identity
-Agents register with adjective+noun names (GreenCastle, BlueLake). Names are unique per project, memorable, and appear in inboxes, commit logs, and the web UI.
-
-### File Reservations (Leases)
-Advisory locks on file paths or globs. Before editing files, reserve them to signal intent. Other agents see the reservation and can choose different work. The optional pre-commit guard blocks commits that conflict with others' exclusive reservations.
-
-### Contact Policies
-Per-agent policies control who can message whom:
-
-| Policy | Behavior |
-|--------|----------|
-| `open` | Accept any message in the project |
-| `auto` (default) | Allow if shared context exists (same thread, overlapping reservations, recent contact) |
-| `contacts_only` | Require explicit contact approval first |
-| `block_all` | Reject all new contacts |
-
-### Messages
-GitHub-Flavored Markdown with threading, importance levels (`low`, `normal`, `high`, `urgent`), and optional acknowledgment requirements. Images are auto-converted to WebP.
-
-## Essential Workflow
-
-### 1. Start Session (One-Call Bootstrap)
+### Legacy/migration mode
 
 ```
 macro_start_session(
   human_key="/abs/path/to/project",
   program="claude-code",
-  model="opus-4.5",
-  task_description="Implementing auth module"
+  model="YOUR_MODEL",
+  task_description="Working on auth module"
 )
 ```
 
 Returns: `{project, agent, file_reservations, inbox}`
 
-This single call: ensures project exists, registers your identity, optionally reserves files, fetches your inbox.
+This single call: ensures project exists → registers your identity → fetches inbox.
 
-### 2. Reserve Files Before Editing
+If the agent is running in tmux, immediately bind the returned Agent Mail identity to the pane:
+
+```bash
+tmux-agent-bind-mail \
+  --pane "$TMUX_PANE" \
+  --project "/abs/path/to/project" \
+  --agent "<agent.name from macro_start_session>" \
+  --agent-id "<agent.id from macro_start_session>" \
+  --program "claude-code" \
+  --model "YOUR_MODEL" \
+  --task "Working on auth module" \
+  --source macro_start_session \
+  --verified
+```
+
+This lets `tmux-agent-panes`, `tmux-agent-who`, and `tmux-agent-send --to-agent ...` map Agent Mail
+names to live tmux panes. This local routing record is not authentication. In core mode, only the
+server-issued pane credential (or an explicitly accepted recovery credential) grants durable sender
+authority across MCP reconnects.
+
+---
+
+## Core Operations
+
+| Task | Tool |
+|------|------|
+| Bootstrap legacy session | `macro_start_session(human_key, program, model, task_description)` |
+| Register core session | controller bootstrap → `register_agent(..., name, bootstrap_credential, idempotency_key)` |
+| Stage a fleet launch | `ensure_fleet_principal(...)` with owner authority, expected generation, supervisor sequence, and stable launch/idempotency ids |
+| Activate a fleet runtime | `activate_fleet_runtime(...)` with the Phase-A receipt, exact process/route facts, recovery authority, and the next supervisor sequence |
+| Continue the same provider session | Current runtime calls `issue_continuation_receipt(...)`; launcher uses `continue_with_receipt` through ensure/activate |
+| Publish fleet readiness | `publish_fleet_runtime_observation(...)` after exact route readback and identity-context injection |
+| Project exhausted launch failure | `publish_fleet_launch_state(..., coordination_state="failed")`; supports a nullable-principal pre-Phase-A row |
+| End an exactly absent stale runtime | `end_fleet_runtime_absent(...)` with two fresh absence events and exact runtime fences |
+| Send message | `send_message(project_key, to, subject, body_md, idempotency_key)`; identity may come from pane bearer |
+| Reply in thread | `reply_message(project_key, message_id, body_md, idempotency_key)`; identity may come from pane bearer |
+| Synchronize inbox | `sync_inbox(project_key, agent_name, cursor)` |
+| Read selected bodies | `read_messages(project_key, agent_name, message_ids)` |
+| Mark read / acknowledge in core | `mark_message_read(...)` / `acknowledge_message(...)` |
+| Batch read / acknowledge (legacy/migration) | `update_messages(project_key, agent_name, read_ids, acknowledge_ids)` |
+| Reserve files | `file_reservation_paths(project_key, agent_name, paths, ttl_seconds, idempotency_key)` |
+| Release files | `release_file_reservations(project_key, agent_name, idempotency_key)` |
+| Search messages | `search_messages(project_key, "query")` |
+
+### Core Write Rule
+
+Use a stable, unique `idempotency_key` for each logical send, reply, reservation acquire/renew/release, and every other retryable core mutation that exposes that parameter. If the client times out, retry the byte-for-byte equivalent logical request with the same key. Never mint a new key merely because the response was lost; that converts an ambiguous success into a possible duplicate. Direct mark/ack operations are naturally idempotent; owner credential lifecycle operations use owner authority and, where documented, generation fencing.
+
+In stateless HTTP core deployments, prefer header-based pane authentication and omit secret tool arguments. Compatibility aliases `agent_name` and `registration_token` still exist for send/reply recovery paths, but they are not the normal durable-pane transport.
+
+### Managed Fleet Lifecycle
+
+Use the fleet contract for tmux-supervised Codex, Claude, and Grok runtimes:
+
+1. Stage with `ensure_fleet_principal`. For every non-create proof, supply the exact active `expected_generation`; a stale value must fail before launch state or authority is changed.
+2. Launch or resume the provider process.
+3. Activate with `activate_fleet_runtime` using the Phase-A receipt and exact host, boot, tmux, pane, process, and provider-session facts.
+4. Read the route back through the target pane carrier, inject identity context, then publish readiness with `publish_fleet_runtime_observation`.
+5. If provider launch/proof fails after staging, sequence-advance desired state
+   and call `publish_fleet_launch_state(..., coordination_state="failed",
+   identity_context_injected=false)`. Replay it through the supervisor journal.
+
+An exhausted failure before principal creation uses the same terminal
+projection. It may create the normalized project and a nullable-principal
+`launch_failed` roster row. Its higher supervisor sequence fences any delayed
+older Phase-A replay. If the projection committed but its response was lost,
+replay the identical supervisor sequence and full state payload; exact replay
+succeeds, while any changed same-sequence payload remains fenced.
+
+Do not end stale runtimes from time or heartbeat age alone. The controller must
+call `end_fleet_runtime_absent` with two distinct, current-generation events:
+fresh absence of the immutable pane instance and fresh absence of the exact
+provider PID/process-start tuple. Both must be no older than 45 seconds and the
+last healthy observation must be at least five minutes old. Success ends only
+that runtime generation and leaves the durable principal as `durable_only`.
+The supervisor must journal the runtime incarnation and pane instance from the
+pane event plus the PID/start tuple from the process event; the adapter checks
+those facts against persisted Phase-B state before the server mutation.
+Observer outage, unreachable inventory, one-sided absence, or changed identity
+fails closed.
+
+In the installed fleet, the periodic `fleet-observer` is the normal producer
+of those proofs. It performs one shared tmux→libproc→tmux census, requires the
+exact `cx`, `clx`, or `gx` registry entry before publishing health, records the
+two absence rows atomically after the grace period, and delegates retirement
+through the supervisor journal. Treat `operational=false`, degraded/old
+status, registry mismatch, or one-sided absence as unavailable evidence; do
+not hand-create proof rows or infer runtime end from heartbeat age.
+
+For an exact-session respawn, issue a short-lived receipt from the authoritative runtime, then use `proof_mode=continue_with_receipt` for both phases. Preserve `runtime_session_id`, advance runtime generation, and use a fresh pane carrier. The agent profile intentionally exposes `issue_continuation_receipt` but not direct `consume_continuation_receipt`; activation performs single-use consumption atomically. A consumed, expired, differently reserved, or stale-generation receipt must fail without moving authority.
+
+Use `rotate_or_takeover` only with an explicit reason. Use `resume_same_authority` only when the current locator remains authoritative. Replay an exact successful request with its original idempotency key; changed payloads require a new logical operation and key.
+
+In the installed fleet, `cx`, `clx`, `gx`, and `fleet-supervisor` are the normal
+callers of this contract. An agent launched through those wrappers should
+already have model-visible public identity context and authenticated pane
+authority when its roster row becomes `live`. It must not call
+`macro_start_session`, choose another name, or manually bind a pane as part of
+normal startup.
+
+The fleet launch wrapper consumes controller/registration authority before
+provider exec. Provider environments retain the pane-scoped HTTP window bearer
+but must not retain `CORE_OWNER_TOKEN`, Agent Mail owner-token variables, or
+Agent Mail registration-token variables.
+
+The supervisor owns desired state, launch attempts, sequence ordering, and
+replay. Agent Mail owns the durable principal, current authority, runtime CAS,
+roster projection, and messages. Tmux binding metadata is public route
+evidence only.
+
+### Token-Efficient Inbox Protocol
+
+1. Keep the last `next_cursor` in session/task state.
+2. Call `sync_inbox` only after a notification or at a meaningful workflow boundary, not after every edit.
+3. Inspect metadata, then call `read_messages` once with only the message ids whose bodies are needed.
+4. In core mode, call `mark_message_read` or `acknowledge_message` for the selected ids. Use `update_messages` batching only in legacy/migration mode until that path is upgraded to the core audit/route contract.
+5. Continue using `send_message` and `reply_message`; their receipts do not echo the authored body.
+
+Use legacy `fetch_inbox` only when cursor sync is unavailable or a specialized recent-history query is required. Do not repeatedly fetch full bodies without `since_ts`.
+
+### The Four Legacy/Migration Macros
+
+The current macros predate managed core registration and do not consistently
+carry core idempotency inputs. Do not use them as core-mode mutation wrappers
+unless the deployment has explicitly upgraded their contracts.
+
+| Macro | When to Use |
+|-------|-------------|
+| `macro_start_session` | Bootstrap: project → agent → inbox |
+| `macro_prepare_thread` | Join existing thread with summary |
+| `macro_file_reservation_cycle` | Reserve → work → auto-release |
+| `macro_contact_handshake` | Cross-agent contact setup (legacy/migration only) |
+
+### Fast Resource Reads (No Tool Call Required)
+
+| Need | Resource |
+|------|----------|
+| List agents | `resource://agents/{project_key}` |
+| Inbox | `resource://inbox/{agent}?project=/abs/path&limit=20` |
+| Thread | `resource://thread/{thread_id}?project=/abs/path&include_bodies=true` |
+| Ack-required | `resource://views/ack-required/{agent}?project=/abs/path` |
+
+---
+
+## File Reservations
+
+### Reserve Before Editing
 
 ```
 file_reservation_paths(
-  project_key="/abs/path/to/project",
+  project_key="/abs/path/project",
   agent_name="GreenCastle",
-  paths=["src/auth/**/*.ts", "src/middleware/auth.ts"],
+  paths=["src/auth/**/*.ts"],
   ttl_seconds=3600,
   exclusive=true,
-  reason="bd-123"
+  reason="bd-123",
+  idempotency_key="reserve:bd-123:auth-files:v1"
 )
 ```
 
 Returns: `{granted: [...], conflicts: [...]}`
 
-Conflicts are reported but reservations are still granted. Check conflicts and coordinate if needed.
+### Conflict Resolution
 
-### 3. Announce Your Work
+If conflicts exist:
+1. **Wait** — TTL will expire
+2. **Coordinate** — Message the holder
+3. **Share** — Use `exclusive=false`
 
-```
-send_message(
-  project_key="/abs/path/to/project",
-  sender_name="GreenCastle",
-  to=["BlueLake"],
-  subject="[bd-123] Starting auth refactor",
-  body_md="Reserving src/auth/**. Will update session handling.",
-  thread_id="bd-123",
-  importance="normal",
-  ack_required=true
-)
-```
-
-### 4. Check Inbox Periodically
-
-```
-fetch_inbox(
-  project_key="/abs/path/to/project",
-  agent_name="GreenCastle",
-  limit=20,
-  urgent_only=false,
-  include_bodies=true
-)
-```
-
-Or use resources for fast reads:
-```
-resource://inbox/GreenCastle?project=/abs/path&limit=20&include_bodies=true
-```
-
-### 5. Release Reservations When Done
+### Release When Done
 
 ```
 release_file_reservations(
-  project_key="/abs/path/to/project",
-  agent_name="GreenCastle"
+  project_key="/abs/path/project",
+  agent_name="GreenCastle",
+  idempotency_key="release:bd-123:auth-files:v1"
 )
 ```
 
-## The Four Macros
+---
 
-Prefer macros for speed and smaller models. Use granular tools when you need fine control.
+## Beads Integration
 
-| Macro | Purpose |
-|-------|---------|
-| `macro_start_session` | Bootstrap: ensure project → register agent → optional file reservations → fetch inbox |
-| `macro_prepare_thread` | Join existing conversation: register → summarize thread → fetch inbox context |
-| `macro_file_reservation_cycle` | Reserve files, do work, optionally auto-release when done |
-| `macro_contact_handshake` | Request contact permission, optionally auto-accept, send welcome message |
-
-## Beads Integration (bd-### Workflow)
-
-When using Beads for task management, keep identifiers aligned:
+Use bead IDs as your threading anchor:
 
 ```
-1. Pick ready work:     bd ready --json → choose bd-123
-2. Reserve files:       file_reservation_paths(..., reason="bd-123")
-3. Announce start:      send_message(..., thread_id="bd-123", subject="[bd-123] Starting...")
-4. Work and update:     Reply in thread with progress
-5. Complete:            bd close bd-123
-                        release_file_reservations(...)
-                        send_message(..., subject="[bd-123] Completed")
+1. Pick work:        br ready --json → choose bd-123
+2. Reserve files:    file_reservation_paths(..., reason="bd-123", idempotency_key="reserve:bd-123:v1")
+3. Announce:         send_message(..., thread_id="bd-123", subject="[bd-123] Starting...", idempotency_key="send:bd-123:start:v1")
+4. Work:             Reply in thread with progress
+5. Complete:         br close bd-123, release_file_reservations(..., idempotency_key="release:bd-123:v1"), final keyed message
 ```
 
-Use `bd-###` as:
-- Mail `thread_id`
-- Message subject prefix `[bd-###]`
-- File reservation `reason`
-- Commit message reference
+**Bead ID (often bd-###) goes in:** thread_id, subject prefix, reservation reason, commit message
 
-## Beads Viewer (bv) Integration
+---
 
-Use bv's robot flags for intelligent task selection:
+## Quick Troubleshooting
 
-| Flag | Output | Use Case |
-|------|--------|----------|
-| `bv --robot-insights` | PageRank, critical path, cycles | "What's most impactful?" |
-| `bv --robot-plan` | Parallel tracks, unblocks | "What can run in parallel?" |
-| `bv --robot-priority` | Recommendations with confidence | "What should I work on next?" |
-| `bv --robot-diff --diff-since <ref>` | Changes since commit/date | "What changed?" |
+| Error | Fix |
+|-------|-----|
+| `MANAGED_REGISTRATION_REQUIRED` | Core mode needs a controller-issued bootstrap credential plus an idempotency key |
+| `PANE_IDENTITY_REQUIRED` | Relaunch with a valid pane-scoped window UUID carrier before registration |
+| `AUTHENTICATION_REQUIRED` | Restore the pane credential header; owner recovery may reissue a bearer, but UUID/name metadata alone is not authority |
+| "sender_name not registered" | In core mode use managed registration; in legacy/migration mode call `macro_start_session` |
+| Timed-out write | Retry the same logical request with the same idempotency key; check the inbox/receipt before creating a new operation |
+| Idempotency mismatch/expired receipt | Do not reuse the key for different content; preserve the original request or start a deliberately new logical operation |
+| "FILE_RESERVATION_CONFLICT" | Wait, coordinate, or use `exclusive=false` |
+| "CONTACT_BLOCKED" | Core: stop and coordinate out of band; `request_contact` and contact macros are not yet core-safe |
+| Empty inbox | Check `cursor`, `since_ts`, `urgent_only`, and agent name spelling |
+| Server unreachable | Check `/health/liveness`, then `/health/readiness`; liveness alone does not authorize writes |
+| Claude lacks Agent Mail tools | Check `claude mcp get mcp-agent-mail`. Current Claude Code reads user-scope MCP servers from root `~/.claude.json`; a legacy `~/.claude/settings.json` `mcpServers` block alone is not enough. Re-add with `claude mcp add-json --scope user mcp-agent-mail ...`, then restart/resume the Claude pane if tools are still missing. |
+| Guard blocks commit | Set `AGENT_NAME` env var; bypass: `AGENT_MAIL_BYPASS=1 git commit` |
 
-**Rule of thumb:** Use `bd` for task operations, use `bv` for task intelligence.
+### HTTP Diagnostics
 
-## Cross-Project Coordination
+```bash
+# Process is serving HTTP
+curl -fsS http://127.0.0.1:8765/health/liveness
 
-For frontend/backend or multi-repo projects:
-
-**Option A: Shared project_key**
-Both repos use the same `project_key`. Agents coordinate automatically.
-
-**Option B: Separate projects with contact links**
+# Storage and startup state are ready
+curl -fsS http://127.0.0.1:8765/health/readiness
 ```
-# Backend agent requests contact with frontend agent
-request_contact(
-  project_key="/abs/path/backend",
-  from_agent="GreenCastle",
-  to_agent="BlueLake",
-  to_project="/abs/path/frontend",
-  reason="API contract coordination"
+
+### Legacy/Migration Doctor Diagnostics (CLI-only, optional)
+
+The current doctor/repair CLI imports legacy storage and may require the
+optional Git dependency. Do not run it against a core deployment. For core,
+use liveness/readiness plus database audit-ledger and blob-store diagnostics
+from the deployment runbook.
+
+```bash
+# Full diagnostics (CLI)
+uv run python -m mcp_agent_mail.cli doctor check --verbose
+
+# Preview repairs (dry run, CLI)
+uv run python -m mcp_agent_mail.cli doctor repair --dry-run
+
+# Apply repairs (CLI)
+uv run python -m mcp_agent_mail.cli doctor repair --yes
+```
+
+---
+
+## Agent Identity
+
+Agents may use adjective+noun names such as GreenCastle, BlueLake, and RedBear,
+or stable explicit IDs matching `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` such as
+`core-1` or `worker_42`. Descriptive role names may still be rejected by a
+deployment's stricter naming policy.
+
+In core mode, an explicit stable name is required. Auto-generation is legacy/migration behavior only.
+
+```
+register_agent(
+  project_key="/abs/path/project",
+  program="claude-code",
+  model="YOUR_MODEL",
+  name="GreenCastle",
+  task_description="Auth refactor",
+  bootstrap_credential=<securely supplied bootstrap>,
+  idempotency_key="register:GreenCastle:attempt-1"
 )
-
-# Frontend agent accepts
-respond_contact(
-  project_key="/abs/path/frontend",
-  to_agent="BlueLake",
-  from_agent="GreenCastle",
-  accept=true
-)
 ```
+
+`agent_name` is a public identifier. `registration_token` and `pane_credential` are secrets. A tmux pane label containing the agent name is useful for routing but cannot replace the credential.
+
+---
+
+## Human Overseer (Legacy/Migration Only)
+
+The current web compose/send route does not implement the core atomic,
+idempotent audit contract and is rejected before mutation in core mode. Do not
+use it for core projects.
+
+Send urgent messages to agents from the web UI at `http://127.0.0.1:8765/mail`:
+
+1. Click "Human Overseer" mode
+2. Compose with `importance: urgent`
+3. Select target agents
+
+Agents see urgent messages via `fetch_inbox(..., urgent_only=true)`.
+
+---
 
 ## Pre-Commit Guard
 
-Install the guard to block commits that conflict with others' exclusive reservations:
-
 ```
-install_precommit_guard(
-  project_key="/abs/path/to/project",
-  code_repo_path="/abs/path/to/project"
-)
+install_precommit_guard(project_key="/abs/path", code_repo_path="/abs/path")
 ```
 
-### Guard Features
-- **Composition-safe**: Chain-runner preserves existing hooks in `hooks.d/`
-- **Rename-aware**: Checks both old and new paths for renames/moves
-- **NUL-safe**: Handles paths with special characters
-- **Git-native matching**: Uses Git wildmatch pathspec semantics
+- Set `AGENT_NAME` env var so guard knows who you are
+- Bypass emergency: `AGENT_MAIL_BYPASS=1 git commit -m "fix"`
+- Warning mode: `AGENT_MAIL_GUARD_MODE=warn`
 
-Set `AGENT_NAME` environment variable so the guard knows who you are.
-
-Bypass in emergencies: `AGENT_MAIL_BYPASS=1 git commit ...`
-
-## Tools Reference
-
-### Project & Identity
-
-| Tool | Purpose |
-|------|---------|
-| `ensure_project(human_key)` | Create/ensure project exists |
-| `register_agent(project_key, program, model, name?, task_description?)` | Register identity |
-| `whois(project_key, agent_name)` | Get agent profile with recent commits |
-| `create_agent_identity(project_key, program, model)` | Always create new unique agent |
-
-### Messaging
-
-| Tool | Purpose |
-|------|---------|
-| `send_message(project_key, sender, to, subject, body_md, ...)` | Send message |
-| `reply_message(project_key, message_id, sender, body_md)` | Reply (preserves thread) |
-| `fetch_inbox(project_key, agent, limit?, since_ts?, urgent_only?)` | Get messages |
-| `mark_message_read(project_key, agent, message_id)` | Mark as read |
-| `acknowledge_message(project_key, agent, message_id)` | Acknowledge receipt |
-| `search_messages(project_key, query)` | FTS5 search |
-| `summarize_thread(project_key, thread_id)` | Extract key points and actions |
-
-### File Reservations
-
-| Tool | Purpose |
-|------|---------|
-| `file_reservation_paths(project_key, agent, paths, ttl?, exclusive?)` | Reserve files |
-| `release_file_reservations(project_key, agent, paths?)` | Release reservations |
-| `renew_file_reservations(project_key, agent, extend_seconds?)` | Extend TTL |
-| `force_release_file_reservation(project_key, agent, reservation_id)` | Clear stale reservation |
-
-### Contact Management
-
-| Tool | Purpose |
-|------|---------|
-| `request_contact(project_key, from_agent, to_agent, reason?)` | Request permission to message |
-| `respond_contact(project_key, to_agent, from_agent, accept)` | Accept/deny contact request |
-| `list_contacts(project_key, agent_name)` | List contact links |
-| `set_contact_policy(project_key, agent_name, policy)` | Set open/auto/contacts_only/block_all |
-
-## Resources (Fast Reads)
-
-Use resources for quick, non-mutating reads:
-
-```
-resource://inbox/{agent}?project=<path>&limit=20&include_bodies=true
-resource://thread/{thread_id}?project=<path>&include_bodies=true
-resource://message/{id}?project=<path>
-resource://file_reservations/{slug}?active_only=true
-resource://project/{slug}
-resource://projects
-resource://agents/{project_key}
-```
+---
 
 ## Search Syntax (FTS5)
 
@@ -288,134 +387,36 @@ resource://agents/{project_key}
 prefix*
 term1 AND term2
 term1 OR term2
-subject:login
-body:"api key"
 (auth OR login) AND NOT admin
 ```
 
-Example: `search_messages(project_key, '"auth module" AND error NOT legacy')`
+---
 
-## Web UI Features
+## References
 
-Browse at `http://127.0.0.1:8765/mail`:
+| Topic | Reference |
+|-------|-----------|
+| All MCP tools | [TOOLS.md](references/TOOLS.md) |
+| Workflow patterns | [WORKFLOWS.md](references/WORKFLOWS.md) |
+| MCP resources | [RESOURCES.md](references/RESOURCES.md) |
+| Cross-project setup | [CROSS-PROJECT.md](references/CROSS-PROJECT.md) |
+| Doctor & recovery | [RECOVERY.md](references/RECOVERY.md) |
+| Installation | [INSTALL.md](references/INSTALL.md) |
+| Fix MCP config | [FIX-MCP-CONFIG.md](references/FIX-MCP-CONFIG.md) |
+| Core deployment and credential lifecycle | [CORE-DEPLOYMENT.md](references/CORE-DEPLOYMENT.md) |
+| Product bus, build slots, internals | [ADVANCED.md](references/ADVANCED.md) |
 
-- **Unified inbox** across all projects
-- **Per-project search** with FTS5
-- **Thread viewer** with markdown rendering
-- **File reservations** browser
-- **Human Overseer**: Send high-priority messages to agents from the web UI
-- **Related Projects Discovery**: AI-powered suggestions for linking repos
+---
 
-### Human Overseer
-
-Send direct messages to agents with automatic preamble:
-- Messages marked as `high` importance
-- Bypasses contact policies
-- Agents are instructed to pause current work, complete request, then resume
-
-## Static Mailbox Export
-
-Export projects to portable, read-only bundles for auditors, stakeholders, or archives:
+## Validation
 
 ```bash
-# Interactive wizard (recommended)
-uv run python -m mcp_agent_mail.cli share wizard
+# Server health
+curl -fsS http://127.0.0.1:8765/health/liveness
+# → {"status":"alive"}
+curl -fsS http://127.0.0.1:8765/health/readiness
+# → {"status":"ready"}
 
-# Manual export
-uv run python -m mcp_agent_mail.cli share export --output ./bundle
-
-# With signing
-uv run python -m mcp_agent_mail.cli share export \
-  --output ./bundle \
-  --signing-key ./keys/signing.key
-
-# Preview locally
-uv run python -m mcp_agent_mail.cli share preview ./bundle
+# Start server if needed
+am
 ```
-
-### Export Features
-- Ed25519 cryptographic signing
-- Age encryption for confidential distribution
-- Scrub presets: `standard` (removes secrets) or `strict` (redacts bodies)
-- Deploy to GitHub Pages or Cloudflare Pages via wizard
-
-## Disaster Recovery
-
-```bash
-# Save current state
-uv run python -m mcp_agent_mail.cli archive save --label nightly
-
-# List restore points
-uv run python -m mcp_agent_mail.cli archive list --json
-
-# Restore after disaster
-uv run python -m mcp_agent_mail.cli archive restore <file>.zip --force
-```
-
-## Mailbox Health (Doctor)
-
-```bash
-# Run diagnostics
-uv run python -m mcp_agent_mail.cli doctor check
-
-# Preview repairs
-uv run python -m mcp_agent_mail.cli doctor repair --dry-run
-
-# Apply repairs (creates backup first)
-uv run python -m mcp_agent_mail.cli doctor repair
-```
-
-Checks: stale locks, database integrity, orphaned records, FTS sync, expired reservations.
-
-## Common Pitfalls
-
-| Error | Fix |
-|-------|-----|
-| "sender_name not registered" | Call `register_agent` or `macro_start_session` first |
-| "FILE_RESERVATION_CONFLICT" | Wait for expiry, coordinate, or use non-exclusive |
-| "CONTACT_BLOCKED" | Use `request_contact` and wait for approval |
-| Empty inbox | Check `since_ts`, `urgent_only`, verify agent name matches exactly |
-
-## Installation
-
-```bash
-# One-liner (recommended)
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail/main/scripts/install.sh?$(date +%s)" | bash -s -- --yes
-
-# Custom port
-curl -fsSL ... | bash -s -- --port 9000 --yes
-
-# Change port after installation
-uv run python -m mcp_agent_mail.cli config set-port 9000
-```
-
-## Key Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STORAGE_ROOT` | `~/.mcp_agent_mail_git_mailbox_repo` | Root for repos and SQLite DB |
-| `HTTP_PORT` | `8765` | Server port |
-| `HTTP_BEARER_TOKEN` | — | Static bearer token for auth |
-| `LLM_ENABLED` | `true` | Enable LLM for summaries/discovery |
-| `CONTACT_ENFORCEMENT_ENABLED` | `true` | Enforce contact policy |
-
-## Docker
-
-```bash
-docker build -t mcp-agent-mail .
-docker run --rm -p 8765:8765 \
-  -e HTTP_HOST=0.0.0.0 \
-  -v agent_mail_data:/data \
-  mcp-agent-mail
-```
-
-## Integration with Flywheel
-
-| Tool | Integration |
-|------|-------------|
-| **NTM** | Agent panes coordinate via mail, dashboard shows inbox |
-| **BV** | Task IDs become thread IDs, robot flags inform task selection |
-| **CASS** | Search mail threads across sessions |
-| **CM** | Extract procedural memory from mail archives |
-| **DCG** | Mail notifies agents of blocked commands |
-| **RU** | Coordinate multi-repo updates via cross-project mail |
