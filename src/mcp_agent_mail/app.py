@@ -9560,14 +9560,23 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         runtime_incarnation_id: str | None = None,
     ) -> str:
         project_hash = hashlib.sha256(canonical_project.encode()).hexdigest()
-        expected = (
-            f"ensure-principal:v1:{project_hash}:{logical_agent_key}:{launch_attempt_id}"
-            if phase == "ensure"
-            else (
+        if phase == "ensure":
+            expected = (
+                f"ensure-principal:v1:{project_hash}:{logical_agent_key}:"
+                f"{launch_attempt_id}"
+            )
+        elif phase == "activate":
+            expected = (
                 f"activate-runtime:v1:{project_hash}:{logical_agent_key}:"
                 f"{launch_attempt_id}:{runtime_incarnation_id}"
             )
-        )
+        elif phase == "end_absent":
+            expected = (
+                f"end-absent-runtime:v1:{project_hash}:{logical_agent_key}:"
+                f"{runtime_incarnation_id}"
+            )
+        else:
+            raise RuntimeError(f"Unsupported fleet idempotency phase: {phase}")
         if idempotency_key != expected:
             raise ToolExecutionError(
                 "INVALID_IDEMPOTENCY_KEY",
@@ -10098,7 +10107,6 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             if (
                 launch_state is not None
                 and supervisor_sequence <= launch_state.supervisor_sequence
-                and launch_state.launch_attempt_id != launch_attempt_id
             ):
                 raise ToolExecutionError(
                     "STALE_SUPERVISOR_SEQUENCE",
@@ -10305,9 +10313,10 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "takeover_reason": takeover_reason,
             "supervisor_sequence": supervisor_sequence,
         }
-        now = _naive_utc()
+        request_now = _naive_utc()
 
         async def mutate(session: Any) -> MutationReceipt:
+            now = _naive_utc()
             project = (
                 await session.execute(
                     select(Project).where(
@@ -10560,9 +10569,9 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 operation_kind="activate_fleet_runtime_v1",
                 idempotency_key=idempotency_key,
                 request_payload=request_payload,
-                expires_ts=now + timedelta(hours=24),
+                expires_ts=request_now + timedelta(hours=24),
                 mutate=mutate,
-                now=now,
+                now=request_now,
             )
             await session.commit()
         response = dict(result.response)
@@ -10721,6 +10730,253 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "overall": "live" if coordination_state == "ready" else coordination_state,
         }
 
+    @mcp.tool(name="end_fleet_runtime_absent")
+    @_instrument_tool(
+        "end_fleet_runtime_absent",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "write", "controller", "presence"},
+        project_arg="project_key",
+    )
+    async def end_fleet_runtime_absent(
+        ctx: Context,
+        project_key: str,
+        logical_agent_key: str,
+        launch_attempt_id: str,
+        runtime_binding_id: int,
+        runtime_generation: int,
+        runtime_incarnation_id: str,
+        pane_instance_id: str,
+        process_id: int,
+        process_started_ts: str,
+        pane_absence_event_id: str,
+        pane_absence_observed_ts: str,
+        process_absence_event_id: str,
+        process_absence_observed_ts: str,
+        observation_sequence: int,
+        supervisor_sequence: int,
+        observer_id: str,
+        owner_token: str,
+        idempotency_key: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """End one stale runtime only after fresh exact pane and process absence proofs."""
+        del ctx, format
+        _require_owner(settings, owner_token)
+        _validate_logical_agent_key(logical_agent_key)
+        normalized_project, _ = _validate_new_project_key(project_key, "workspace")
+        if project_key != normalized_project:
+            raise ToolExecutionError(
+                "PROJECT_MISMATCH",
+                "project_key must already be normalized by the fleet canonicalization algorithm.",
+            )
+        if (
+            not launch_attempt_id.strip()
+            or not runtime_incarnation_id.strip()
+            or not pane_instance_id.strip()
+            or not pane_absence_event_id.strip()
+            or not process_absence_event_id.strip()
+            or not observer_id.strip()
+        ):
+            raise ToolExecutionError(
+                "INVALID_ABSENCE_PROOF",
+                "Absence proof identifiers must not be blank.",
+            )
+        if pane_absence_event_id == process_absence_event_id:
+            raise ToolExecutionError(
+                "INVALID_ABSENCE_PROOF",
+                "Pane and process absence proofs require distinct event ids.",
+            )
+        if (
+            runtime_binding_id < 1
+            or runtime_generation < 1
+            or process_id < 1
+            or observation_sequence < 1
+            or supervisor_sequence < 1
+        ):
+            raise ToolExecutionError(
+                "INVALID_ABSENCE_PROOF",
+                "Binding, generation, process, and sequence values must be positive.",
+            )
+        started = _parse_iso(process_started_ts)
+        pane_observed = _parse_iso(pane_absence_observed_ts)
+        process_observed = _parse_iso(process_absence_observed_ts)
+        if started is None or pane_observed is None or process_observed is None:
+            raise ToolExecutionError(
+                "INVALID_ABSENCE_PROOF",
+                "Absence proof timestamps must be ISO-8601.",
+            )
+        started = _naive_utc(started)
+        pane_observed = _naive_utc(pane_observed)
+        process_observed = _naive_utc(process_observed)
+        project_hash = _validate_fleet_idempotency_key(
+            phase="end_absent",
+            idempotency_key=idempotency_key,
+            canonical_project=normalized_project,
+            logical_agent_key=logical_agent_key,
+            launch_attempt_id=launch_attempt_id,
+            runtime_incarnation_id=f"{runtime_binding_id}:{runtime_generation}",
+        )
+        request_payload = {
+            "project_key": normalized_project,
+            "logical_agent_key": logical_agent_key,
+            "launch_attempt_id": launch_attempt_id,
+            "runtime_binding_id": runtime_binding_id,
+            "runtime_generation": runtime_generation,
+            "runtime_incarnation_id": runtime_incarnation_id,
+            "pane_instance_id": pane_instance_id,
+            "process_id": process_id,
+            "process_started_ts": _iso(started),
+            "pane_absence_event_id": pane_absence_event_id,
+            "pane_absence_observed_ts": _iso(pane_observed),
+            "process_absence_event_id": process_absence_event_id,
+            "process_absence_observed_ts": _iso(process_observed),
+            "observation_sequence": observation_sequence,
+            "supervisor_sequence": supervisor_sequence,
+            "observer_id": observer_id,
+        }
+        request_now = _naive_utc()
+
+        async def mutate(session: Any) -> MutationReceipt:
+            now = _naive_utc()
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        cast(Any, Project.human_key) == normalized_project
+                    )
+                )
+            ).scalar_one_or_none()
+            if project is None or project.id is None:
+                raise ToolExecutionError(
+                    "PROJECT_MISMATCH",
+                    "Absence proof project does not exist.",
+                )
+            launch_state = await session.get(
+                FleetLaunchState,
+                (project.id, logical_agent_key),
+            )
+            binding = await session.get(RuntimeBinding, runtime_binding_id)
+            observation = await session.get(RuntimeObservation, runtime_binding_id)
+            if (
+                launch_state is None
+                or binding is None
+                or observation is None
+                or launch_state.launch_attempt_id != launch_attempt_id
+                or binding.project_id != project.id
+                or binding.agent_id != launch_state.agent_id
+                or binding.generation != runtime_generation
+                or binding.runtime_incarnation_id != runtime_incarnation_id
+                or binding.pane_instance_id != pane_instance_id
+                or binding.process_id != process_id
+                or binding.process_started_ts != started
+                or binding.state == "ended"
+            ):
+                raise ToolExecutionError(
+                    "STALE_GENERATION",
+                    "Absence proof does not match the exact active runtime.",
+                )
+            if observation.runtime_generation != runtime_generation:
+                raise ToolExecutionError(
+                    "STALE_GENERATION",
+                    "Absence proof observation generation changed.",
+                )
+            if supervisor_sequence <= launch_state.supervisor_sequence:
+                raise ToolExecutionError(
+                    "STALE_SUPERVISOR_SEQUENCE",
+                    "Absence retirement sequence must increase.",
+                )
+            if observation_sequence <= observation.observation_sequence:
+                raise ToolExecutionError(
+                    "STALE_OBSERVATION_SEQUENCE",
+                    "Absence observation sequence must increase.",
+                )
+            for observed in (pane_observed, process_observed):
+                age_seconds = (now - observed).total_seconds()
+                if age_seconds < -5 or age_seconds > 45:
+                    raise ToolExecutionError(
+                        "ABSENCE_PROOF_STALE",
+                        "Both absence observations must be fresh within 45 seconds.",
+                    )
+            if (now - observation.observed_ts).total_seconds() < 300:
+                raise ToolExecutionError(
+                    "ABSENCE_GRACE_ACTIVE",
+                    "The exact runtime has not remained stale for five minutes.",
+                    recoverable=True,
+                )
+
+            binding.state = "ended"
+            binding.ended_ts = now
+            session.add(binding)
+            observation.observation_sequence = observation_sequence
+            observation.observer_id = observer_id
+            observation.pane_live = False
+            observation.route_readback_verified = False
+            observation.prompt_state = "absent"
+            observation.provider_state = "absent"
+            observation.observed_ts = max(pane_observed, process_observed)
+            session.add(observation)
+            launch_state.desired_state = "held"
+            launch_state.coordination_state = "ready"
+            launch_state.identity_context_injected = False
+            launch_state.supervisor_sequence = supervisor_sequence
+            launch_state.observed_ts = observation.observed_ts
+            session.add(launch_state)
+            await append_audit_event(
+                session,
+                project_id=project.id,
+                actor_kind="owner",
+                actor_scope_id=f"fleet-observer/{observer_id}",
+                actor_agent_id=binding.agent_id,
+                operation_kind="fleet_runtime_absence_ended_v1",
+                entity_type="runtime_binding",
+                entity_id=str(binding.id),
+                payload_version="fleet-absence-v1",
+                payload={
+                    "logical_agent_key": logical_agent_key,
+                    "runtime_generation": runtime_generation,
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
+                    "process_id": process_id,
+                    "process_started_ts": _iso(started),
+                    "pane_absence_event_id": pane_absence_event_id,
+                    "pane_absence_observed_ts": _iso(pane_observed),
+                    "process_absence_event_id": process_absence_event_id,
+                    "process_absence_observed_ts": _iso(process_observed),
+                    "observation_sequence": observation_sequence,
+                    "supervisor_sequence": supervisor_sequence,
+                },
+            )
+            return MutationReceipt(
+                response={
+                    "project_id": project.id,
+                    "logical_agent_key": logical_agent_key,
+                    "runtime_binding_id": runtime_binding_id,
+                    "generation": runtime_generation,
+                    "desired_state": "held",
+                    "coordination_state": "ready",
+                    "overall": "ended",
+                },
+                entity_type="runtime_binding",
+                entity_id=str(runtime_binding_id),
+                project_id=project.id,
+            )
+
+        async with get_immediate_session() as session:
+            result = await run_idempotent_mutation(
+                session,
+                scope_kind="fleet_logical_agent",
+                scope_id=f"{project_hash}:{logical_agent_key}",
+                operation_kind="end_fleet_runtime_absent_v1",
+                idempotency_key=idempotency_key,
+                request_payload=request_payload,
+                expires_ts=request_now + timedelta(hours=24),
+                mutate=mutate,
+                now=request_now,
+            )
+            await session.commit()
+        response = dict(result.response)
+        response["replayed"] = result.replayed
+        return response
+
     @mcp.tool(name="publish_fleet_launch_state")
     @_instrument_tool(
         "publish_fleet_launch_state",
@@ -10754,32 +11010,77 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "failed",
         }:
             raise ToolExecutionError("INVALID_COORDINATION_STATE", "Unsupported coordination state.")
-        project = await _get_project_by_identifier(project_key)
-        if project.id is None:
-            raise ValueError("Project must be persisted before launch-state publication.")
+        normalized_project, _ = _validate_new_project_key(project_key, "workspace")
+        if project_key != normalized_project:
+            raise ToolExecutionError(
+                "PROJECT_MISMATCH",
+                "project_key must already be normalized by the fleet canonicalization algorithm.",
+            )
         now = _naive_utc()
         async with get_immediate_session() as session:
+            slug = _compute_project_slug(normalized_project)
+            project = (
+                await session.execute(
+                    select(Project).where(
+                        _sa_or(
+                            cast(Any, Project.human_key) == normalized_project,
+                            cast(Any, Project.slug) == slug,
+                        )
+                    )
+                )
+            ).scalars().first()
+            if project is None:
+                project = Project(
+                    slug=slug,
+                    human_key=normalized_project,
+                    namespace_kind="workspace",
+                )
+                session.add(project)
+                await session.flush()
+                await _append_project_creation_event(
+                    session,
+                    project,
+                    namespace_kind="workspace",
+                )
+            if project.id is None:
+                raise RuntimeError("Project id was not allocated.")
             launch_state = await session.get(
                 FleetLaunchState,
                 (project.id, logical_agent_key),
             )
-            if launch_state is not None and supervisor_sequence <= launch_state.supervisor_sequence:
-                raise ToolExecutionError(
-                    "STALE_SUPERVISOR_SEQUENCE",
-                    "Supervisor sequence must increase.",
-                )
+            replayed = False
+            if launch_state is not None:
+                if supervisor_sequence < launch_state.supervisor_sequence:
+                    raise ToolExecutionError(
+                        "STALE_SUPERVISOR_SEQUENCE",
+                        "Supervisor sequence must increase.",
+                    )
+                if supervisor_sequence == launch_state.supervisor_sequence:
+                    replayed = (
+                        launch_state.desired_state == desired_state
+                        and launch_state.coordination_state == coordination_state
+                        and launch_state.launch_attempt_id == launch_attempt_id
+                        and bool(launch_state.identity_context_injected)
+                        is identity_context_injected
+                    )
+                    if not replayed:
+                        raise ToolExecutionError(
+                            "STALE_SUPERVISOR_SEQUENCE",
+                            "An exact supervisor sequence replay changed launch state.",
+                        )
             if launch_state is None:
                 launch_state = FleetLaunchState(
                     project_id=project.id,
                     logical_agent_key=logical_agent_key,
                 )
-            launch_state.desired_state = desired_state
-            launch_state.coordination_state = coordination_state
-            launch_state.supervisor_sequence = supervisor_sequence
-            launch_state.launch_attempt_id = launch_attempt_id
-            launch_state.identity_context_injected = identity_context_injected
-            launch_state.observed_ts = now
-            session.add(launch_state)
+            if not replayed:
+                launch_state.desired_state = desired_state
+                launch_state.coordination_state = coordination_state
+                launch_state.supervisor_sequence = supervisor_sequence
+                launch_state.launch_attempt_id = launch_attempt_id
+                launch_state.identity_context_injected = identity_context_injected
+                launch_state.observed_ts = now
+                session.add(launch_state)
             await session.commit()
         return {
             "project_id": project.id,
@@ -10787,6 +11088,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             "desired_state": desired_state,
             "coordination_state": coordination_state,
             "supervisor_sequence": supervisor_sequence,
+            "replayed": replayed,
         }
 
     async def _fleet_roster_projection(

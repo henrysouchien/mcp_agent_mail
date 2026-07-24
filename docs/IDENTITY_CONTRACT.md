@@ -190,3 +190,34 @@ Fleet tooling should therefore use this sequence:
 5. Keep shell-level pane routing metadata separate and fail closed if either the live route or Agent Mail proof is missing.
 
 An invalid request carrier deliberately blocks fallback to the process-wide environment value. Treat the UUID like a bearer credential: store it with restrictive permissions, exclude it from logs and prompts, and use TLS outside localhost.
+
+## Fleet launch failure and exact-absence retirement
+
+Fleet launch state is independently roster-visible even before an Agent record
+exists. `publish_fleet_launch_state` may create the normalized workspace project
+and a nullable-principal `launch_failed` row after an exhausted pre-principal
+failure. A higher terminal supervisor sequence fences any older Phase-A command;
+an exact late Phase-A replay cannot revive the failed attempt.
+
+Controller crash recovery uses Agent Mail idempotency receipts or exact
+state-based terminal replay plus the local supervisor command journal.
+Replaying a committed Phase-B activation returns the same runtime binding and
+generation. Context/readback convergence remains non-live until its
+sequence-fenced observation commits.
+
+Ending a stale runtime through observation is a separate controller mutation:
+`end_fleet_runtime_absent`. It accepts only the exact active runtime binding,
+generation, incarnation, pane instance, PID, and process-start timestamp. It
+also requires two distinct evidence events—a fresh pane-instance absence and a
+fresh provider-process absence—both no older than 45 seconds, plus a prior
+healthy observation that has been stale for at least five minutes. The
+idempotent transaction:
+
+1. revalidates every runtime and sequence fence;
+2. ends the exact runtime generation;
+3. persists the final absence observation and both evidence IDs in audit;
+4. moves desired state to `held`, retaining the durable principal; and
+5. makes the roster project that principal as `durable_only`.
+
+One-sided absence, stale evidence, observer outage, an unreachable host, a
+reused pane/PID, or a changed generation fails closed and cannot end a runtime.

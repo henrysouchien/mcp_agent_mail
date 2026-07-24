@@ -327,6 +327,98 @@ async def test_database_concurrent_first_registration_claims_one_window_once(
 
 
 @pytest.mark.asyncio
+async def test_pre_principal_terminal_projection_creates_visible_failed_roster_row(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_database_profile(monkeypatch)
+    owner_token = "test-fleet-controller-owner"
+    monkeypatch.setenv("CORE_OWNER_TOKEN", owner_token)
+    _config.clear_settings_cache()
+    project_key = "/regression/fleet-pre-principal-failure"
+    logical_key = f"fa:{uuid.uuid4()}"
+    launch_attempt_id = str(uuid.uuid4())
+
+    async with Client(build_mcp_server()) as client:
+        projection_args = {
+            "project_key": project_key,
+            "logical_agent_key": logical_key,
+            "desired_state": "running",
+            "coordination_state": "failed",
+            "supervisor_sequence": 2,
+            "launch_attempt_id": launch_attempt_id,
+            "identity_context_injected": False,
+            "owner_token": owner_token,
+        }
+        projected = await client.call_tool(
+            "publish_fleet_launch_state",
+            projection_args,
+        )
+        assert projected.data["coordination_state"] == "failed"
+        assert projected.data["replayed"] is False
+        replayed_projection = await client.call_tool(
+            "publish_fleet_launch_state",
+            projection_args,
+        )
+        assert replayed_projection.data["coordination_state"] == "failed"
+        assert replayed_projection.data["replayed"] is True
+        changed_projection = {
+            **projection_args,
+            "desired_state": "held",
+        }
+        with pytest.raises(ToolError, match="exact supervisor sequence replay changed"):
+            await client.call_tool(
+                "publish_fleet_launch_state",
+                changed_projection,
+            )
+
+        roster = await client.call_tool(
+            "agent_roster",
+            {"project_key": project_key, "owner_token": owner_token},
+        )
+        assert len(roster.data["agents"]) == 1
+        row = roster.data["agents"][0]
+        assert row["logical_agent_key"] == logical_key
+        assert row["agent_id"] is None
+        assert row["agent_name"] is None
+        assert row["state"] == "launch_failed"
+        assert row["launch_attempt_id"] == launch_attempt_id
+        assert row["supervisor_sequence"] == 2
+        assert row["durable_reachable"] is False
+        assert row["live_tui_reachable"] is False
+
+        project_hash = hashlib.sha256(project_key.encode()).hexdigest()
+        with pytest.raises(ToolError, match="sequence did not advance"):
+            await client.call_tool(
+                "ensure_fleet_principal",
+                {
+                    "canonical_project": project_key,
+                    "logical_agent_key": logical_key,
+                    "launch_attempt_id": launch_attempt_id,
+                    "proof_mode": "create",
+                    "window_locator": str(uuid.uuid4()),
+                    "provider": "grok",
+                    "requested_model": "grok-4",
+                    "task_description": "must not revive terminal launch",
+                    "owner_token": owner_token,
+                    "idempotency_key": (
+                        f"ensure-principal:v1:{project_hash}:{logical_key}:"
+                        f"{launch_attempt_id}"
+                    ),
+                    "supervisor_sequence": 1,
+                    "expected_generation": 0,
+                },
+            )
+
+    async with get_session() as session:
+        assert await session.scalar(select(func.count()).select_from(Project)) == 1
+        assert await session.scalar(select(func.count()).select_from(Agent)) == 0
+        assert (
+            await session.scalar(select(func.count()).select_from(LogicalAgentPrincipal))
+            == 0
+        )
+
+
 async def test_fleet_identity_two_phase_create_converges_to_live_roster(
     isolated_env: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -403,8 +495,17 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
             "supervisor_sequence": 2,
         }
         activated = await client.call_tool("activate_fleet_runtime", activate_args)
+        activated_replay = await client.call_tool(
+            "activate_fleet_runtime",
+            activate_args,
+        )
         assert activated.data["overall"] == "route_missing"
         assert activated.data["generation"] == 1
+        assert activated.data["replayed"] is False
+        assert activated_replay.data["replayed"] is True
+        assert activated_replay.data["runtime_binding_id"] == activated.data[
+            "runtime_binding_id"
+        ]
 
         starting = await client.call_tool(
             "agent_roster",
@@ -482,6 +583,100 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
     assert resource_payload["agents"][0]["supervisor_sequence"] == 3
     assert resource_payload["agents"][0]["observation_sequence"] == 1
 
+    premature_observed_ts = datetime.now(timezone.utc).isoformat()
+    premature_end_args = {
+        "project_key": project_key,
+        "logical_agent_key": logical_key,
+        "launch_attempt_id": launch_attempt_id,
+        "runtime_binding_id": activated.data["runtime_binding_id"],
+        "runtime_generation": 1,
+        "runtime_incarnation_id": runtime_incarnation_id,
+        "pane_instance_id": pane_instance_id,
+        "process_id": 5101,
+        "process_started_ts": "2026-07-23T14:00:00Z",
+        "pane_absence_event_id": str(uuid.uuid4()),
+        "pane_absence_observed_ts": premature_observed_ts,
+        "process_absence_event_id": str(uuid.uuid4()),
+        "process_absence_observed_ts": premature_observed_ts,
+        "observation_sequence": 2,
+        "supervisor_sequence": 4,
+        "observer_id": "fleet-test-observer",
+        "owner_token": owner_token,
+        "idempotency_key": (
+            f"end-absent-runtime:v1:{project_hash}:{logical_key}:"
+            f"{activated.data['runtime_binding_id']}:1"
+        ),
+    }
+    async with Client(build_mcp_server()) as client:
+        with pytest.raises(ToolError, match="five minutes"):
+            await client.call_tool(
+                "end_fleet_runtime_absent",
+                premature_end_args,
+            )
+
+    async with get_session() as session:
+        observation = await session.get(
+            RuntimeObservation,
+            activated.data["runtime_binding_id"],
+        )
+        assert observation is not None
+        observation.observed_ts = (
+            datetime.now(timezone.utc) - timedelta(minutes=6)
+        ).replace(tzinfo=None)
+        session.add(observation)
+        await session.commit()
+
+    pane_absence_event_id = str(uuid.uuid4())
+    process_absence_event_id = str(uuid.uuid4())
+    absence_observed_ts = datetime.now(timezone.utc).isoformat()
+    end_absent_args = {
+        "project_key": project_key,
+        "logical_agent_key": logical_key,
+        "launch_attempt_id": launch_attempt_id,
+        "runtime_binding_id": activated.data["runtime_binding_id"],
+        "runtime_generation": 1,
+        "runtime_incarnation_id": runtime_incarnation_id,
+        "pane_instance_id": pane_instance_id,
+        "process_id": 5101,
+        "process_started_ts": "2026-07-23T14:00:00Z",
+        "pane_absence_event_id": pane_absence_event_id,
+        "pane_absence_observed_ts": absence_observed_ts,
+        "process_absence_event_id": process_absence_event_id,
+        "process_absence_observed_ts": absence_observed_ts,
+        "observation_sequence": 2,
+        "supervisor_sequence": 4,
+        "observer_id": "fleet-test-observer",
+        "owner_token": owner_token,
+        "idempotency_key": (
+            f"end-absent-runtime:v1:{project_hash}:{logical_key}:"
+            f"{activated.data['runtime_binding_id']}:1"
+        ),
+    }
+    async with Client(build_mcp_server()) as client:
+        ended = await client.call_tool(
+            "end_fleet_runtime_absent",
+            end_absent_args,
+        )
+        replayed_end = await client.call_tool(
+            "end_fleet_runtime_absent",
+            end_absent_args,
+        )
+        assert ended.data["overall"] == "ended"
+        assert ended.data["replayed"] is False
+        assert replayed_end.data["overall"] == "ended"
+        assert replayed_end.data["replayed"] is True
+
+        roster = await client.call_tool(
+            "agent_roster",
+            {"project_key": project_key, "owner_token": owner_token},
+        )
+        row = roster.data["agents"][0]
+        assert row["state"] == "durable_only"
+        assert row["desired_state"] == "held"
+        assert row["runtime_binding_id"] is None
+        assert row["live_tui_reachable"] is False
+        assert row["durable_reachable"] is True
+
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Project)) == 1
         assert (
@@ -495,6 +690,12 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert await session.scalar(select(func.count()).select_from(FleetLaunchState)) == 1
         assert await session.scalar(select(func.count()).select_from(RuntimeBinding)) == 1
         assert await session.scalar(select(func.count()).select_from(RuntimeObservation)) == 1
+        binding = await session.get(
+            RuntimeBinding,
+            activated.data["runtime_binding_id"],
+        )
+        assert binding is not None
+        assert binding.state == "ended"
 
 
 @pytest.mark.asyncio
