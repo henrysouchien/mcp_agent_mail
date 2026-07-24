@@ -150,6 +150,7 @@ class TestToolFilter:
             "issue_continuation_receipt",
             "publish_fleet_runtime_observation",
             "publish_fleet_launch_state",
+            "end_fleet_runtime_absent",
             "agent_roster_current",
             "agent_roster",
             "reconcile_runtime_binding",
