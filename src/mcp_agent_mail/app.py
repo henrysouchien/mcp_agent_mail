@@ -12229,6 +12229,18 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             binding.last_heartbeat_ts = now
             binding.state = observed_state
             session.add(binding)
+            if observed_state == "healthy":
+                persisted_agent = await session.get(Agent, agent.id)
+                if persisted_agent is None:
+                    raise ToolExecutionError(
+                        "PRINCIPAL_MISMATCH",
+                        "Healthy runtime binding points to a missing principal.",
+                    )
+                persisted_agent.program = binding.program
+                persisted_agent.model = binding.model
+                persisted_agent.task_description = binding.task_description
+                persisted_agent.last_active_ts = now
+                session.add(persisted_agent)
             await session.commit()
         return {
             "project_id": project.id,

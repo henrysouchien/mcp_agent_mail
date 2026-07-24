@@ -210,7 +210,9 @@ program, model, task description, and activity timestamp from the exact
 generation-fenced runtime binding. Starting, degraded, failed, stale, and
 superseded runtimes cannot overwrite the profile. Managed launch therefore
 does not require a later token-backed `register_agent` call merely to refresh
-profile metadata.
+profile metadata. An exact healthy heartbeat also reapplies the same projection
+so pre-cutover managed runtimes converge without owner ceremony; unhealthy
+heartbeats do not rewrite it.
 
 Ending a stale runtime through observation is a separate controller mutation:
 `end_fleet_runtime_absent`. It accepts only the exact active runtime binding,

@@ -551,6 +551,69 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
                 principal.task_description
                 == activate_args["task_description"]
             )
+            principal.program = "stale-program"
+            principal.model = "stale-model"
+            principal.task_description = "stale task"
+            session.add(principal)
+            await session.commit()
+        monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_locator)
+        _config.clear_settings_cache()
+        async with Client(build_mcp_server()) as heartbeat_client:
+            degraded = await heartbeat_client.call_tool(
+                "heartbeat_runtime_binding",
+                {
+                    "project_key": project_key,
+                    "agent_name": ensured.data["agent_name"],
+                    "runtime_session_id": activate_args[
+                        "runtime_session_id"
+                    ],
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
+                    "generation": 1,
+                    "registration_token": ensured.data[
+                        "agent_recovery_authority"
+                    ],
+                    "observed_state": "degraded",
+                },
+            )
+            assert degraded.data["state"] == "degraded"
+            async with get_session() as session:
+                degraded_principal = await session.get(
+                    Agent,
+                    ensured.data["agent_id"],
+                )
+                assert degraded_principal is not None
+                assert degraded_principal.task_description == "stale task"
+            healthy = await heartbeat_client.call_tool(
+                "heartbeat_runtime_binding",
+                {
+                    "project_key": project_key,
+                    "agent_name": ensured.data["agent_name"],
+                    "runtime_session_id": activate_args[
+                        "runtime_session_id"
+                    ],
+                    "runtime_incarnation_id": runtime_incarnation_id,
+                    "pane_instance_id": pane_instance_id,
+                    "generation": 1,
+                    "registration_token": ensured.data[
+                        "agent_recovery_authority"
+                    ],
+                    "observed_state": "healthy",
+                },
+            )
+            assert healthy.data["state"] == "healthy"
+        async with get_session() as session:
+            healed_principal = await session.get(
+                Agent,
+                ensured.data["agent_id"],
+            )
+            assert healed_principal is not None
+            assert healed_principal.program == activate_args["program"]
+            assert healed_principal.model == activate_args["model"]
+            assert (
+                healed_principal.task_description
+                == activate_args["task_description"]
+            )
         stale_launch_attempt_id = str(uuid.uuid4())
         stale_ensure = {
             **ensure_args,

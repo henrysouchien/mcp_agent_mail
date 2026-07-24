@@ -148,8 +148,9 @@ Use the fleet contract for tmux-supervised Codex, Claude, and Grok runtimes:
 The final `ready` observation reconciles the durable principal's program,
 model, task description, and activity timestamp from the exact active runtime
 binding. Do not issue a separate token-backed `register_agent` profile refresh
-after a successful managed launch. Non-ready or stale generations cannot
-rewrite the principal profile.
+after a successful managed launch. A later exact healthy heartbeat repairs any
+pre-cutover profile drift from the same binding. Non-ready, unhealthy, or stale
+generations cannot rewrite the principal profile.
 
 An exhausted failure before principal creation uses the same terminal
 projection. It may create the normalized project and a nullable-principal
