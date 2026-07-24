@@ -512,6 +512,15 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
             {"project_key": project_key, "owner_token": owner_token},
         )
         assert starting.data["agents"][0]["state"] == "starting"
+        async with get_session() as session:
+            staged_principal = await session.get(
+                Agent,
+                ensured.data["agent_id"],
+            )
+            assert staged_principal is not None
+            assert staged_principal.program == "fleet-principal"
+            assert staged_principal.model == "unbound"
+            assert staged_principal.task_description == ""
 
         observed = await client.call_tool(
             "publish_fleet_runtime_observation",
@@ -533,6 +542,15 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
             },
         )
         assert observed.data["overall"] == "live"
+        async with get_session() as session:
+            principal = await session.get(Agent, ensured.data["agent_id"])
+            assert principal is not None
+            assert principal.program == activate_args["program"]
+            assert principal.model == activate_args["model"]
+            assert (
+                principal.task_description
+                == activate_args["task_description"]
+            )
         stale_launch_attempt_id = str(uuid.uuid4())
         stale_ensure = {
             **ensure_args,

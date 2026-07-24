@@ -205,6 +205,13 @@ Replaying a committed Phase-B activation returns the same runtime binding and
 generation. Context/readback convergence remains non-live until its
 sequence-fenced observation commits.
 
+That final `ready` observation also reconciles the durable Agent profile's
+program, model, task description, and activity timestamp from the exact
+generation-fenced runtime binding. Starting, degraded, failed, stale, and
+superseded runtimes cannot overwrite the profile. Managed launch therefore
+does not require a later token-backed `register_agent` call merely to refresh
+profile metadata.
+
 Ending a stale runtime through observation is a separate controller mutation:
 `end_fleet_runtime_absent`. It accepts only the exact active runtime binding,
 generation, incarnation, pane instance, PID, and process-start timestamp. It

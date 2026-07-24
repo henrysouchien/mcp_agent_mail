@@ -10701,6 +10701,18 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             binding.last_heartbeat_ts = observed
             binding.state = "healthy" if coordination_state == "ready" else "starting"
             session.add(binding)
+            if coordination_state == "ready":
+                agent = await session.get(Agent, binding.agent_id)
+                if agent is None:
+                    raise ToolExecutionError(
+                        "PRINCIPAL_MISMATCH",
+                        "Ready runtime binding points to a missing principal.",
+                    )
+                agent.program = binding.program
+                agent.model = binding.model
+                agent.task_description = binding.task_description
+                agent.last_active_ts = observed
+                session.add(agent)
             await append_audit_event(
                 session,
                 project_id=project.id,

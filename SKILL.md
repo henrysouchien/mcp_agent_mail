@@ -145,6 +145,12 @@ Use the fleet contract for tmux-supervised Codex, Claude, and Grok runtimes:
    and call `publish_fleet_launch_state(..., coordination_state="failed",
    identity_context_injected=false)`. Replay it through the supervisor journal.
 
+The final `ready` observation reconciles the durable principal's program,
+model, task description, and activity timestamp from the exact active runtime
+binding. Do not issue a separate token-backed `register_agent` profile refresh
+after a successful managed launch. Non-ready or stale generations cannot
+rewrite the principal profile.
+
 An exhausted failure before principal creation uses the same terminal
 projection. It may create the normalized project and a nullable-principal
 `launch_failed` roster row. Its higher supervisor sequence fences any delayed
