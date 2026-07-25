@@ -10179,6 +10179,7 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 FleetLaunchState,
                 (project.id, logical_agent_key),
             )
+            retry_rotates_locator = False
             if proof_mode == "retry_failed_create":
                 if expected_generation != 0:
                     raise ToolExecutionError(
@@ -10197,13 +10198,27 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         .limit(1)
                     )
                 ).scalar_one_or_none()
+                retry_same_locator = (
+                    current_identity is not None
+                    and current_identity.window_uuid.lower()
+                    == window_locator.lower()
+                    and existing_locator is not None
+                    and existing_locator.id == current_identity.id
+                )
+                retry_rotates_locator = (
+                    current_identity is not None
+                    and existing_locator is None
+                    and launch_state is not None
+                    and launch_state.staged_window_identity_id
+                    == current_identity.id
+                    and launch_state.staged_locator_digest
+                    == _locator_digest(current_identity.window_uuid)
+                )
                 if (
                     active_runtime is not None
                     or current_marker is None
                     or current_identity is None
-                    or current_identity.window_uuid.lower() != window_locator.lower()
-                    or existing_locator is None
-                    or existing_locator.id != current_identity.id
+                    or not (retry_same_locator or retry_rotates_locator)
                     or launch_state is None
                     or launch_state.agent_id != agent.id
                     or launch_state.coordination_state != "failed"
@@ -10314,7 +10329,31 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     )
             elif proof_mode == "retry_failed_create":
                 assert current_identity is not None
-                staged_identity = current_identity
+                if retry_rotates_locator:
+                    staged_identity = WindowIdentity(
+                        project_id=project.id,
+                        agent_id=agent.id,
+                        window_uuid=window_locator,
+                        display_name=agent.name,
+                        created_ts=now,
+                        last_active_ts=now,
+                        expires_ts=now
+                        + timedelta(
+                            days=getattr(settings, "window_identity_ttl_days", 30)
+                        ),
+                    )
+                    session.add(staged_identity)
+                    await session.flush()
+                    await _activate_window_identity_marker(
+                        session,
+                        project_id=project.id,
+                        agent_id=agent.id,
+                        identity=staged_identity,
+                        allow_replace=True,
+                        now=now,
+                    )
+                else:
+                    staged_identity = current_identity
             elif proof_mode == "resume_same_authority":
                 if (
                     current_identity is None

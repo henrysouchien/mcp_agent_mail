@@ -410,3 +410,73 @@ async def test_failed_create_retries_same_principal_with_new_attempt(
         "runtimes": 0,
         "observations": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_failed_create_retry_can_rotate_rejected_locator(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del isolated_env
+    owner_token = configure_database_profile(monkeypatch)
+    project = "/regression/fleet-failed-create-rotate"
+    logical_key = f"fa:{uuid.uuid4()}"
+    first_locator = str(uuid.uuid4())
+    replacement_locator = str(uuid.uuid4())
+    first_attempt = str(uuid.uuid4())
+
+    async with Client(build_mcp_server()) as client:
+        first = await client.call_tool(
+            "ensure_fleet_principal",
+            ensure_arguments(
+                project=project,
+                logical_key=logical_key,
+                attempt_id=first_attempt,
+                locator=first_locator,
+                owner_token=owner_token,
+                supervisor_sequence=1,
+            ),
+        )
+        await client.call_tool(
+            "publish_fleet_launch_state",
+            {
+                "project_key": project,
+                "logical_agent_key": logical_key,
+                "desired_state": "running",
+                "coordination_state": "failed",
+                "supervisor_sequence": 2,
+                "launch_attempt_id": first_attempt,
+                "identity_context_injected": False,
+                "owner_token": owner_token,
+            },
+        )
+        retry = await client.call_tool(
+            "ensure_fleet_principal",
+            ensure_arguments(
+                project=project,
+                logical_key=logical_key,
+                attempt_id=str(uuid.uuid4()),
+                locator=replacement_locator,
+                owner_token=owner_token,
+                supervisor_sequence=3,
+                proof_mode="retry_failed_create",
+                expected_agent_id=first.data["agent_id"],
+                recovery_authority=first.data["agent_recovery_authority"],
+                recovery_attempt_id=first_attempt,
+            ),
+        )
+
+    assert retry.data["agent_id"] == first.data["agent_id"]
+    assert retry.data["staged_locator_digest"] != first.data[
+        "staged_locator_digest"
+    ]
+    assert await authority_counts() == {
+        "projects": 1,
+        "agents": 1,
+        "assignments": 1,
+        "identities": 2,
+        "authorities": 1,
+        "launches": 1,
+        "runtimes": 0,
+        "observations": 0,
+    }
