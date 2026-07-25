@@ -1,0 +1,20 @@
+{
+  "target_path": "/Users/henrychien/.local/share/mcp_agent_mail",
+  "discovered_at": "2026-07-25T20:07:42Z",
+  "languages": [
+    "python"
+  ],
+  "binaries": [
+    {
+      "name": "mcp-agent-mail",
+      "invocation": "uv run python -m mcp_agent_mail.cli"
+    }
+  ],
+  "env_var_prefix": "MCP_AGENT_MAIL",
+  "existing_surfaces": {
+    "robot_mode": false,
+    "capabilities": true,
+    "robot_docs": false
+  },
+  "recommended_mode": "full"
+}
