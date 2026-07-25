@@ -783,6 +783,8 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         assert row["runtime_binding_id"] is None
         assert row["live_tui_reachable"] is False
         assert row["durable_reachable"] is True
+        assert "no verified live TUI route" in row["interpretation"]
+        assert "Use mail normally" in row["recommended_action"]
 
     async with get_session() as session:
         assert await session.scalar(select(func.count()).select_from(Project)) == 1

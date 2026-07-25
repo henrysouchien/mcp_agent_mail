@@ -157,6 +157,24 @@ def test_agent_roster_cli_requires_controller_authority(
     assert "controller/operator authority" in result.stderr
 
 
+def test_capabilities_json_is_stable_discovery_contract() -> None:
+    result = CliRunner().invoke(app, ["capabilities", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == 1
+    assert payload["canonical_invocation"] == "mcp-agent-mail"
+    assert payload["server_start"] == "mcp-agent-mail serve-http"
+
+
+def test_robot_docs_guide_explains_identity_readback() -> None:
+    result = CliRunner().invoke(app, ["robot-docs", "guide", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert any(
+        "verification_not_requested" in line for line in payload["identity"]
+    )
+
+
 def test_release_sentinel_requires_quiescence_and_detects_state_change(
     isolated_env: object,
     tmp_path: Path,

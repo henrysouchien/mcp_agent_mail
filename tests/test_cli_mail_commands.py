@@ -13,6 +13,7 @@ Reference: mcp_agent_mail-n6z
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -127,6 +128,18 @@ def test_mail_status_basic(isolated_env, tmp_path, monkeypatch):
     # Should succeed even without git repo
     assert result.exit_code == 0
     assert "WORKTREES_ENABLED" in result.stdout
+
+
+def test_mail_status_json(isolated_env, tmp_path):
+    test_dir = tmp_path / "json_repo"
+    test_dir.mkdir()
+
+    result = runner.invoke(app, ["mail", "status", str(test_dir), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["path"] == str(test_dir)
+    assert isinstance(payload["worktrees_enabled"], bool)
 
 
 def test_mail_status_with_git_repo(isolated_env, tmp_path):

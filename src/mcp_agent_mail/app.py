@@ -11778,6 +11778,41 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                     "launch_failed": ["LAUNCH_FAILED"],
                     "stale": ["OBSERVATION_STALE"],
                 }.get(state, [])
+                state_guidance = {
+                    "conflict": (
+                        "Server authority and the active runtime route disagree.",
+                        "Stop mutating work and have the fleet controller reconcile the authoritative runtime.",
+                    ),
+                    "coordination_degraded": (
+                        "The durable identity exists, but launch coordination reported degraded operation.",
+                        "Inspect the launch attempt and supervisor diagnostics before retrying.",
+                    ),
+                    "live": (
+                        "The durable identity and caller-observed live TUI route are verified.",
+                        "No recovery action is required.",
+                    ),
+                    "launch_failed": (
+                        "The most recent managed launch attempt failed.",
+                        "Inspect launch diagnostics, correct the cause, and issue a new launch attempt.",
+                    ),
+                    "stale": (
+                        "A runtime route exists, but its observation is older than the freshness window.",
+                        "Refresh the observation before trusting live TUI reachability.",
+                    ),
+                    "starting": (
+                        "The controller is still converging the requested running state.",
+                        "Wait for convergence or inspect the launch attempt if this state persists.",
+                    ),
+                    "durable_only": (
+                        "The Agent Mail identity is reachable, but no verified live TUI route is active.",
+                        "Use mail normally; launch or reconcile a runtime only when live TUI routing is required.",
+                    ),
+                    "ended": (
+                        "The historical logical agent has no active durable/runtime assignment.",
+                        "No action is required unless this agent should be relaunched.",
+                    ),
+                }
+                interpretation, recommended_action = state_guidance[state]
                 rows.append(
                     {
                         "project_id": project.id,
@@ -11846,6 +11881,8 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                         "durable_reachable": agent is not None,
                         "live_tui_reachable": state == "live",
                         "issue_codes": issue_codes,
+                        "interpretation": interpretation,
+                        "recommended_action": recommended_action,
                     }
                 )
             return rows
@@ -11906,7 +11943,13 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         include_history: bool = False,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Read the roster for the one project implied by authenticated pane authority."""
+        """Read the roster implied by authenticated pane authority.
+
+        Prefer this read-only tool inside a managed pane when the project should
+        be inferred. Each row includes ``interpretation`` and
+        ``recommended_action``. Use ``agent_roster`` instead only when a
+        controller must name a different project explicitly.
+        """
         del ctx, format
         project = await _current_roster_project()
         rows = await _fleet_roster_projection(project, include_history=include_history)
@@ -11969,7 +12012,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         expected_generation: int = 0,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Enroll or compare-and-swap one authenticated runtime route."""
+        """Enroll or compare-and-swap one complete, caller-observed runtime route.
+
+        Use only when a launcher/controller has all runtime incarnation, process,
+        and tmux route fields plus the expected generation. Do not call merely
+        because ``identity_status`` reports ``verification_not_requested``;
+        that state means the caller omitted read-back evidence, not that the
+        server route is absent.
+        """
         _require_owner(settings, owner_token)
         for label, value in {
             "runtime_session_id": runtime_session_id,
@@ -17998,6 +18048,12 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         code_repo_path: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
+        """Install the authoritative Git pre-commit reservation gate.
+
+        Use after onboarding a code repository when file reservations must block
+        conflicting commits. This mutates the repository hook configuration and
+        is skipped when worktree-friendly features are disabled.
+        """
         if not settings.worktrees_enabled:
             await ctx.info("Worktree-friendly features are disabled (WORKTREES_ENABLED=0). Skipping guard install.")
             return {"hook": ""}
@@ -18024,6 +18080,11 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         code_repo_path: str,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
+        """Remove the Agent Mail pre-commit reservation gate from a repository.
+
+        Use during repository decommissioning or an intentional guard rollback.
+        This is a mutating operation; it does not release active reservations.
+        """
         if get_settings().tools_log_enabled:
             try:
                 import importlib as _imp

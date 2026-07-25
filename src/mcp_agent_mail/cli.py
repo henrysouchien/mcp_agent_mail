@@ -338,14 +338,10 @@ def _run_async(coro: Any) -> Any:
         reset_database_state()
 
 
-app = typer.Typer(help="Developer utilities for the MCP Agent Mail service.", invoke_without_command=True)
-
-
-@app.callback()
-def _app_callback(ctx: typer.Context) -> None:
-    """Default to ``serve-http`` when no subcommand is given."""
-    if ctx.invoked_subcommand is None:
-        serve_http(host=None, port=None, path=None, tool_profile=None)
+app = typer.Typer(
+    help="Developer utilities for the MCP Agent Mail service.",
+    no_args_is_help=True,
+)
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -410,10 +406,121 @@ products_app = typer.Typer(help="Product Bus: manage products and links")
 app.add_typer(products_app, name="products")
 docs_app = typer.Typer(help="Documentation helpers for agent onboarding")
 app.add_typer(docs_app, name="docs")
+robot_docs_app = typer.Typer(
+    help="Compact, stable operating guidance for AI agents.",
+    no_args_is_help=True,
+)
+app.add_typer(robot_docs_app, name="robot-docs")
 doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
 release_app = typer.Typer(help="Release safety checks for production state")
 app.add_typer(release_app, name="release")
+
+
+def _capabilities_payload() -> dict[str, Any]:
+    """Return the stable, machine-readable CLI/MCP discovery contract."""
+    return {
+        "schema_version": 1,
+        "name": "mcp-agent-mail",
+        "version": _package_version(),
+        "canonical_invocation": "mcp-agent-mail",
+        "safe_discovery": [
+            "mcp-agent-mail --help",
+            "mcp-agent-mail capabilities --json",
+            "mcp-agent-mail robot-docs guide --json",
+        ],
+        "server_start": "mcp-agent-mail serve-http",
+        "exit_codes": {
+            "0": "success",
+            "1": "runtime or environment failure",
+            "2": "invalid invocation or arguments",
+        },
+        "output": {
+            "human_default": "Rich terminal output",
+            "machine_flag": "--json",
+            "mcp_formats": ["json", "toon"],
+        },
+        "high_value_cli_commands": [
+            "agent-roster",
+            "doctor check",
+            "list-projects",
+            "mail status",
+            "serve-http",
+        ],
+        "mcp_discovery_resources": [
+            "resource://tooling/directory",
+            "resource://tooling/schemas",
+            "resource://tooling/metrics",
+        ],
+    }
+
+
+@app.command("capabilities")
+def capabilities(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the stable machine-readable capability contract.",
+    ),
+) -> None:
+    """Describe supported CLI/MCP workflows without inspecting Rich help."""
+    payload = _capabilities_payload()
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+    table = Table(title="MCP Agent Mail capabilities", show_header=False)
+    table.add_column("Field", style="bold cyan")
+    table.add_column("Value", overflow="fold")
+    table.add_row("Version", str(payload["version"]))
+    table.add_row("Canonical command", str(payload["canonical_invocation"]))
+    table.add_row("Start server", str(payload["server_start"]))
+    table.add_row("Machine discovery", "mcp-agent-mail capabilities --json")
+    table.add_row(
+        "MCP directory",
+        str(payload["mcp_discovery_resources"][0]),
+    )
+    console.print(table)
+
+
+def _robot_guide_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "start": [
+            "Use macro_start_session for normal MCP onboarding.",
+            "Use mcp-agent-mail capabilities --json for CLI discovery.",
+            "Use resource://tooling/directory for MCP tool selection.",
+        ],
+        "identity": [
+            "identity_status without caller-observed route fields is informational.",
+            "verification_not_requested does not mean the server route is missing.",
+            "Call reconcile_runtime_binding only to enroll or compare-and-swap a complete observed runtime route.",
+        ],
+        "coordination": [
+            "Reserve contested paths before editing and release them when done.",
+            "Use agent_roster_current when authenticated pane authority implies the project.",
+            "durable_only means mail identity exists without a verified live TUI route; it is not automatically an error.",
+        ],
+    }
+
+
+@robot_docs_app.command("guide")
+def robot_docs_guide(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit structured agent operating guidance.",
+    ),
+) -> None:
+    """Print concise, paste-ready operating guidance for an AI agent."""
+    payload = _robot_guide_payload()
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+    console.print("[bold]MCP Agent Mail — robot guide[/bold]")
+    for section in ("start", "identity", "coordination"):
+        console.print(f"\n[bold cyan]{section}[/bold cyan]")
+        for item in payload[section]:
+            console.print(f"- {item}")
 
 
 def _resolve_agent_roster_project(explicit_project: str | None) -> str:
@@ -4568,6 +4675,11 @@ def mail_status(
         Path,
         typer.Argument(..., help="Absolute path to a repo/worktree directory (use '.' for current)."),
     ],
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit machine-readable routing diagnostics.",
+    ),
 ) -> None:
     """
     Print routing diagnostics: gate state, configured identity mode, normalized remote (if any),
@@ -4582,6 +4694,17 @@ def mail_status(
     ident = _resolve_ident(str(p))
     normalized_remote = ident.get("normalized_remote")
     slug_value = ident["slug"]
+    payload = {
+        "worktrees_enabled": gate,
+        "project_identity_mode": mode or "dir",
+        "project_identity_remote": remote_name,
+        "normalized_remote": normalized_remote,
+        "slug": slug_value,
+        "path": ident["human_key"],
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
 
     table = Table(title="Mail routing status", show_lines=False, expand=True)
     table.add_column("Field")
@@ -6335,4 +6458,4 @@ def doctor_restore(
 
 
 if __name__ == "__main__":
-    app()
+    app(prog_name=os.environ.get("MCP_AGENT_MAIL_PROG_NAME"))

@@ -1,9 +1,4 @@
-"""Tests for the CLI stub that helps confused agents.
-
-The CLI stub is a shell script installed by install.sh that prints a helpful
-message when agents mistakenly try to run 'mcp-agent-mail' as a CLI command
-instead of using the MCP tools.
-"""
+"""Tests for the installed canonical CLI launcher."""
 from __future__ import annotations
 
 import subprocess
@@ -13,96 +8,51 @@ import pytest
 
 
 @pytest.fixture
-def cli_stub_script(tmp_path: Path) -> Path:
-    """Create a test copy of the CLI stub script."""
-    stub_content = '''#!/usr/bin/env bash
-# MCP Agent Mail — Helpful Stub for Confused Agents
-cat <<'MSG'
-MCP Agent Mail is NOT a CLI tool!
-
-It's an MCP (Model Context Protocol) server that provides tools to your
-AI coding agent. You should already have access to these tools as part
-of your available MCP tools.
-
-CORRECT USAGE:
-   Use the MCP tools directly, for example:
-     • mcp__mcp-agent-mail__register_agent
-     • mcp__mcp-agent-mail__send_message
-     • mcp__mcp-agent-mail__fetch_inbox
-MSG
-exit 1
-'''
-    stub_path = tmp_path / "mcp-agent-mail"
-    stub_path.write_text(stub_content)
-    stub_path.chmod(0o755)
-    return stub_path
+def cli_launcher_script(tmp_path: Path) -> Path:
+    """Create a launcher backed by a fake Python executable."""
+    python_path = tmp_path / "python"
+    python_path.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n")
+    python_path.chmod(0o755)
+    launcher_path = tmp_path / "mcp-agent-mail"
+    launcher_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'exec "{python_path}" -m mcp_agent_mail.cli "$@"\n'
+    )
+    launcher_path.chmod(0o755)
+    return launcher_path
 
 
-def test_cli_stub_prints_not_cli_message(cli_stub_script: Path):
-    """Test that the CLI stub prints a message explaining it's not a CLI tool."""
+def test_cli_launcher_dispatches_to_real_module(cli_launcher_script: Path):
     result = subprocess.run(
-        [str(cli_stub_script)],
+        [str(cli_launcher_script), "--help"],
         capture_output=True,
         text=True,
     )
-
-    assert result.returncode == 1, "CLI stub should exit with code 1"
-    output = result.stdout
-
-    # Check for key messages in the output
-    assert "NOT a CLI" in output or "not a CLI" in output.lower()
-    assert "MCP" in output
-    assert "mcp__mcp-agent-mail__" in output
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == ["-m", "mcp_agent_mail.cli", "--help"]
 
 
-def test_cli_stub_mentions_correct_tools(cli_stub_script: Path):
-    """Test that the CLI stub mentions the correct MCP tool names."""
+def test_cli_launcher_preserves_arguments(cli_launcher_script: Path):
     result = subprocess.run(
-        [str(cli_stub_script)],
+        [str(cli_launcher_script), "mail", "status", ".", "--json"],
         capture_output=True,
         text=True,
     )
-
-    output = result.stdout
-
-    # Should mention some of the key tools
-    assert "register_agent" in output
-    assert "send_message" in output
-    assert "fetch_inbox" in output
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[-4:] == ["mail", "status", ".", "--json"]
 
 
-def test_cli_stub_ignores_arguments(cli_stub_script: Path):
-    """Test that the CLI stub ignores any arguments passed to it."""
-    # Try various argument patterns that a confused agent might try
-    test_cases = [
-        ["--help"],
-        ["send", "--to", "BlueLake", "--message", "Hello"],
-        ["register", "--name", "MyAgent"],
-        ["-v"],
-    ]
-
-    for args in test_cases:
-        result = subprocess.run(
-            [str(cli_stub_script), *args],
-            capture_output=True,
-            text=True,
-        )
-
-        # Should always exit 1 regardless of arguments
-        assert result.returncode == 1
-        # Should always print the help message
-        assert "MCP" in result.stdout
-
-
-class TestInstallScriptCliStub:
-    """Tests for the install_cli_stub function in install.sh."""
+class TestInstallScriptCliLauncher:
+    """Tests for the install_cli_launcher function in install.sh."""
 
     def test_install_function_exists(self):
-        """Verify the install_cli_stub function exists in install.sh."""
+        """Verify the install_cli_launcher function exists in install.sh."""
         install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
         content = install_script.read_text()
 
-        assert "install_cli_stub()" in content, "install_cli_stub function should exist"
+        assert "install_cli_launcher()" in content
+        assert 'exec "\\${python_path}" -m mcp_agent_mail.cli "\\$@"' in content
 
     def test_install_creates_variants(self):
         """Verify install script creates variant symlinks."""
@@ -114,9 +64,7 @@ class TestInstallScriptCliStub:
         for variant in expected_variants:
             assert variant in content, f"Should create symlink for '{variant}'"
 
-    def test_stub_mentions_github_repo(self):
-        """Verify the stub script mentions the GitHub repo for documentation."""
+    def test_launcher_does_not_claim_the_cli_is_missing(self):
         install_script = Path(__file__).parent.parent / "scripts" / "install.sh"
         content = install_script.read_text()
-
-        assert "github.com" in content.lower() and "mcp_agent_mail" in content
+        assert "is NOT a CLI tool" not in content

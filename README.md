@@ -2459,9 +2459,15 @@ See `deploy/gunicorn.conf.py` for a starter configuration. For project direction
 
 ## CLI Commands
 
-The project exposes a developer CLI for common operations:
+The installer exposes the canonical `mcp-agent-mail` command. Running it
+without a subcommand is side-effect free and prints help; server startup is
+always explicit through `mcp-agent-mail serve-http`.
 
+- `capabilities [--json]`: discover the stable CLI/MCP contract
+- `robot-docs guide [--json]`: print compact operating guidance for AI agents
 - `serve-http`: run the HTTP transport (Streamable HTTP only)
+- `agent-roster [--project PATH] [--json]`: inspect fleet state, interpretation, and recommended action
+- `mail status PATH [--json]`: inspect project identity and routing inputs
 - `migrate`: ensure schema and FTS structures exist
 - `lint` / `typecheck`: developer helpers
 - `list-projects [--include-agents]`: enumerate projects
