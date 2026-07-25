@@ -879,8 +879,10 @@ async def test_fleet_identity_two_phase_create_converges_to_live_roster(
         bindings = (
             await session.execute(
                 select(RuntimeBinding)
-                .where(RuntimeBinding.agent_id == ensured.data["agent_id"])
-                .order_by(RuntimeBinding.generation)
+                .where(
+                    cast(Any, RuntimeBinding.agent_id) == ensured.data["agent_id"]
+                )
+                .order_by(cast(Any, RuntimeBinding.generation))
             )
         ).scalars().all()
         assert [binding.state for binding in bindings] == [
@@ -921,7 +923,9 @@ async def test_late_absence_replay_accepts_exact_runtime_ended_by_new_generation
         async with get_session() as session:
             project = (
                 await session.execute(
-                    select(Project).where(Project.human_key == project_key)
+                    select(Project).where(
+                        cast(Any, Project.human_key) == project_key
+                    )
                 )
             ).scalar_one()
             assert project.id is not None
@@ -1127,6 +1131,71 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
         assert enrolled.data["generation"] == 1
         assert enrolled.data["overall"] == "route_missing"
 
+        verification_not_requested = await client.call_tool(
+            "identity_status",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+            },
+        )
+        assert verification_not_requested.data["overall"] == "verification_not_requested"
+        assert verification_not_requested.data["route"]["server_route_present"] is True
+        assert (
+            verification_not_requested.data["route"]["status"]
+            == "verification_not_requested"
+        )
+        assert verification_not_requested.data["route"]["verification"] == {
+            "required_fields": [
+                "host_id",
+                "tmux_server_id",
+                "pane_id",
+                "route_generation",
+            ],
+            "provided_fields": [],
+            "missing_fields": [
+                "host_id",
+                "tmux_server_id",
+                "pane_id",
+                "route_generation",
+            ],
+            "interpretation": (
+                "A server-side route exists; exact caller-observed readback was not "
+                "requested. Do not reconcile this runtime based on this result."
+            ),
+            "next_action": {
+                "tool": "identity_status",
+                "supply_fields": [
+                    "host_id",
+                    "tmux_server_id",
+                    "pane_id",
+                    "route_generation",
+                ],
+                "purpose": "Verify exact caller-observed route readback.",
+            },
+        }
+
+        insufficient_evidence = await client.call_tool(
+            "identity_status",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "pane_id": "%24",
+            },
+        )
+        assert (
+            insufficient_evidence.data["overall"]
+            == "insufficient_route_evidence"
+        )
+        assert insufficient_evidence.data["route"]["status"] == "insufficient_evidence"
+        assert insufficient_evidence.data["route"]["verification"]["provided_fields"] == [
+            "pane_id"
+        ]
+        assert insufficient_evidence.data["route"]["verification"]["missing_fields"] == [
+            "host_id",
+            "tmux_server_id",
+            "route_generation",
+        ]
+
         ready = await client.call_tool(
             "identity_status",
             {
@@ -1140,6 +1209,26 @@ async def test_runtime_binding_reconcile_is_generation_fenced_and_requires_route
         )
         assert ready.data["overall"] == "ready"
         assert ready.data["route"]["status"] == "verified"
+        assert ready.data["route"]["verification"]["missing_fields"] == []
+        assert ready.data["route"]["verification"]["next_action"] is None
+
+        route_conflict = await client.call_tool(
+            "identity_status",
+            {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "host_id": "host-a",
+                "tmux_server_id": "server-a",
+                "pane_id": "%99",
+                "route_generation": 1,
+            },
+        )
+        assert route_conflict.data["overall"] == "conflict"
+        assert route_conflict.data["route"]["status"] == "conflict"
+        assert route_conflict.data["route"]["verification"]["missing_fields"] == []
+        assert route_conflict.data["route"]["verification"]["next_action"]["tool"] == (
+            "reconcile_runtime_binding"
+        )
 
         moved_args = dict(reconcile_args)
         moved_args.update({"pane_id": "%31", "expected_generation": 1})

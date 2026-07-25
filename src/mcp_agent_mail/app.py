@@ -9715,8 +9715,14 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
         """Report coherent server authority, runtime incarnation, and route state.
 
         Route fields are caller-observed metadata used only for exact read-back
-        comparison.  No bearer, token, secret, authorization header, or raw
-        environment value is returned.
+        comparison. Supplying none reports ``verification_not_requested``;
+        supplying only some reports ``insufficient_route_evidence`` and names
+        the missing fields. Neither state means that the server route is absent,
+        and neither justifies calling ``reconcile_runtime_binding``. A complete
+        mismatch reports ``conflict``.
+
+        No bearer, token, secret, authorization header, or raw environment
+        value is returned.
         """
         project = await _get_project_by_identifier(project_key)
         if project.id is None:
@@ -9768,17 +9774,43 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             else:
                 generation = binding.generation
                 runtime_payload = _runtime_binding_payload(binding)
+                route_evidence = {
+                    "host_id": host_id,
+                    "tmux_server_id": tmux_server_id,
+                    "pane_id": pane_id,
+                    "route_generation": route_generation,
+                }
+                provided_route_fields = [
+                    name for name, value in route_evidence.items() if value is not None
+                ]
+                missing_route_fields = [
+                    name for name, value in route_evidence.items() if value is None
+                ]
+                verification_payload: dict[str, Any] = {
+                    "required_fields": list(route_evidence),
+                    "provided_fields": provided_route_fields,
+                    "missing_fields": missing_route_fields,
+                    "interpretation": (
+                        "A server-side route exists; exact caller-observed "
+                        "readback was not requested. Do not reconcile this "
+                        "runtime based on this result."
+                    ),
+                    "next_action": {
+                        "tool": "identity_status",
+                        "supply_fields": missing_route_fields,
+                        "purpose": "Verify exact caller-observed route readback.",
+                    },
+                }
                 route_payload = {
                     "host_id": binding.host_id,
                     "tmux_server_id": binding.tmux_server_id,
                     "pane_id": binding.pane_id,
                     "generation": binding.generation,
-                    "status": "unverified",
+                    "server_route_present": True,
+                    "status": "verification_not_requested",
+                    "verification": verification_payload,
                 }
-                supplied_route = all(
-                    value is not None
-                    for value in (host_id, tmux_server_id, pane_id, route_generation)
-                )
+                supplied_route = not missing_route_fields
                 route_matches = supplied_route and (
                     host_id == binding.host_id
                     and tmux_server_id == binding.tmux_server_id
@@ -9787,12 +9819,36 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
                 )
                 if route_matches:
                     route_payload["status"] = "verified"
+                    verification_payload["interpretation"] = (
+                        "Caller-observed route evidence exactly matches the "
+                        "server-side runtime route."
+                    )
+                    verification_payload["next_action"] = None
                     overall = "ready" if binding.state == "healthy" else "stale"
                 elif supplied_route:
                     route_payload["status"] = "conflict"
+                    verification_payload["interpretation"] = (
+                        "Complete caller-observed route evidence conflicts with "
+                        "the server-side runtime route."
+                    )
+                    verification_payload["next_action"] = {
+                        "tool": "reconcile_runtime_binding",
+                        "purpose": (
+                            "Reconcile only after independently confirming the "
+                            "caller-observed route evidence is current."
+                        ),
+                    }
                     overall = "conflict"
+                elif provided_route_fields:
+                    route_payload["status"] = "insufficient_evidence"
+                    verification_payload["interpretation"] = (
+                        "A server-side route exists, but exact readback cannot be "
+                        "evaluated until every required caller-observed field is "
+                        "supplied. Do not reconcile this runtime based on this result."
+                    )
+                    overall = "insufficient_route_evidence"
                 else:
-                    overall = "route_missing"
+                    overall = "verification_not_requested"
 
         return {
             "project_id": project.id,
