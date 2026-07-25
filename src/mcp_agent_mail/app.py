@@ -9949,6 +9949,22 @@ def build_mcp_server(settings_override: Optional[Settings] = None) -> FastMCP:
             if project.id is None:
                 raise RuntimeError("Project id was not allocated.")
 
+            locator_owners = (
+                await session.execute(
+                    select(WindowIdentity).where(
+                        func.lower(cast(Any, WindowIdentity.window_uuid))
+                        == window_locator.lower(),
+                    )
+                )
+            ).scalars().all()
+            if any(
+                identity.project_id != project.id
+                for identity in locator_owners
+            ):
+                raise ToolExecutionError(
+                    "WINDOW_LOCATOR_PROJECT_MISMATCH",
+                    "The requested window locator belongs to another project.",
+                )
             assignment = (
                 await session.execute(
                     select(LogicalAgentPrincipal).where(

@@ -149,6 +149,44 @@ async def test_locator_conflict_is_typed_and_creates_no_ghost_rows(
 
 
 @pytest.mark.asyncio
+async def test_cross_project_locator_conflict_precedes_principal_allocation(
+    isolated_env: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del isolated_env
+    owner_token = configure_database_profile(monkeypatch)
+    locator = str(uuid.uuid4())
+    first = ensure_arguments(
+        project="/regression/fleet-locator-owner",
+        logical_key=f"fa:{uuid.uuid4()}",
+        attempt_id=str(uuid.uuid4()),
+        locator=locator,
+        owner_token=owner_token,
+        supervisor_sequence=1,
+    )
+    second = ensure_arguments(
+        project="/regression/fleet-locator-foreign",
+        logical_key=f"fa:{uuid.uuid4()}",
+        attempt_id=str(uuid.uuid4()),
+        locator=locator,
+        owner_token=owner_token,
+        supervisor_sequence=1,
+    )
+
+    async with Client(build_mcp_server()) as client:
+        await client.call_tool("ensure_fleet_principal", first)
+        before = await authority_counts()
+        with pytest.raises(ToolError) as error:
+            await client.call_tool("ensure_fleet_principal", second)
+        envelope = decode_error_marker(str(error.value))
+        after = await authority_counts()
+
+    assert envelope["type"] == "WINDOW_LOCATOR_PROJECT_MISMATCH"
+    assert envelope["retry_class"] == "operator_action"
+    assert before == after
+
+
+@pytest.mark.asyncio
 async def test_create_adopts_exact_unmanaged_locator_owner(
     isolated_env: object,
     monkeypatch: pytest.MonkeyPatch,

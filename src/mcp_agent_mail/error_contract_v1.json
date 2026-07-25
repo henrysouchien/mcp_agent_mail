@@ -129,6 +129,10 @@
     "WINDOW_LOCATOR_ALREADY_ASSIGNED": {
       "message": "The requested window locator is already assigned.",
       "retry_class": "operator_action"
+    },
+    "WINDOW_LOCATOR_PROJECT_MISMATCH": {
+      "message": "The pane carrier belongs to a different Agent Mail project; archive it and mint a fresh carrier.",
+      "retry_class": "operator_action"
     }
   },
   "vectors": [
